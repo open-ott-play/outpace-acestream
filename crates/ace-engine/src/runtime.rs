@@ -168,6 +168,24 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("OUTPACE_HLS_IDLE_TIMEOUT_MS") {
         config.ace_hls_idle_timeout_ms = v.parse()?;
     }
+    for (name, slot) in [
+        ("OUTPACE_HISTORY_BYTES", &mut config.history.max_bytes),
+        (
+            "OUTPACE_HISTORY_TOTAL_BYTES",
+            &mut config.history.global_max_bytes,
+        ),
+    ] {
+        match std::env::var(name) {
+            Ok(value) => *slot = value.parse()?,
+            Err(std::env::VarError::NotPresent) => {}
+            Err(error) => return Err(format!("invalid {name}: {error}").into()),
+        }
+    }
+    match std::env::var("OUTPACE_HISTORY_SECONDS") {
+        Ok(value) => config.history.max_seconds = value.parse()?,
+        Err(std::env::VarError::NotPresent) => {}
+        Err(error) => return Err(format!("invalid OUTPACE_HISTORY_SECONDS: {error}").into()),
+    }
     if let Ok(v) = std::env::var("OUTPACE_MAX_UNCHOKED") {
         config.max_unchoked = v.parse()?;
     }
@@ -204,6 +222,7 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     config.live_recovery.validate()?;
     config.startup_buffer.validate()?;
     config.hls.validate()?;
+    config.history.validate()?;
     config.ace_hls_idle_timeout()?;
     config.hls_audio.validate()?;
     validate_cache_budget(&config)?;
@@ -605,6 +624,7 @@ pub async fn build_runtime(
     config.startup_buffer.validate()?;
     config.live_recovery.validate()?;
     config.hls.validate()?;
+    config.history.validate()?;
     config.ace_hls_idle_timeout()?;
     config.hls_audio.validate()?;
     validate_cache_budget(&config)?;
@@ -671,8 +691,13 @@ pub async fn build_runtime(
     }
     let networks: Vec<String> = registry.networks().iter().map(|s| s.to_string()).collect();
 
-    let manager =
-        StreamManager::with_normalizer(registry, config.session_buffer, config.hls, normalizer);
+    let manager = StreamManager::with_normalizer_and_history(
+        registry,
+        config.session_buffer,
+        config.hls,
+        normalizer,
+        config.history,
+    );
     manager.spawn_reaper();
     if config.seed_ttl_secs > 0 {
         let seed_registry_reap = seed_registry.clone();

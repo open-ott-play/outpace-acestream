@@ -9,6 +9,8 @@ import re
 import stat
 import tarfile
 
+from release_policy import parse_tag
+
 TARGETS = {
     "x86_64-unknown-linux-musl": "tar.gz",
     "aarch64-unknown-linux-musl": "tar.gz",
@@ -28,8 +30,7 @@ LINUX = {
 def prepare(tag: str, assets: Path, output: Path, revision: str) -> None:
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("Expected the resolved Git release commit")
-    if not re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", tag):
-        raise ValueError("Expected a stable release tag vX.Y.Z")
+    parse_tag(tag)
     version = tag[1:]
     expected = {f"outpace-{version}-{target}.{ext}" for target, ext in TARGETS.items()}
     expected |= {f"outpace-source-{version}-{target}-{revision}.tar.gz" for target in TARGETS}

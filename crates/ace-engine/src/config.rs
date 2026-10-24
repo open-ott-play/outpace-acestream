@@ -356,6 +356,8 @@ config_with_root_redaction! {
     pub startup_buffer: StartupBufferConfig,
     /// HLS byte-segment packaging policy.
     pub hls: HlsConfig,
+    /// Optional bounded retained-media replay; disabled by default.
+    pub history: crate::history::HlsHistoryConfig,
     pub hls_audio: HlsAudioConfig,
     /// Stable desired unchokes per exact served key, plus one rotating optimistic slot.
     /// With I interested peers, the coordinator desires min(I, max_unchoked + 1); this is not
@@ -434,6 +436,7 @@ impl Default for Config {
             live_recovery: LiveRecoveryConfig::default(),
             startup_buffer: StartupBufferConfig::default(),
             hls: HlsConfig::default(),
+            history: crate::history::HlsHistoryConfig::default(),
             hls_audio: HlsAudioConfig::default(),
             max_unchoked: 8,
             max_inbound_peers: 64,

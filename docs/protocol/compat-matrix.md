@@ -121,10 +121,10 @@ need not be JSON.
 | `/ace/getstream` | Missing/empty `format`: direct TS. `format=json`: new playback/stat/command URLs, session fields and metadata. | Selector/format/no-network errors: HTTP 200, `response: null`. Direct source-start failure: HTTP 404. |
 | `/ace/r/<id>/<token>` | Leased TS; opening it starts or joins the source. | Invalid, wrong-content, stopped, expired or evicted lease: 404. Start failures: 404/422/502 as below. |
 | `/ace/manifest.m3u8` | Missing/empty `format` or `format=redirect`: HTTP 302 to a stable playlist. `format=json`: HLS playback/stat/command URLs and session metadata. | Selector/format/no-network errors: HTTP 200, `response: null`. Source/packager-start failure: 404, including JSON mode. |
-| `/ace/m/<id>/<token>.m3u8` | Token-authenticated live media playlist; absolute segment URLs; `no-store`. | Invalid lease or removed packager: 404. Not ready, stalled/recovering or failed packager: 503 with `Retry-After: 1`; authorization/expiry takes precedence. |
-| `/ace/c/<token>/<seq>.ts` | Token-authenticated retained native HLS bytes, `video/mp2t`, `no-store`. Does not start a source. | Unknown/revoked token, missing packager, malformed/future/evicted segment: 404. |
+| `/ace/m/<id>/<token>.m3u8` | Token-authenticated live media playlist; absolute segment URLs; `no-store`. | Invalid lease or removed packager: 404. Not ready, stalled/recovering or failed packager: 503 with `Retry-After: 1`; authorization/expiry takes precedence. Stale initial generation after a timeshift transition: 410. |
+| `/ace/c/<token>/<seq>.ts` | Token-authenticated retained native HLS bytes, `video/mp2t`, `no-store`. Does not start a source. | Unknown/revoked token, missing packager, malformed/future/evicted segment: 404. Stale initial generation after a timeshift transition: 410. |
 | `/ace/stat/<id>/<token>` | Stats and metadata under `response`; does not start a source. | Invalid lease: HTTP 200, `response: null`, `error: "invalid or expired playback session"`. No network also gives an in-band error. |
-| `/ace/cmd/<id>/<token>?method=stop` | Revokes this lease; success is `response: "ok"`. | Invalid lease: same in-band error as stat. Any method other than `stop`, including absent method: HTTP 200 with `error: "missing method"`. |
+| `/ace/cmd/<id>/<token>?method=…` | `stop` revokes this lease with `response: "ok"`. Outpace-specific `timeshift_status`, `timeshift_seek` and `timeshift_live` follow the [timeshift contract](../timeshift.md). Responses use `no-store`. | Invalid lease: same in-band error as stat. Unknown or absent method: HTTP 200 with `error: "unknown or missing method"`. Seek/live transitions require an HLS lease. |
 | `/server/api`, `/webui/api/service` | Identical GET control-method dispatch on `?method=`; table below. | Handler responses are HTTP 200 with `result`/`error`, including unknown/missing methods and resolution failures. |
 
 For **leased TS start failures**, `NotFound` maps to 404 (an unregistered provider,
@@ -216,7 +216,11 @@ native consumers of the same source. Sharing is by resolved manager source key;
 clients must not assume all different selector spellings coalesce. Ordinary idle
 cleanup applies when no owner remains.
 
-HLS serves the shared native packager's retained live window, not an archive.
+Ordinary HLS serves the shared native packager's retained live window. The 0.9.0
+beta adds opt-in, per-viewer finite replay through explicit Outpace
+`timeshift_status`, `timeshift_seek` and `timeshift_live` extensions. These do not
+claim official control-API parity, UTC seek or a persistent archive; see
+[the beta contract](../timeshift.md).
 Segments leaving that window return 404; tokens do not preserve old segments.
 Playlist/segment reads do not count as native activity or start replacement work.
 

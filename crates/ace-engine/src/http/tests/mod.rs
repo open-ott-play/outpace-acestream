@@ -19,6 +19,7 @@ mod compat_hls;
 mod native;
 mod server_api;
 mod source;
+mod timeshift;
 mod vod;
 
 fn state() -> AppState {

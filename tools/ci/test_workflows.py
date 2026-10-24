@@ -108,10 +108,12 @@ class WorkflowContracts(unittest.TestCase):
         candidate = workflow("fuzz-candidate.yml")["jobs"]["fuzz"]
         self.assertEqual(job["uses"].rsplit("@", 1)[1], candidate["with"]["toolkit-ref"])
 
-    def test_stable_release_keeps_full_source_matrix_and_verifier(self):
+    def test_stable_and_beta_release_keep_full_source_matrix_and_verifier(self):
         doc = workflow("release.yml")
-        self.assertEqual(doc["on"], {"push": {"tags": ["v*.*.*", "!v*.*.*-*"]}})
+        self.assertEqual(doc["on"], {"push": {"tags": ["v*.*.*", "!v*.*.*-*", "v*.*.*-beta.*"]}})
         self.assertNotIn("fuzz", doc["jobs"])
+        self.assertIn('tools/release/release_policy.py metadata "$GITHUB_REF_NAME"', steps_text(doc["jobs"]["release-metadata"]))
+        self.assertIn('--cargo-version "$cargo_version"', steps_text(doc["jobs"]["release-metadata"]))
         build = doc["jobs"]["build-binaries"]
         targets = [row["target"] for row in build["strategy"]["matrix"]["include"]]
         self.assertEqual(set(targets), {
@@ -131,6 +133,37 @@ class WorkflowContracts(unittest.TestCase):
         self.assertIn("SHA256SUMS", publish["steps"][release_index]["with"]["files"])
         self.assertEqual(doc["jobs"]["publish-container"]["needs"], "publish-release")
 
+    def test_beta_assets_are_verified_in_draft_before_publication(self):
+        doc = workflow("release.yml")
+        self.assertEqual(doc["concurrency"], {"group": "outpace-release-${{ github.ref }}", "cancel-in-progress": "false"})
+        steps = doc["jobs"]["publish-release"]["steps"]
+        upload_index = next(index for index, step in enumerate(steps) if step.get("uses", "").startswith("softprops/action-gh-release@"))
+        upload = steps[upload_index]["with"]
+        self.assertEqual(upload["prerelease"], "${{ needs.release-metadata.outputs.prerelease }}")
+        self.assertEqual(upload["draft"], upload["prerelease"])
+        self.assertEqual(upload["make_latest"], "${{ needs.release-metadata.outputs.make_latest }}")
+        self.assertEqual(upload["fail_on_unmatched_files"], "true")
+        guard_index = next(index for index, step in enumerate(steps) if "release_policy.py unpublished" in step.get("run", ""))
+        final_index = next(index for index, step in enumerate(steps) if "gh release edit" in step.get("run", ""))
+        self.assertLess(guard_index, upload_index)
+        self.assertLess(upload_index, final_index)
+        for index in (guard_index, final_index):
+            self.assertEqual(steps[index]["if"], "needs.release-metadata.outputs.prerelease == 'true'")
+        final = steps[final_index]["run"]
+        self.assertLess(final.index("release_policy.py draft"), final.index("gh release edit"))
+        self.assertLess(final.index("tools/release/prepare_container.py"), final.index("gh release edit"))
+        self.assertIn("--draft=false --prerelease --latest=false --verify-tag", final)
+        self.assertIn("release_policy.py published", final)
+
+    def test_paginated_release_lists_use_external_jq(self):
+        for name in ("release.yml", "publish-container.yml"):
+            commands = "\n".join(steps_text(job) for job in workflow(name)["jobs"].values())
+            listings = [line for line in commands.splitlines() if "gh api --paginate --slurp" in line]
+            self.assertEqual(len(listings), 1)
+            # gh --slurp cannot be combined with its built-in --jq option.
+            self.assertIn("| jq 'add'", listings[0])
+            self.assertNotIn("--jq", listings[0])
+
     def test_containers_still_require_verified_assets_and_three_architectures(self):
         doc = workflow("publish-container.yml")
         jobs = doc["jobs"]
@@ -141,6 +174,16 @@ class WorkflowContracts(unittest.TestCase):
         self.assertEqual(set(jobs["merge"]["needs"]), {"prepare", "build"})
         self.assertIn('"${#sources[@]}" != 3', steps_text(jobs["merge"]))
         self.assertEqual(doc["concurrency"]["cancel-in-progress"], "false")
+        self.assertIn('release_policy.py published "$RELEASE_TAG"', steps_text(jobs["prepare"]))
+        merge = jobs["merge"]
+        self.assertEqual(merge["env"]["RELEASE_CHANNEL"], "${{ needs.prepare.outputs.channel }}")
+        checkout = next(step for step in merge["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+        self.assertEqual(checkout["with"]["ref"], "${{ needs.prepare.outputs.tooling_revision }}")
+        commands = steps_text(merge)
+        self.assertIn("gh api --paginate --slurp", commands)
+        self.assertLess(commands.index("release_policy.py channel"), commands.index("docker buildx imagetools create"))
+        self.assertIn('--tag "${IMAGE_NAME}:${RELEASE_CHANNEL}"', commands)
+        self.assertNotIn('--tag "${IMAGE_NAME}:latest"', commands)
 
 
 if __name__ == "__main__":

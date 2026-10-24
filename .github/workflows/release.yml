@@ -5,9 +5,15 @@ on:
     tags:
       - "v*.*.*"
       - "!v*.*.*-*"
+      - "v*.*.*-beta.*"
 
 permissions:
   contents: read
+
+# A retry for the same tag must not race draft upload/publication.
+concurrency:
+  group: outpace-release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   BIN_NAME: outpace
@@ -20,6 +26,8 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.release.outputs.version }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+      make_latest: ${{ steps.release.outputs.make_latest }}
 
     steps:
       - name: Checkout
@@ -41,15 +49,8 @@ jobs:
             exit 1
           fi
 
-          tag="$GITHUB_REF_NAME"
-          expected="v${cargo_version}"
-          if [[ "$tag" != "$expected" ]]; then
-            echo "::error::Release tag ${tag} does not match the Cargo version (expected ${expected}). Update the [workspace.package] version in Cargo.toml or retag."
-            exit 1
-          fi
-
-          echo "version=${cargo_version}" >> "$GITHUB_OUTPUT"
-          echo "Release version (from Cargo metadata): ${cargo_version}"
+          python3 tools/release/release_policy.py metadata "$GITHUB_REF_NAME" \
+            --cargo-version "$cargo_version" >> "$GITHUB_OUTPUT"
 
   build-binaries:
     name: Build ${{ matrix.target }}
@@ -182,13 +183,45 @@ jobs:
           python3 tools/release/prepare_container.py \
             "$GITHUB_REF_NAME" dist "$RUNNER_TEMP/validated-release" "$GITHUB_SHA"
 
+      - name: Keep an existing beta release immutable
+        if: needs.release-metadata.outputs.prerelease == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/$GH_REPO/releases?per_page=100" | jq 'add' > releases.json
+          python3 tools/release/release_policy.py unpublished "$GITHUB_REF_NAME" releases.json
+
+      # Prerelease assets must be uploaded while still a draft on repositories
+      # with immutable releases. The next step verifies the uploaded set first.
       - name: Publish release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           generate_release_notes: true
+          prerelease: ${{ needs.release-metadata.outputs.prerelease }}
+          draft: ${{ needs.release-metadata.outputs.prerelease }}
+          make_latest: ${{ needs.release-metadata.outputs.make_latest }}
+          fail_on_unmatched_files: true
           files: |
             dist/outpace-*
             dist/SHA256SUMS
+
+      - name: Verify uploaded beta assets and publish the draft
+        if: needs.release-metadata.outputs.prerelease == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release view "$GITHUB_REF_NAME" --json tagName,isDraft,isPrerelease > beta-release.json
+          python3 tools/release/release_policy.py draft "$GITHUB_REF_NAME" beta-release.json
+          gh release download "$GITHUB_REF_NAME" --dir "$RUNNER_TEMP/beta-release-assets" --pattern '*'
+          python3 tools/release/prepare_container.py "$GITHUB_REF_NAME" \
+            "$RUNNER_TEMP/beta-release-assets" "$RUNNER_TEMP/validated-beta-upload" "$GITHUB_SHA"
+          gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease --latest=false --verify-tag
+          gh release view "$GITHUB_REF_NAME" --json tagName,isDraft,isPrerelease > beta-release.json
+          python3 tools/release/release_policy.py published "$GITHUB_REF_NAME" beta-release.json
 
   publish-container:
     name: Publish GHCR image from release archives

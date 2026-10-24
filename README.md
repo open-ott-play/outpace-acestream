@@ -15,6 +15,7 @@ require an original closed-source engine at runtime and is not an official Ace
 Stream product. The executable remains `outpace`; configuration uses `OUTPACE_*`.
 
 [Download v0.8.1](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.8.1)
+· [Timeshift beta](docs/timeshift.md)
 · [Documentation](docs/README.md)
 · [HTTP API](docs/native-api.md)
 · [Troubleshooting](docs/troubleshooting.md)
@@ -59,7 +60,7 @@ the Unix durable peer-hint backend; follow the Windows-specific recipe.
 | Single-file VOD | Verified file pieces, HTTP byte ranges and native VOD HLS. Requires a VOD descriptor. |
 | Broadcast origination | Signed broadcasts from raw HTTP MPEG-TS, RTMP or managed HTTP(S) MPEG-TS input. |
 | Audio conversion | Optional FFmpeg-based conversion of selected supported live-HLS audio to AAC stereo. Video is copied. |
-| Historical playback | Peer timeshift and durable DVR are planned. A live HLS window is not a channel archive. |
+| Historical playback | 0.9.0 beta: opt-in finite retained-HLS replay with independent viewer generations; experimental exact peer-history acquisition. No UTC programme archive or durable DVR. See [timeshift](docs/timeshift.md). |
 
 Channel discovery, playlist curation, EPG and the television interface belong to
 the player or proxy. Codec support still depends on that player. Premium or

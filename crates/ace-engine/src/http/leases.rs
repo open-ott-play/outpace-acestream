@@ -1,4 +1,4 @@
-use crate::hls::HlsPackager;
+use crate::hls::{HlsHistorySnapshot, HlsPackager};
 use crate::session::{SessionPin, StreamSession, Subscription};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -30,6 +30,17 @@ struct AceHlsLease {
     _pin: SessionPin,
     idle_deadline: Instant,
     pending_requests: usize,
+    view: AceHlsView,
+    view_changed: tokio::sync::watch::Sender<u64>,
+}
+
+/// Viewer playback state is independent of the shared source/normalizer generation.
+/// A replay pins only this small descriptor, never copies or retains media outside
+/// the packager's bounded history store.
+#[derive(Clone, Debug)]
+pub(super) struct AceHlsView {
+    pub(super) generation: u64,
+    pub(super) history: Option<HlsHistorySnapshot>,
 }
 
 impl AceLease {
@@ -277,6 +288,11 @@ impl AceSessionStore {
                     _pin: pin.into_pin(),
                     idle_deadline: now + self.hls_idle_timeout,
                     pending_requests: 0,
+                    view: AceHlsView {
+                        generation: 0,
+                        history: None,
+                    },
+                    view_changed: tokio::sync::watch::channel(0).0,
                 }),
             },
         );
@@ -366,6 +382,58 @@ impl AceSessionStore {
                         .is_some_and(|bound| Arc::ptr_eq(&bound, hls))
                 })
             })
+    }
+
+    pub(super) fn hls_view(
+        &self,
+        id: &str,
+        token: &str,
+    ) -> Option<(AceHlsView, tokio::sync::watch::Receiver<u64>)> {
+        self.purge_expired(Instant::now());
+        let leases = self.leases.lock().unwrap();
+        let hls = leases
+            .get(token)
+            .filter(|lease| lease.playback_id == id)?
+            .hls
+            .as_ref()?;
+        Some((hls.view.clone(), hls.view_changed.subscribe()))
+    }
+
+    /// Commit a completely prepared replay/live view. Concurrent seeks compare the
+    /// generation they prepared against, and a revoked/expired source cannot commit.
+    pub(super) fn replace_hls_view(
+        &self,
+        id: &str,
+        token: &str,
+        pkg: &Arc<HlsPackager>,
+        expected_generation: u64,
+        history: Option<HlsHistorySnapshot>,
+    ) -> Option<AceHlsView> {
+        self.purge_expired(Instant::now());
+        let mut leases = self.leases.lock().unwrap();
+        let lease = leases
+            .get_mut(token)
+            .filter(|lease| lease.playback_id == id)?;
+        let bound = lease.generation.as_ref()?;
+        bound.source.upgrade()?;
+        if !bound
+            .hls
+            .as_ref()?
+            .upgrade()
+            .is_some_and(|current| Arc::ptr_eq(&current, pkg))
+        {
+            return None;
+        }
+        let hls = lease.hls.as_mut()?;
+        if hls.view.generation != expected_generation {
+            return None;
+        }
+        hls.view = AceHlsView {
+            generation: expected_generation.checked_add(1)?,
+            history,
+        };
+        hls.view_changed.send_replace(hls.view.generation);
+        Some(hls.view.clone())
     }
 
     /// Protect an authorized HLS manifest wait from idle expiry. Absolute authorization

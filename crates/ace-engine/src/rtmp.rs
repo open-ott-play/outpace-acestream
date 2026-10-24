@@ -380,14 +380,24 @@ mod tests {
 
     #[tokio::test]
     async fn rtmp_publish_reaches_broadcast_piece_store() {
-        let ffmpeg_available = Command::new("ffmpeg")
-            .arg("-version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .is_ok_and(|status| status.success());
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+        use tokio::time::timeout;
+
+        let ffmpeg_available = timeout(
+            Duration::from_secs(5),
+            Command::new("ffmpeg")
+                .arg("-version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await
+        .expect("ffmpeg version probe timed out")
+        .is_ok_and(|status| status.success());
         if !ffmpeg_available {
             eprintln!("skipping RTMP loopback smoke: target-executable ffmpeg is unavailable");
             return;
@@ -399,22 +409,55 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let server = tokio::spawn(async move {
-            let _ = serve_rtmp(addr, bs, cancel_rx).await;
+        // A normal RTMP disconnect intentionally drops an incomplete signed piece. Fence
+        // the graceful-unpublish flush too: this test must observe a full piece produced
+        // by ordinary media ingestion, independent of FFmpeg's shutdown command ordering.
+        let handler = RtmpIngestHandler::new(bs);
+        let (finish_tx, finish_rx) = watch::channel(false);
+        let operations = Arc::new(std::array::from_fn::<_, 3, _>(|_| AtomicUsize::new(0)));
+        let hook_operations = operations.clone();
+        handler.set_operation_hook(Arc::new(move |operation| {
+            let mut finish_rx = finish_rx.clone();
+            let index = match operation {
+                RtmpOperation::Mux => 0,
+                RtmpOperation::Ingest => 1,
+                RtmpOperation::Finish => 2,
+            };
+            hook_operations[index].fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                if operation == RtmpOperation::Finish {
+                    while !*finish_rx.borrow_and_update() {
+                        if finish_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            })
+        }));
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        let mut server = tokio::spawn(async move {
+            RtmpServer::new(ServerConfig::with_addr(addr).disable_gop_buffer(), handler)
+                .run_until(async move { cancelled(&mut cancel_rx).await })
+                .await
         });
         wait_for_tcp(addr).await;
 
         let output = format!("rtmp://{addr}/live/loop");
-        let status = Command::new("ffmpeg")
+        // HRD filler keeps even a tiny synthetic picture above the default 64 KiB
+        // piece boundary. Bound encoder/filter threads for concurrent CI test loads.
+        let mut child = Command::new("ffmpeg")
             .args([
                 "-hide_banner",
                 "-loglevel",
                 "error",
+                "-filter_threads",
+                "1",
+                "-filter_complex_threads",
+                "1",
                 "-f",
                 "lavfi",
                 "-i",
-                "testsrc=size=128x96:rate=10",
+                "testsrc2=size=128x96:rate=10",
                 "-f",
                 "lavfi",
                 "-i",
@@ -425,32 +468,127 @@ mod tests {
                 "libx264",
                 "-preset",
                 "ultrafast",
+                "-threads:v",
+                "1",
+                "-b:v",
+                "1M",
+                "-minrate",
+                "1M",
+                "-maxrate",
+                "1M",
+                "-bufsize",
+                "1M",
+                "-x264-params",
+                "nal-hrd=cbr:force-cfr=1",
                 "-g",
                 "10",
                 "-pix_fmt",
                 "yuv420p",
                 "-c:a",
                 "aac",
+                "-threads:a",
+                "1",
                 "-f",
                 "flv",
             ])
             .arg(output)
             .stdin(Stdio::null())
-            .status()
-            .await
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
             .expect("ffmpeg preflight succeeded for RTMP loopback test");
-        assert!(status.success(), "ffmpeg RTMP publish failed: {status}");
-
-        let bc = registry.get("loop").await.expect("broadcast was minted");
-        for _ in 0..100 {
-            if bc.store.lock().await.chunk(0, 0).is_some() {
-                server.abort();
-                return;
+        // Drain stderr concurrently, retaining only a bounded prefix for failure reports.
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let captured = stderr.clone();
+        let mut pipe = child.stderr.take().unwrap();
+        let mut stderr_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 4096];
+            loop {
+                let count = pipe.read(&mut buffer).await?;
+                if count == 0 {
+                    return Ok::<_, std::io::Error>(());
+                }
+                let mut captured = captured.lock().unwrap();
+                let keep = count.min((64 * 1024usize).saturating_sub(captured.len()));
+                captured.extend_from_slice(&buffer[..keep]);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        });
+
+        let observed = timeout(Duration::from_secs(15), async {
+            loop {
+                if let Some(bc) = registry.get("loop").await {
+                    let store = bc.store.lock().await;
+                    if store.has_piece(0) {
+                        let piece: Vec<u8> = (0..store.chunks_per_piece())
+                            .flat_map(|chunk| store.chunk(0, chunk).unwrap().into_owned())
+                            .collect();
+                        return (bc.clone(), piece);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+
+        // Always release the test barrier and reap processes/tasks before assertions.
+        // Keeping the child alive until this point also covers servers which wait for
+        // unpublish acknowledgement before FFmpeg exits.
+        finish_tx.send_replace(true);
+        let status = timeout(Duration::from_secs(5), child.wait()).await;
+        if status.is_err() {
+            let _ = child.start_kill();
+            let _ = timeout(Duration::from_secs(5), child.wait()).await;
         }
-        server.abort();
-        panic!("RTMP publish did not reach broadcast piece store");
+        let stderr_result = timeout(Duration::from_secs(5), &mut stderr_task).await;
+        if stderr_result.is_err() {
+            stderr_task.abort();
+        }
+        cancel_tx.send_replace(true);
+        let server_result = timeout(Duration::from_secs(5), &mut server).await;
+        if server_result.is_err() {
+            server.abort();
+        }
+        let shutdown = timeout(Duration::from_secs(5), registry.shutdown()).await;
+        let counts = operations
+            .each_ref()
+            .map(|value| value.load(Ordering::Relaxed));
+        let stderr = String::from_utf8_lossy(&stderr.lock().unwrap()).into_owned();
+        let diagnostics =
+            format!("ffmpeg={status:?}; mux/ingest/finish={counts:?}; stderr={stderr}");
+        assert!(
+            matches!(status, Ok(Ok(status)) if status.success()),
+            "FFmpeg RTMP publish failed or timed out: {diagnostics}"
+        );
+        assert!(
+            matches!(stderr_result, Ok(Ok(Ok(())))),
+            "stderr capture failed: {stderr_result:?}; {diagnostics}"
+        );
+        assert!(
+            matches!(server_result, Ok(Ok(Ok(())))),
+            "RTMP server did not shut down: {server_result:?}; {diagnostics}"
+        );
+        assert!(
+            matches!(shutdown, Ok(Ok(()))),
+            "registry shutdown: {shutdown:?}"
+        );
+        let (bc, piece) = observed.unwrap_or_else(|_| {
+            panic!("RTMP publish did not produce a complete piece before tail flush: {diagnostics}")
+        });
+        assert_eq!(bc.geometry.piece_length, 65_536);
+        assert_eq!(piece.len() as u64, bc.geometry.piece_length);
+        let (payload, signature) =
+            ace_wire::live_auth::split_piece(&piece, bc.auth.signature_len()).unwrap();
+        assert!(ace_wire::live_auth::verify_piece(
+            &bc.auth.pubkey_der(),
+            payload,
+            signature,
+        ));
+        assert!(payload
+            .as_chunks::<188>()
+            .0
+            .iter()
+            .all(|packet| packet[0] == 0x47));
     }
 }
 

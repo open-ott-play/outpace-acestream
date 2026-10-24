@@ -461,9 +461,11 @@ Environment variables parsed by the daemon include:
   `0` disables the age bound (byte-only, the pre-0.2 behavior). VOD stores are always byte-only.
 - `OUTPACE_CACHE_TYPE` - where the seed store keeps piece data: `memory` (default) or `disk`.
   `disk` trades RAM for capacity, mirroring Acestream's disk-cache option.
-- `OUTPACE_CACHE_DIR` - root dir for disk-mode piece files (one subdir per served stream; see
-  below), default `<data_dir>/cache`. Only used when `OUTPACE_CACHE_TYPE=disk`. Startup wipes
-  this directory only when it is empty or already contains a regular `.outpace-cache` sentinel
+- `OUTPACE_CACHE_DIR` - root dir for persistent warm-peer hints in both cache modes and
+  disk-mode piece files (one subdir per served stream; see below). Defaults to
+  `<OUTPACE_DATA_DIR>/cache` after selecting the data directory; an explicit cache path
+  takes precedence. In disk mode, startup wipes this directory only when it is empty or
+  already contains a regular `.outpace-cache` sentinel
   file (written automatically on first successful disk-cache start). A symlink is not accepted
   as a sentinel. An unmarked non-empty path is refused rather than deleted.
 - `OUTPACE_PREFETCH_PIECES` - optional exact number of pieces behind the live edge to start at.

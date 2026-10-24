@@ -342,8 +342,8 @@ config_with_root_redaction! {
     pub seed_retention_secs: u64,
     /// Backend the seed store uses for piece data (`memory` | `disk`).
     pub cache_type: CacheType,
-    /// Root directory for disk-mode piece files (one subdirectory per infohash). Only used when
-    /// `cache_type` is `Disk`. Defaults to `<data_dir>/cache`.
+    /// Root directory for persistent warm-peer hints in both cache modes, plus piece files
+    /// when `cache_type` is `Disk`. Defaults to `<data_dir>/cache` after environment overrides.
     pub cache_dir: PathBuf,
     /// Pieces behind the live edge to start at, giving an immediate playback cushion.
     pub prefetch_pieces: Option<u64>,

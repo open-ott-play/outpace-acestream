@@ -10,3 +10,9 @@
 
 # Local AceStream content-id registry (LLM context only, never committed)
 /acestream-ids.txt
+
+# Local Python helper/test bytecode
+__pycache__/
+
+# Generated inventory inside corresponding-source exports
+/SOURCE-MANIFEST.json

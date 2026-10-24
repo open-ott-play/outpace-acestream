@@ -240,6 +240,11 @@ async fn debug_memstats() -> Response {
 pub fn router(state: AppState) -> Router {
     let compat = state.experimental_ace_compat;
     let mut router = Router::new()
+        .route("/", get(crate::source::landing))
+        .route("/source", get(crate::source::landing))
+        .route("/source.tar.gz", get(crate::source::archive))
+        .route("/source.json", get(crate::source::metadata))
+        .route("/license", get(crate::source::license))
         .route("/healthz", get(|| async { "ok" }))
         .route("/debug/memstats", get(debug_memstats))
         .route("/networks", get(networks))
@@ -277,7 +282,9 @@ pub fn router(state: AppState) -> Router {
             .route("/server/api", get(server_api))
             .route("/webui/api/service", get(server_api));
     }
-    router.with_state(state)
+    router
+        .with_state(state)
+        .layer(axum::middleware::map_response(crate::source::advertise))
 }
 
 #[cfg(test)]

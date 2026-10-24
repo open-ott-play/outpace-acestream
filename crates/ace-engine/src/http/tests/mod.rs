@@ -18,6 +18,7 @@ mod compat;
 mod compat_hls;
 mod native;
 mod server_api;
+mod source;
 mod vod;
 
 fn state() -> AppState {

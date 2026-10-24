@@ -72,10 +72,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Prepare exact source context
+        run: python3 tools/source/prepare_context.py "$RUNNER_TEMP/outpace-source"
+
       - name: Build ARMv7 image
         uses: docker/build-push-action@v7
         with:
-          context: .
+          context: ${{ runner.temp }}/outpace-source
           platforms: linux/arm/v7
           load: true
           tags: outpace:armv7-smoke

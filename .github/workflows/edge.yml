@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE_NAME: ghcr.io/jamezrin/outpace
+  IMAGE_NAME: ghcr.io/open-ott-play/outpace-acestream
 
 jobs:
   publish:
@@ -50,10 +50,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Prepare exact source context
+        run: python3 tools/source/prepare_context.py "$RUNNER_TEMP/outpace-source"
+
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
-          context: .
+          context: ${{ runner.temp }}/outpace-source
           platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}

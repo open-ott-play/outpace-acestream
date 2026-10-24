@@ -2,6 +2,8 @@
 """Verify the complete release archive set and copy only Linux executables."""
 import argparse
 import hashlib
+import json
+import zipfile
 from pathlib import Path
 import re
 import tarfile
@@ -22,7 +24,9 @@ LINUX = {
 }
 
 
-def prepare(tag: str, assets: Path, output: Path) -> None:
+def prepare(tag: str, assets: Path, output: Path, revision: str) -> None:
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError("Expected the resolved Git release commit")
     if not re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", tag):
         raise ValueError("Expected a stable release tag vX.Y.Z")
     version = tag[1:]
@@ -45,6 +49,40 @@ def prepare(tag: str, assets: Path, output: Path) -> None:
             actual = hashlib.file_digest(source, "sha256").hexdigest()
         if actual != digest:
             raise ValueError(f"Checksum mismatch: {name}")
+    # Every platform must ship its exact source and legal notices. Read selected
+    # regular members only; never extract user-controlled archive paths.
+    notices = {}
+    for target, extension in TARGETS.items():
+        path = assets / f"outpace-{version}-{target}.{extension}"
+        prefix = f"outpace-{version}-{target}/"
+        required = ["corresponding-source.tar.gz", "source.json", "LICENSE", "NOTICE", "AUTHORS.md"]
+        values = {}
+        if extension == "zip":
+            with zipfile.ZipFile(path) as archive:
+                for name in required:
+                    matches = [item for item in archive.infolist() if item.filename == prefix + name]
+                    if len(matches) != 1 or matches[0].is_dir() or matches[0].file_size > 64 * 1024 * 1024:
+                        raise ValueError(f"Missing or oversized release source member: {name}")
+                    values[name] = archive.read(matches[0])
+        else:
+            with tarfile.open(path, "r:gz") as archive:
+                for name in required:
+                    matches = [item for item in archive.getmembers() if item.name == prefix + name]
+                    if len(matches) != 1 or not matches[0].isfile() or matches[0].size > 64 * 1024 * 1024:
+                        raise ValueError(f"Missing or oversized release source member: {name}")
+                    values[name] = archive.extractfile(matches[0]).read()
+        info = json.loads(values["source.json"])
+        if (info.get("version") != version or info.get("license") != "AGPL-3.0-or-later"
+                or info.get("project") != "Outpace AceStream"
+                or info.get("repository") != "https://github.com/open-ott-play/outpace-acestream"
+                or info.get("target") != target or info.get("base_revision") != revision
+                or info.get("tree_state") != "clean"
+                or hashlib.sha256(values["corresponding-source.tar.gz"]).hexdigest() != info.get("source_sha256")):
+            raise ValueError("Release source identity or checksum mismatch")
+        for name in ["LICENSE", "NOTICE", "AUTHORS.md"]:
+            if name in notices and notices[name] != values[name]:
+                raise ValueError("Legal notices differ across release targets")
+            notices[name] = values[name]
     # Validate every selected member before creating the context. Never extract paths.
     binaries = {}
     for target, platform in LINUX.items():
@@ -58,6 +96,8 @@ def prepare(tag: str, assets: Path, output: Path) -> None:
             if not binaries[platform]:
                 raise ValueError(f"Empty executable: {name}")
     output.mkdir(parents=True, exist_ok=False)
+    for name, data in notices.items():
+        (output / name).write_bytes(data)
     for platform, binary in binaries.items():
         destination = output / platform / "outpace"
         destination.parent.mkdir()
@@ -70,5 +110,6 @@ if __name__ == "__main__":
     parser.add_argument("tag")
     parser.add_argument("assets", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("revision", help="resolved commit of the release tag")
     args = parser.parse_args()
-    prepare(args.tag, args.assets, args.output)
+    prepare(args.tag, args.assets, args.output, args.revision)

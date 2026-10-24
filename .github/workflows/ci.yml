@@ -88,6 +88,9 @@ jobs:
       - name: Test A/B capture and analysis
         run: python3 -m unittest discover -s tools/abcompare -v
 
+      - name: Test source context isolation
+        run: python3 -m unittest discover -s tools/source -v
+
       - name: Test release archive verification
         run: python3 -m unittest discover -s tools/release -v
 

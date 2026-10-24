@@ -1,6 +1,7 @@
-# outpace
+# Outpace AceStream
 
-outpace is a from-scratch Rust implementation of the public Acestream P2P live
+Outpace AceStream is an independently maintained development of
+[Outpace](https://github.com/jamezrin/outpace), a Rust implementation of the public Acestream P2P live
 streaming path. It joins Acestream swarms, pulls MPEG-TS media, and exposes the
 result through a native daemon API, HLS, and CLI commands that work with players
 such as VLC and downstream tools such as Jellyfin or dispatcharr.
@@ -8,6 +9,60 @@ such as VLC and downstream tools such as Jellyfin or dispatcharr.
 The project does not use closed-source engine blobs at runtime. Reverse-engineering
 fixtures, protocol captures, and reference binaries are kept under git-ignored
 `re/` and `references/` directories when present on a development machine.
+
+## License, source and independent development
+
+This repository is `open-ott-play/outpace-acestream`. It preserves Outpace's Git
+history and **AGPL-3.0-or-later** license; creating an independent repository does
+not change those obligations. See [LICENSE](LICENSE), [NOTICE](NOTICE) and
+[AUTHORS.md](AUTHORS.md). The command is still `outpace`, crates keep their existing
+names, and `OUTPACE_*` environment variables remain compatible. This is an engine
+for AceStream sources, with HTTP/HLS output for players such as hls-proxy; it is
+not itself a player and is not an official Ace Stream product.
+
+Every build embeds a corresponding-source archive containing the actual tracked
+source bytes, Cargo.lock, build scripts, tests, documentation and notices. The
+running daemon offers it prominently at `/` and `/source`; `/source.tar.gz` serves
+the archive and `/source.json` reports its SHA-256, base Git revision and whether
+the tree was modified. An HTTP `Link` header advertises the offer on API responses.
+The same archive is available offline with `outpace source > source.tar.gz`.
+No runtime source checkout, network lookup or writable filesystem is required.
+
+Keep these endpoints reachable when putting a modified engine behind a proxy,
+and provide the source link to users of an integrated player. A separately
+modified surrounding program may have additional obligations; these mechanisms
+address this engine, not a blanket legal assessment of every deployment.
+
+### Building and reproducing source
+
+Build with the Rust toolchain pinned in `rust-toolchain.toml` and
+`cargo build --locked --release -p ace-engine --bin outpace`. Add new source files
+to Git before building; unindexed files in compilation directories are rejected.
+Tracked modifications are included and identified as modified. Ignored operator
+state, credentials, the private identifier registry and Git metadata are never
+part of the archive. Do not stage secrets: packaging deliberately publishes the
+tracked project, subject to checks against reserved private paths and unsafe links.
+
+To rebuild a downloaded source archive, extract it, enter `outpace-acestream`,
+and run the same Cargo command. The included `SOURCE-MANIFEST.json` supplies a
+hashed inventory when Git is absent. Cargo fetches the exact dependency versions
+and checksums in Cargo.lock from their public registries; native system build
+requirements are documented by the Dockerfiles and CI workflows. The archive
+identifies source inputs; it is not a claim of bit-for-bit binary reproducibility
+across different compilers, linkers, flags and hosts.
+
+For a container built from source, first prepare an isolated context containing
+only indexed project files (Python 3 is required for this preparation step):
+
+```bash
+python3 tools/source/prepare_context.py /tmp/outpace-source-context
+docker build -t outpace-acestream:local /tmp/outpace-source-context
+```
+
+The script refuses to overwrite an existing directory. CI uses the same process.
+Release archives include this source archive as well as the binary, license and
+notices. Published runtime images carry the exact release binary with its embedded
+source and identify the release revision through OCI labels.
 
 ## Status
 
@@ -262,11 +317,11 @@ Available targets:
 Install a prebuilt Unix binary:
 
 ```bash
-version=0.1.0
+version=0.8.1
 target=x86_64-unknown-linux-musl
 artifact="outpace-${version}-${target}.tar.gz"
-curl -LO "https://github.com/jamezrin/outpace/releases/download/v${version}/${artifact}"
-curl -LO "https://github.com/jamezrin/outpace/releases/download/v${version}/SHA256SUMS"
+curl -LO "https://github.com/open-ott-play/outpace-acestream/releases/download/v${version}/${artifact}"
+curl -LO "https://github.com/open-ott-play/outpace-acestream/releases/download/v${version}/SHA256SUMS"
 awk -v artifact="$artifact" '$2 == artifact { print }' SHA256SUMS | shasum -a 256 --check
 tar -xzf "$artifact"
 sudo install -m 0755 "outpace-${version}-${target}/outpace" /usr/local/bin/outpace
@@ -282,7 +337,7 @@ docker run --rm \
   -p 1935:1935 \
   -p 8621:8621/tcp \
   -v outpace-data:/var/lib/outpace \
-  ghcr.io/jamezrin/outpace:0.1.0
+  ghcr.io/open-ott-play/outpace-acestream:0.8.1
 ```
 
 The container defaults to `outpace serve`. It sets `OUTPACE_BIND=0.0.0.0:6878`,
@@ -321,10 +376,10 @@ the Cargo version. The workflow:
 - uploads `tar.gz` archives for Unix targets and `zip` archives for Windows;
 - generates one `SHA256SUMS` file for all archives;
 - creates a GitHub Release with generated release notes;
-- publishes `ghcr.io/jamezrin/outpace:<version>` and `ghcr.io/jamezrin/outpace:latest`.
+- publishes `ghcr.io/open-ott-play/outpace-acestream:<version>` and `ghcr.io/open-ott-play/outpace-acestream:latest`.
 
 Pushes to `main` run `.github/workflows/edge.yml`, which publishes
-`ghcr.io/jamezrin/outpace:edge` and `ghcr.io/jamezrin/outpace:sha-<commit>` for
+`ghcr.io/open-ott-play/outpace-acestream:edge` and `ghcr.io/open-ott-play/outpace-acestream:sha-<commit>` for
 `linux/amd64` only. `edge` moves with `main`. Keep production pinned to a
 release tag.
 

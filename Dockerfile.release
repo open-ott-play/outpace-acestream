@@ -12,7 +12,7 @@ ARG TARGETVARIANT
 FROM binary-${TARGETARCH}${TARGETVARIANT} AS binary
 
 FROM debian:bookworm-slim AS runtime
-LABEL org.opencontainers.image.source="https://github.com/jamezrin/outpace" \
+LABEL org.opencontainers.image.source="https://github.com/open-ott-play/outpace-acestream" \
       org.opencontainers.image.licenses="AGPL-3.0-or-later"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
@@ -22,7 +22,7 @@ RUN apt-get update \
     && chown outpace:outpace /var/lib/outpace \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=binary /outpace /usr/local/bin/outpace
-COPY LICENSE /usr/share/doc/outpace/LICENSE
+COPY LICENSE NOTICE AUTHORS.md /usr/share/doc/outpace/
 ENV OUTPACE_BIND=0.0.0.0:6878 \
     OUTPACE_RTMP_BIND=0.0.0.0:1935 \
     OUTPACE_DATA_DIR=/var/lib/outpace

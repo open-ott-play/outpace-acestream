@@ -36,6 +36,8 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Write the embedded corresponding source (tar.gz) to stdout, without starting services.
+    Source,
     /// Run the HTTP API, RTMP ingest listener, and enabled peer services.
     Serve(ServeArgs),
     /// Create or resume a named broadcast and run its ingest server.
@@ -129,6 +131,11 @@ impl PlaybackTarget {
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse_cli().command {
+        Command::Source => {
+            use std::io::Write;
+            std::io::stdout().lock().write_all(crate::source::ARCHIVE)?;
+            Ok(())
+        }
         Command::Serve(_) => run_serve().await,
         Command::Broadcast(args) => run_broadcast(args).await,
         Command::Play(args) => run_play(args).await,

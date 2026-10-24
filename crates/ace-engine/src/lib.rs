@@ -42,6 +42,7 @@ pub mod rtmp_ts;
 pub mod runtime;
 pub mod server_api;
 pub mod session;
+pub mod source;
 pub mod startup_buffer;
 pub mod testprovider;
 pub mod transport_url;

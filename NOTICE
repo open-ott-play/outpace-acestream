@@ -1,0 +1,34 @@
+Outpace AceStream
+https://github.com/open-ott-play/outpace-acestream
+
+This project is an independently maintained derivative of Outpace:
+https://github.com/jamezrin/outpace
+
+Original Outpace code: copyright its respective contributors, as recorded in
+Git history. Subsequent modifications: copyright the Outpace AceStream
+contributors, as recorded in Git history. Original authorship and notices are
+preserved. This project is not an official Ace Stream product or an endorsement
+by the original Outpace authors.
+
+The original Outpace engine and this derivative are licensed under the GNU
+Affero General Public License, version 3 or (at your option) any later version
+(AGPL-3.0-or-later). See LICENSE. The engine is not an MIT-licensed project.
+
+Changes beginning October 24, 2026 include independent project/release metadata,
+an embedded corresponding-source offer, and downstream reliability work. Git
+history records individual modifications and their dates. Runtime command names
+and OUTPACE_* configuration variables are retained for compatibility.
+
+Each distributed engine binary embeds its own source archive. Run
+    outpace source > source.tar.gz
+or download /source.tar.gz from its HTTP server. /source and /source.json provide
+license/source links and build identity. A Git base revision alone does not
+identify a modified build; use the archive's SHA-256 and SOURCE-MANIFEST.json.
+
+Third-party dependencies retain their respective licenses. Cargo.lock records
+exact Rust dependency versions and registry checksums; dependency sources and
+license notices are supplied by their upstream packages. An optional separately
+installed FFmpeg has its own build-dependent licensing terms.
+
+This program is distributed WITHOUT ANY WARRANTY, including the implied
+warranties of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See LICENSE.

@@ -21,17 +21,16 @@ RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
 COPY rust-toolchain.toml ./
 RUN rustup show
 
-COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
-# tools/ is copied so Cargo can resolve every workspace member's manifest; the
-# `-p ace-engine` build below still only compiles the engine, not the tools.
-COPY tools ./tools
+# The context must be prepared with tools/source/prepare_context.py.
+# It contains only indexed source and a hashed inventory for gitless builds.
+COPY . .
+RUN test -f SOURCE-MANIFEST.json
 
 RUN cargo build --locked --release -p ace-engine --bin outpace
 
 FROM debian:bookworm-slim AS runtime
 
-LABEL org.opencontainers.image.source="https://github.com/jamezrin/outpace" \
+LABEL org.opencontainers.image.source="https://github.com/open-ott-play/outpace-acestream" \
       org.opencontainers.image.licenses="AGPL-3.0-or-later"
 
 RUN apt-get update \
@@ -43,7 +42,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/target/release/outpace /usr/local/bin/outpace
-COPY LICENSE /usr/share/doc/outpace/LICENSE
+COPY --from=builder /src/LICENSE /src/NOTICE /src/AUTHORS.md /usr/share/doc/outpace/
 
 ENV OUTPACE_BIND=0.0.0.0:6878 \
     OUTPACE_RTMP_BIND=0.0.0.0:1935 \

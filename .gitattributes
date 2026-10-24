@@ -1,0 +1,4 @@
+# Legal notices must be byte-identical across all release platforms.
+LICENSE text eol=lf
+NOTICE text eol=lf
+AUTHORS.md text eol=lf

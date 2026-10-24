@@ -1,11 +1,10 @@
+# Build from an isolated context produced by tools/source/prepare_context.py.
+# These exclusions are defense in depth, not a replacement for its inventory.
+.git
 .agents
 .codex
-.git
-.github
-docs
 re
 references
 target
-tests
-tools/*
-!tools/swarmtest
+acestream-ids.txt
+.env

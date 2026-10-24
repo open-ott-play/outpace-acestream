@@ -23,7 +23,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE_NAME: ghcr.io/jamezrin/outpace
+  IMAGE_NAME: ghcr.io/open-ott-play/outpace-acestream
 
 jobs:
   prepare:
@@ -78,9 +78,8 @@ jobs:
           mkdir release-assets
           gh release download "$RELEASE_TAG" --dir release-assets \
             --pattern 'outpace-*' --pattern SHA256SUMS
-          python3 tools/release/prepare_container.py "$RELEASE_TAG" release-assets container-context
+          python3 tools/release/prepare_container.py "$RELEASE_TAG" release-assets container-context "${{ steps.release.outputs.revision }}"
           cp Dockerfile.release container-context/Dockerfile
-          cp LICENSE container-context/LICENSE
 
       - name: Upload verified runtime context
         uses: actions/upload-artifact@v7

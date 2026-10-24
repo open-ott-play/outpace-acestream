@@ -1036,8 +1036,10 @@ mod tests {
             secure::Directory::open(&root).is_err(),
             "directory inode lock must reject alias writers"
         );
-        directory.write(&valid()).unwrap();
-        assert_eq!(directory.read().unwrap(), valid());
+        // The fixture embeds a wall-clock second; reuse the exact bytes across I/O.
+        let expected = valid();
+        directory.write(&expected).unwrap();
+        assert_eq!(directory.read().unwrap(), expected);
         assert_eq!(
             std::fs::metadata(root.join(FILE))
                 .unwrap()

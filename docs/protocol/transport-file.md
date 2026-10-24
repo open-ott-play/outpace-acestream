@@ -65,6 +65,13 @@ infohash = SHA1(bencode([
 ```
 Confirmed by importing the official `Transport.so` in the sandbox and calling
 `load_transport_file_from_string(...).get_infohash()` while wrapping `hashlib.sha1`.
+
+When present, append `["provider_key", descriptor["provider_key"]]` and then
+`["provider_sid", descriptor["provider_sid"]]` after `bitrate`, before encoding the
+list. Preserve each value as bencode without normalization. Both fields are optional;
+ordinary descriptors keep the six-field formula. Omitting a supplied provider field
+selects a different swarm even when the displayed name and geometry match. The
+synthetic `provider-descriptor.bencode` vector covers the extended formula.
 Ground-truth vectors:
 - `tests/vectors/transport-01.bin` → official infohash =
   `50e93529d3eb46a50506b14464185a15292d6e47`

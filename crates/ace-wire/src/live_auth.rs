@@ -20,10 +20,9 @@
 //!   module to actually produce a valid signature instead of the old zero/placeholder tail.
 //!
 //! Confirmed against a real engine-produced `.sauth` file + two real captured pieces
-//! (`tests/vectors/live-source-auth/piece-{0,1}.bin`) — `verify_piece` passes on both, and
-//! re-signing the same payload with the same key reproduces the *exact* captured signature
-//! bytes (PKCS#1 v1.5 has no randomized padding, so this is a legitimate determinism check,
-//! not a coincidence).
+//! (`tests/vectors/live-source-auth/piece-{0,1}.bin`) — `verify_piece` passes on both.
+//! Committed interoperability fixtures retain only public keys and signed pieces;
+//! signing and PEM round-trip tests generate ephemeral identities at runtime.
 //!
 //! Identity/transport details (from note 25, still accurate):
 //! - The private key is plain **PKCS#1 PEM** (`-----BEGIN RSA PRIVATE KEY-----`).
@@ -178,34 +177,18 @@ mod tests {
         assert!(LiveSourceAuth::from_pkcs1_pem("not a key").is_err());
     }
 
-    /// Cross-check against a REAL engine-produced `.sauth` file + its transport's `pubkey`
-    /// field, captured in note 25 (docs/protocol/notes/25-source-node-b0-groundtruth.md).
-    /// This is the exact key/pubkey pair confirmed byte-for-byte via `openssl rsa -pubout`.
+    /// The captured transport's public identity needs no retained private material.
     #[test]
-    fn matches_captured_real_engine_key_and_pubkey() {
-        let pem = "-----BEGIN RSA PRIVATE KEY-----\n\
-MIIByQIBAAJhANWhf9+R3J9ahrC4TgA8INMYGRPcqH7duMMzjPujeKe0VNwkoFbO\n\
-zuqnTj0SVG4G71zFOUHjkQaZqOyj+tlB+gX8VXIyCwa4qYWgqG8WecY/KEGqw3u3\n\
-ttsqNZtdYP3SowIBAwJgI5rqpUL6Go8WcsliVV9azdlZg09xanpJdd3s1Js+xp4O\n\
-JLDFY80ifHE3tNhjZ6vSQUZhcWWa8rgGmXUKb5DV26lbwBmXIZqDThFraVC0TUlg\n\
-VRYz2NZBpUmrFU/QIXTPAjEA2GtgXaalo/gXRyTqHGKvHir3Y0qzQ3/X+Mk9XJA6\n\
-DkW9qfeCCfpRXQd69VZ2oRDlAjEA/LOQO9tJslFqDMDSH3pHwdk3jk3M+Zm9uG7m\n\
-mqIF6EEomS4KXLfbnmi4JigJlATnAjEAkEeVk8RubVAPhMNGvZcfaXH6QjHM16qP\n\
-+zDTkwrRXtkpG/pWsVGLk1pR+ORPFgtDAjEAqHe1fTzbzDZGsys2v6bagTt6Xt6I\n\
-pmZ+evSZvGwD8CtwZh6xkyU9FEXQGXAGYq3vAjAU/ftYqb721J8ZV++r45NvFtWA\n\
-lFnyUtHCJzkA4A01o5sLQecDwC9Zvq0jlUltCeM=\n\
------END RSA PRIVATE KEY-----\n";
-        let expected_pubkey_der = "307a300d06092a864886f70d01010105000369003066026100d5a17fdf91dc\
-9f5a86b0b84e003c20d3181913dca87eddb8c3338cfba378a7b454dc24a056ceceeaa74e3d12546e06ef5cc53941e\
-3910699a8eca3fad941fa05fc5572320b06b8a985a0a86f1679c63f2841aac37bb7b6db2a359b5d60fdd2a3020103";
-
-        let auth = LiveSourceAuth::from_pkcs1_pem(pem).unwrap();
-        let der_hex: String = auth
-            .pubkey_der()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        assert_eq!(der_hex, expected_pubkey_der);
+    fn captured_transport_pubkey_has_expected_der_and_signature_geometry() {
+        let der =
+            include_bytes!("../../../tests/vectors/live-source-auth/transport-public-key.der");
+        let key = RsaPublicKey::from_public_key_der(der).unwrap();
+        assert_eq!(key.to_public_key_der().unwrap().as_bytes(), der);
+        assert_eq!(signature_len_from_pubkey_der(der), Some(96));
+        assert_eq!(
+            LivePieceVerifier::from_der(der).unwrap().signature_len(),
+            96
+        );
     }
 
     #[test]
@@ -221,24 +204,10 @@ lFnyUtHCJzkA4A01o5sLQecDwC9Zvq0jlUltCeM=\n\
         assert!(split_piece(&[1, 2], 5).is_none());
     }
 
-    // Ground truth for the signing-scheme crack (note 27): a real official-engine source
-    // node's private key, captured by hooking its own PyCryptodome SHA1 calls while it
-    // signed real pieces (docs/protocol/notes/27-b0-signing-cracked.md), plus two real
-    // signed pieces it produced (tests/vectors/live-source-auth/piece-{0,1}.bin). This is
-    // NOT outpace's own key — it's the official engine's, used here purely to prove our
-    // sign/verify implementation matches the real one byte-for-byte.
-    const CAPTURED_SOURCE_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----\n\
-MIIByQIBAAJhALTKEtVQMXdmmIC0nHQmq4Htj0hiqqTCUmcUXdE7CKBd/c4KH/Cj\n\
-lbBIKcaX+eDlSnMsdfNkR3t8z5VISA2NejZJGBGgvnroMiJzMJg5ZwGOvICoxuwX\n\
-b0IBpo2Vic9s/QIBAwJgHiGtzjgIPpEZasjEvgZx6vztNrsccMsNu9i6TYnWxWT/\n\
-olcFUsXuSAwG9m6ppXuMIDpHjqjd9xuuK5uHesYQDFgmEeBOooVyC50WjezWByXZ\n\
-fh3C6Hiors46ytmwcDK1AjEAvT3G6vodnmK5DPUXYqGpxfe6NCuC/tzH+dwsNWu7\n\
-rz/6oOuxL13DXF3bYe32Bo0TAjEA9JEBsHT2EnQBgq4DykdwJkB5cjNjrOq94uh9\n\
-D0CnJ2uo6wqESeW3zM5qao1xJ6+vAjB+KS9HUWkUQdCzTg+XFnEupSbNcldUky/7\n\
-6B148n0ff/xrR8t06SzoPpJBSU6vCLcCMQCjC1Z1o062+AEByVfcL6AZgFD2zO0d\n\
-8dPsmv4KKxoaR8XyBwLb7nqIiZxHCPYadR8CMQCDtIDEcZ3dZEQkotxtIbErQSCr\n\
-w7burR2QqD9OS/n92TGQ2S3yyv5k6oG00re0J44=\n\
------END RSA PRIVATE KEY-----\n";
+    // Public-only interoperability evidence: the captured source's public key and
+    // its original signed pieces. Private identities are unnecessary for verification.
+    const CAPTURED_SOURCE_DER: &[u8] =
+        include_bytes!("../../../tests/vectors/live-source-auth/public-key.der");
 
     fn captured_piece(idx: u32) -> Vec<u8> {
         let path = format!(
@@ -253,19 +222,18 @@ w7burR2QqD9OS/n92TGQ2S3yyv5k6oG00re0J44=\n\
 
     #[test]
     fn signature_len_is_96_for_the_captured_768_bit_key() {
-        let auth = LiveSourceAuth::from_pkcs1_pem(CAPTURED_SOURCE_PEM).unwrap();
-        assert_eq!(auth.signature_len(), 96);
+        assert_eq!(signature_len_from_pubkey_der(CAPTURED_SOURCE_DER), Some(96));
     }
 
     #[test]
     fn verify_piece_passes_on_real_captured_pieces() {
-        let auth = LiveSourceAuth::from_pkcs1_pem(CAPTURED_SOURCE_PEM).unwrap();
-        let pubkey_der = auth.pubkey_der();
+        let pubkey_der = CAPTURED_SOURCE_DER;
+        let signature_len = signature_len_from_pubkey_der(pubkey_der).unwrap();
         for idx in [0, 1] {
             let piece = captured_piece(idx);
-            let (payload, sig) = split_piece(&piece, auth.signature_len()).unwrap();
+            let (payload, sig) = split_piece(&piece, signature_len).unwrap();
             assert!(
-                verify_piece(&pubkey_der, payload, sig),
+                verify_piece(pubkey_der, payload, sig),
                 "piece {idx}: real captured signature must verify"
             );
         }
@@ -273,31 +241,32 @@ w7burR2QqD9OS/n92TGQ2S3yyv5k6oG00re0J44=\n\
 
     #[test]
     fn verify_piece_rejects_a_tampered_payload() {
-        let auth = LiveSourceAuth::from_pkcs1_pem(CAPTURED_SOURCE_PEM).unwrap();
-        let pubkey_der = auth.pubkey_der();
+        let pubkey_der = CAPTURED_SOURCE_DER;
+        let signature_len = signature_len_from_pubkey_der(pubkey_der).unwrap();
         let piece = captured_piece(0);
-        let (payload, sig) = split_piece(&piece, auth.signature_len()).unwrap();
+        let (payload, sig) = split_piece(&piece, signature_len).unwrap();
         let mut tampered = payload.to_vec();
         tampered[0] ^= 0xFF;
-        assert!(!verify_piece(&pubkey_der, &tampered, sig));
+        assert!(!verify_piece(pubkey_der, &tampered, sig));
     }
 
     #[test]
-    fn resigning_the_real_payload_reproduces_the_exact_captured_signature() {
-        // PKCS#1 v1.5 has no randomized padding, so signing the same payload with the same
-        // key is deterministic: our implementation must reproduce the *exact* bytes the real
-        // engine produced, not just "a" signature that happens to verify.
-        let auth = LiveSourceAuth::from_pkcs1_pem(CAPTURED_SOURCE_PEM).unwrap();
-        for idx in [0, 1] {
-            let piece = captured_piece(idx);
-            let (payload, real_sig) = split_piece(&piece, auth.signature_len()).unwrap();
-            let our_sig = auth.sign(payload);
-            assert_eq!(
-                our_sig, real_sig,
-                "piece {idx}: re-signing must match the real engine byte-for-byte"
-            );
+    fn generated_identity_signing_is_deterministic_and_survives_pem_reload() {
+        let auth = LiveSourceAuth::generate();
+        let reloaded = LiveSourceAuth::from_pkcs1_pem(&auth.to_pkcs1_pem()).unwrap();
+        let pubkey_der = auth.pubkey_der();
+        for payload in [
+            b"synthetic first payload".as_slice(),
+            b"synthetic second payload",
+        ] {
+            let signature = auth.sign(payload);
+            assert_eq!(signature, auth.sign(payload));
+            assert_eq!(signature, reloaded.sign(payload));
+            assert!(verify_piece(&pubkey_der, payload, &signature));
+            assert!(!verify_piece(&pubkey_der, b"tampered payload", &signature));
         }
     }
+
     #[test]
     fn cached_verifier_matches_der_verification_for_valid_corrupt_and_wrong_key_pieces() {
         let source = LiveSourceAuth::generate();

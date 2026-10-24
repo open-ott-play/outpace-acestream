@@ -42,6 +42,9 @@ Actions; Trivy checks the checkout and Cargo lockfiles for fixable high/critical
 vulnerabilities and secrets; dependency review rejects newly introduced
 high/critical vulnerable dependencies in pull requests. These are supplemental
 checks and do not rename the five required checks or change branch protection.
+Golden signature tests retain public keys and signed pieces only. Signing and
+PEM round-trip tests generate ephemeral identities; captured private keys are not
+needed in the checkout and are not exempted from secret scanning.
 Only the CodeQL-capable caller grants `security-events: write`; the source fuzz
 assessment retains `contents: read` and receives no secrets.
 

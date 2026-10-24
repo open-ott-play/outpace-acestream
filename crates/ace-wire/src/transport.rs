@@ -53,6 +53,22 @@ pub struct TransportDescriptor {
     pub raw: crate::bencode::Bencode,
 }
 
+/// The descriptor determines its playback protocol; HLS has no piece geometry.
+#[derive(Debug)]
+pub enum TransportSource {
+    Swarm(Box<TransportDescriptor>),
+    Hls(HlsTransportDescriptor),
+}
+
+/// An HTTP HLS source described inside an encrypted Acestream transport file.
+#[derive(Debug, PartialEq, Eq)]
+pub struct HlsTransportDescriptor {
+    /// Original URL, including any signed query. Never rewrite or log credentials.
+    pub manifest_url: String,
+    pub title: Option<String>,
+    pub categories: Vec<String>,
+}
+
 impl TransportDescriptor {
     /// Total content byte length for a single-file VOD (`length` key), if present.
     ///
@@ -136,6 +152,23 @@ pub fn decode_transport_with_key(
     key: &[u8; 16],
     iv: &[u8; 16],
 ) -> Result<TransportDescriptor> {
+    match decode_transport_source_with_key(bytes, key, iv)? {
+        TransportSource::Swarm(descriptor) => Ok(*descriptor),
+        TransportSource::Hls(_) => Err(WireError::Hls("HLS transport requires manifest playback")),
+    }
+}
+
+/// Decode either a classic piece-based descriptor or an HLS descriptor.
+pub fn decode_transport_source(bytes: &[u8]) -> Result<TransportSource> {
+    decode_transport_source_with_key(bytes, &TRANSPORT_KEY, &TRANSPORT_IV)
+}
+
+/// Typed transport decoder with an explicit key and IV for deterministic vectors.
+pub fn decode_transport_source_with_key(
+    bytes: &[u8],
+    key: &[u8; 16],
+    iv: &[u8; 16],
+) -> Result<TransportSource> {
     // 1. Magic check.
     if !crate::infohash::is_transport_file(bytes) {
         return Err(WireError::Invalid("not a transport file"));
@@ -165,6 +198,24 @@ pub fn decode_transport_with_key(
     let raw = Bencode::parse(&pt)?;
     if !matches!(raw, Bencode::Dict(_)) {
         return Err(WireError::Invalid("descriptor not a dict"));
+    }
+
+    if raw.get(b"type").and_then(Bencode::as_bytes) == Some(b"hls") {
+        let manifest_url = raw
+            .get(b"manifest_url")
+            .and_then(Bencode::as_bytes)
+            .filter(|value| !value.is_empty() && value.len() <= 8192)
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .ok_or(WireError::Hls("missing or invalid HLS manifest_url"))?
+            .to_string();
+        return Ok(TransportSource::Hls(HlsTransportDescriptor {
+            manifest_url,
+            title: raw
+                .get(b"title")
+                .and_then(Bencode::as_bytes)
+                .and_then(|value| bounded_text(value, 256)),
+            categories: decode_categories(&raw),
+        }));
     }
 
     // 6. Extract fields.
@@ -205,7 +256,7 @@ pub fn decode_transport_with_key(
     };
     let is_live = pieces.is_empty();
 
-    Ok(TransportDescriptor {
+    Ok(TransportSource::Swarm(Box::new(TransportDescriptor {
         name,
         piece_length,
         chunk_length,
@@ -216,7 +267,7 @@ pub fn decode_transport_with_key(
         pieces,
         is_live,
         raw,
-    })
+    })))
 }
 
 /// Encode an Acestream transport file from a bencode descriptor dict — the inverse of
@@ -250,6 +301,67 @@ mod tests {
             &TRANSPORT_KEY,
             &TRANSPORT_IV,
         )
+    }
+
+    fn hls_fixture() -> Bencode {
+        Bencode::parse(
+            include_bytes!("../../../tests/vectors/hls-descriptor.bencode")
+                .strip_suffix(b"\n")
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn hls_descriptor_is_typed_without_inventing_piece_geometry() {
+        let bytes = encode_transport(&hls_fixture());
+        let TransportSource::Hls(descriptor) = decode_transport_source(&bytes).unwrap() else {
+            panic!("expected HLS transport");
+        };
+        assert_eq!(
+            descriptor.manifest_url,
+            "https://cdn.example.test/live/master.m3u8?token=a%2Fb&expires=123"
+        );
+        assert_eq!(descriptor.title.as_deref(), Some("Synthetic HLS fixture"));
+        assert_eq!(descriptor.categories, vec!["fixture"]);
+        assert!(matches!(decode_transport(&bytes), Err(WireError::Hls(_))));
+    }
+
+    #[test]
+    fn hls_requires_a_bounded_utf8_manifest_url_even_if_piece_fields_are_present() {
+        for manifest in [
+            None,
+            Some(Bencode::Int(1)),
+            Some(Bencode::Bytes(vec![])),
+            Some(Bencode::Bytes(vec![0xff])),
+            Some(Bencode::Bytes(vec![b'x'; 8193])),
+        ] {
+            let Bencode::Dict(mut descriptor) = hls_fixture() else {
+                unreachable!()
+            };
+            descriptor.remove(b"manifest_url".as_slice());
+            if let Some(manifest) = manifest {
+                descriptor.insert(b"manifest_url".to_vec(), manifest);
+            }
+            descriptor.insert(b"piece_length".to_vec(), Bencode::Int(131072));
+            descriptor.insert(b"chunk_length".to_vec(), Bencode::Int(16384));
+            assert!(matches!(
+                decode_transport_source(&encode_transport(&Bencode::Dict(descriptor))),
+                Err(WireError::Hls(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn source_decoder_checks_version_and_truncated_version_before_slicing_body() {
+        let mut bytes = encode_transport(&hls_fixture());
+        bytes[19] = 3;
+        assert!(matches!(
+            decode_transport_source(&bytes),
+            Err(WireError::Invalid(_))
+        ));
+        assert!(decode_transport_source(b"AceStreamTransport").is_err());
+        assert!(decode_transport_source(b"AceStreamTransport\x00").is_err());
     }
 
     #[test]

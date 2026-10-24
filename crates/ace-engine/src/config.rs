@@ -394,6 +394,8 @@ config_with_root_redaction! {
     /// the deprecated `OUTPACE_EXPERIMENTAL_ACE_COMPAT` alias. The field name is retained
     /// for Rust and serialized configuration compatibility; native APIs remain primary.
     pub experimental_ace_compat: bool,
+    /// Compatibility HLS inactivity timeout; pending manifest requests remain protected.
+    pub ace_hls_idle_timeout_ms: u64,
     /// Allow the outpace raw-transport-hash BEP-9 content-id fallback. Defaults off.
     pub bep9_content_id_fallback: bool,
     /// Immutable per-name origination profiles, applied only at identity admission.
@@ -438,6 +440,7 @@ impl Default for Config {
             port_map_backend: ace_swarm::portmap::PortMapBackend::Auto,
             port_map_external_port: None,
             experimental_ace_compat: false,
+            ace_hls_idle_timeout_ms: 60_000,
             bep9_content_id_fallback: false,
             broadcast_options: BTreeMap::new(),
             broadcast_sources: BTreeMap::new(),
@@ -793,3 +796,12 @@ mod tests {
 
 #[cfg(test)]
 mod inbound_policy_tests;
+
+impl Config {
+    pub fn ace_hls_idle_timeout(&self) -> Result<Duration, String> {
+        if !(1..=21_600_000).contains(&self.ace_hls_idle_timeout_ms) {
+            return Err("OUTPACE_HLS_IDLE_TIMEOUT_MS must be between 1 and 21600000".into());
+        }
+        Ok(Duration::from_millis(self.ace_hls_idle_timeout_ms))
+    }
+}

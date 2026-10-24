@@ -1,4 +1,4 @@
-//! Peer discovery: announce to the stream's UDP trackers (BEP-15) and aggregate the unique
+//! Peer discovery: announce to the stream's HTTP(S) and UDP trackers and aggregate the unique
 //! peers they return. Mainline DHT self-announce (`dht_announce_peer`, BEP-5) is a separate,
 //! composable primitive in `crate::dht` — callers that want both combine them explicitly
 //! (see `ace_engine::ace_provider`'s periodic self-announce), rather than baking a
@@ -231,8 +231,43 @@ async fn stream_tracker_peers(
     policy: TrackerPolicy,
     peers: tokio::sync::mpsc::Sender<SocketAddrV4>,
 ) {
+    let http = crate::http_tracker::discover_incremental(
+        trackers,
+        crate::http_tracker::Announce {
+            infohash: *infohash,
+            peer_id: *peer_id,
+            port,
+            event,
+            transfer: TransferState {
+                downloaded: 0,
+                left,
+                uploaded: 0,
+            },
+        },
+        peers.clone(),
+    );
+    let udp = stream_udp_tracker_peers(
+        trackers, infohash, peer_id, port, event, left, policy, peers,
+    );
+    tokio::join!(http, udp);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_udp_tracker_peers(
+    trackers: &[String],
+    infohash: &[u8; 20],
+    peer_id: &[u8; 20],
+    port: u16,
+    event: AnnounceEvent,
+    left: u64,
+    policy: TrackerPolicy,
+    peers: tokio::sync::mpsc::Sender<SocketAddrV4>,
+) {
     let mut jobs = tokio::task::JoinSet::new();
-    let mut urls = trackers.iter().take(MAX_TRACKERS);
+    let mut urls = trackers
+        .iter()
+        .take(MAX_TRACKERS)
+        .filter(|url| url.starts_with("udp://"));
     loop {
         while jobs.len() < TRACKER_PARALLELISM {
             let Some(url) = urls.next() else {

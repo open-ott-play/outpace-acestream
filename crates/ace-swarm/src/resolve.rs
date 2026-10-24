@@ -19,7 +19,9 @@ use ace_wire::handshake::random_peer_id;
 use ace_wire::identity::Identity;
 use ace_wire::infohash::{infohash_of_descriptor, transport_file_hash};
 use ace_wire::message::PeerMessage;
-use ace_wire::transport::decode_transport;
+use ace_wire::transport::{
+    decode_transport, decode_transport_source, TransportDescriptor, TransportSource,
+};
 use base64ct::{Base64, Encoding};
 use rand::RngExt;
 use sha1::{Digest, Sha1};
@@ -77,6 +79,8 @@ const CATALOG_RESPONSE_KEY: &[u8] = b"CNVU\\\\w5S/HGg\"pSzY&O\"`uGCD18\\x0cfS|h2
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ResolveError {
+    /// A recognized HLS descriptor has no usable manifest.
+    Hls(&'static str),
     BadInfohash,
     Transport(&'static str),
     /// A signed catalog request/response step failed during content-id resolution.
@@ -103,6 +107,10 @@ fn normalized_title(value: &str) -> Option<String> {
 /// content-id resolution): official swarm infohash + geometry + trackers from the descriptor.
 pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveError> {
     let d = decode_transport(bytes).map_err(|_| ResolveError::Transport("decode failed"))?;
+    stream_info_from_descriptor(d)
+}
+
+fn stream_info_from_descriptor(d: TransportDescriptor) -> Result<StreamInfo, ResolveError> {
     validate_geometry(d.piece_length, d.chunk_length)?;
     // A valid RSA pubkey => pieces carry a modulus-length signature tail to strip *and* a key
     // to verify each piece's in-band signature against (issue #10); no parseable pubkey =>
@@ -188,15 +196,14 @@ pub fn vod_info_from_transport(bytes: &[u8]) -> Result<VodInfo, ResolveError> {
 /// `piece_length`/`chunk_length` come from a metadata-swarm peer's transport descriptor. The
 /// wire codec addresses chunks within a piece by a `u16` index and assumes the fixed Acestream
 /// chunk size, so a downloadable descriptor must satisfy:
-/// - `chunk_length == DEFAULT_CHUNK_LENGTH` — the 16 KiB protocol constant the wire codec and
-///   both live/broadcast paths use; any other value is rejected rather than trusted.
+/// - `chunk_length` is a supported 8 KiB or 16 KiB live wire geometry; other values are rejected.
 /// - `piece_length <= MAX_PIECE_LENGTH` — bounds the per-piece reassembly allocation.
 /// - `piece_length` is an exact multiple of `chunk_length` — whole chunks per piece, so request
 ///   generation stays consistent with the descriptor.
 /// - `piece_length / chunk_length <= u16::MAX` — the chunks-per-piece count must fit the wire
 ///   chunk index without truncation (see [`StreamInfo::chunks_per_piece`]).
 fn validate_geometry(piece_length: u64, chunk_length: u64) -> Result<(), ResolveError> {
-    if chunk_length != DEFAULT_CHUNK_LENGTH {
+    if !matches!(chunk_length, 8192 | DEFAULT_CHUNK_LENGTH) {
         return Err(ResolveError::Transport("unexpected chunk_length"));
     }
     if piece_length > MAX_PIECE_LENGTH {
@@ -300,6 +307,79 @@ pub async fn resolve_infohash_via_catalog(infohash: &str) -> Result<StreamInfo, 
     let value = Base64::encode_string(&requested);
     let bytes = catalog_transport_bytes_query("infohash", &value).await?;
     catalog_infohash_info(&bytes, requested)
+}
+
+/// Playback protocol selected by a content descriptor. HLS must not acquire a P2P session.
+#[derive(Debug)]
+pub enum ResolvedTransport {
+    Swarm(StreamInfo),
+    Hls {
+        manifest_url: String,
+        metadata: StreamMetadata,
+    },
+}
+
+/// Resolve either supported descriptor kind without requiring HLS piece geometry.
+pub fn playback_from_transport(bytes: &[u8]) -> Result<ResolvedTransport, ResolveError> {
+    let decoded = decode_transport_source(bytes).map_err(|error| match error {
+        ace_wire::WireError::Hls(message) => ResolveError::Hls(message),
+        _ => ResolveError::Transport("decode failed"),
+    })?;
+    match decoded {
+        TransportSource::Swarm(descriptor) => {
+            stream_info_from_descriptor(*descriptor).map(ResolvedTransport::Swarm)
+        }
+        TransportSource::Hls(descriptor) => {
+            validate_hls_manifest_url(&descriptor.manifest_url)?;
+            Ok(ResolvedTransport::Hls {
+                manifest_url: descriptor.manifest_url,
+                metadata: StreamMetadata {
+                    title: descriptor.title,
+                    categories: descriptor.categories,
+                    bitrate: None,
+                },
+            })
+        }
+    }
+}
+
+/// Require an ordinary, absolute HTTP(S) URL without ambiguous whitespace or userinfo.
+/// This URL is returned to the player, never fetched by the engine. Redirecting the complete
+/// manifest URL keeps relative variants, segments, keys and signed queries relative to the
+/// origin. It does not implement the separate Acestream HLS-over-P2P distribution protocol.
+fn validate_hls_manifest_url(value: &str) -> Result<(), ResolveError> {
+    if value
+        .bytes()
+        .any(|b| b.is_ascii_control() || b.is_ascii_whitespace() || b == b'\\')
+    {
+        return Err(ResolveError::Hls("invalid HLS manifest URL"));
+    }
+    let url =
+        reqwest::Url::parse(value).map_err(|_| ResolveError::Hls("invalid HLS manifest URL"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !value.starts_with(&format!("{}://", url.scheme()))
+        || value
+            .split_once("://")
+            .is_none_or(|(_, rest)| rest.starts_with('/'))
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(ResolveError::Hls("unsupported HLS manifest URL"));
+    }
+    Ok(())
+}
+
+/// Fetch each playback's current descriptor; signed origin URLs are not cached indefinitely.
+pub async fn resolve_playback_via_catalog(
+    content_id: &str,
+) -> Result<ResolvedTransport, ResolveError> {
+    playback_from_transport(&catalog_transport_bytes(content_id).await?)
+}
+
+/// Fetch a transport-file URL with the existing bounded, DNS-pinned SSRF guard.
+pub async fn resolve_playback_from_url(url: &str) -> Result<ResolvedTransport, ResolveError> {
+    playback_from_transport(&transport_bytes_from_url(url).await?)
 }
 
 /// Fetch the raw (encrypted) `AceStreamTransport` bytes for `content_id` from the signed
@@ -810,6 +890,62 @@ mod tests {
     use cbc::cipher::{block_padding::Pkcs7, BlockModeEncrypt, KeyIvInit};
 
     #[test]
+    fn hls_playback_uses_origin_metadata_instead_of_swarm_geometry() {
+        let raw = ace_wire::bencode::Bencode::parse(
+            include_bytes!("../../../tests/vectors/hls-descriptor.bencode")
+                .strip_suffix(b"\n")
+                .unwrap(),
+        )
+        .unwrap();
+        let bytes = ace_wire::transport::encode_transport(&raw);
+        let ResolvedTransport::Hls {
+            manifest_url,
+            metadata,
+        } = playback_from_transport(&bytes).unwrap()
+        else {
+            panic!("expected HLS playback")
+        };
+        assert!(manifest_url.ends_with("?token=a%2Fb&expires=123"));
+        assert_eq!(metadata.title.as_deref(), Some("Synthetic HLS fixture"));
+        assert_eq!(metadata.bitrate, None);
+        assert_eq!(metadata.categories, vec!["fixture"]);
+        // The original piece-based API still refuses HLS; it must not synthesize a swarm.
+        assert!(stream_info_from_transport(&bytes).is_err());
+    }
+
+    #[test]
+    fn hls_origin_accepts_http_https_and_preserves_the_url_bytes() {
+        for url in [
+            "http://cdn.example.test/path/master.m3u8",
+            "https://cdn.example.test:8443/a%2Fb/master.m3u8?token=a%2Fb%3D&x=1&x=2",
+        ] {
+            assert_eq!(validate_hls_manifest_url(url), Ok(()));
+        }
+    }
+
+    #[test]
+    fn hls_origin_rejects_non_http_credentials_and_ambiguous_input() {
+        for url in [
+            "file:///etc/passwd",
+            "ftp://cdn.example.test/live",
+            "/relative.m3u8",
+            "javascript:alert(1)",
+            "http:///cdn.example.test/x",
+            "http:cdn.example.test/x",
+            "https://user:password@cdn.example.test/x",
+            "https://cdn.example.test/a\rb",
+            "https://cdn.example.test/a b",
+            "https://cdn.example.test/a\\b",
+            "http://",
+        ] {
+            assert!(
+                matches!(validate_hls_manifest_url(url), Err(ResolveError::Hls(_))),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
     fn transport_non_global_env_value_parses_to_deny_unless_exactly_one() {
         // Pure parse, no env mutation. Mirrors TrackerPolicy::from_env_value (#118): only the
         // exact value "1" opts in. Note this is stricter than the daemon's general boolean gates
@@ -1133,8 +1269,8 @@ mod tests {
 
     #[test]
     fn rejects_unexpected_chunk_length() {
-        // The wire codec's chunk size is the fixed Acestream protocol constant (16 KiB).
-        let tf = make_transport(b"d12:chunk_lengthi8192e12:piece_lengthi65536ee");
+        // Only the observed 8 KiB and 16 KiB wire geometries are supported.
+        let tf = make_transport(b"d12:chunk_lengthi4096e12:piece_lengthi65536ee");
         assert_eq!(
             stream_info_from_transport(&tf),
             Err(ResolveError::Transport("unexpected chunk_length"))
@@ -1152,6 +1288,14 @@ mod tests {
                 "piece_length not a multiple of chunk_length"
             ))
         );
+    }
+
+    #[test]
+    fn accepts_eight_kib_live_geometry() {
+        let tf = make_transport(b"d10:authmethod3:RSA7:bitratei8375e12:chunk_lengthi8192e4:name4:Test12:piece_lengthi65536e6:pubkey3:abce");
+        let info = stream_info_from_transport(&tf).unwrap();
+        assert_eq!(info.chunk_length, 8192);
+        assert_eq!(info.chunks_per_piece(), 8);
     }
 
     #[test]

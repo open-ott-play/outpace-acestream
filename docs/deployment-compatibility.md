@@ -1,0 +1,51 @@
+# Deployment compatibility
+
+Outpace AceStream keeps the `outpace` executable, `OUTPACE_*` configuration and
+Ace-compatible HTTP routes used by existing local and Kubernetes deployments.
+The repository name identifies the project; deployments do not need to rename
+services, persistent data directories or player URLs.
+
+## Descriptor and tracker support
+
+A transport descriptor with `type=hls` is resolved as an HLS origin, without
+inventing piece geometry or starting a swarm. `/ace/getstream` and
+`/ace/manifest.m3u8` redirect to its original HTTP(S) manifest; JSON mode returns
+that playback URL with `transport=hls`. Signed query bytes and relative playlist,
+segment and key resolution remain the origin's responsibility. Malformed HLS
+descriptors fail explicitly. This is origin handoff, not HLS-over-P2P relay.
+
+Classic live descriptors support observed 8 KiB and 16 KiB chunk geometry while
+retaining piece-size, divisibility and wire-index limits. Catalog-resolved swarm
+descriptors pass through the verified infohash index before playback, avoiding a
+second catalog fetch without trusting caller-supplied transport URLs as shared
+index authority.
+
+HTTP(S), UDP and DHT discovery operate concurrently. Each HTTP tracker request
+uses a pinned public address, no environment proxy and no redirects. HTTP
+collection has four concurrent requests, a five-second total deadline,
+64 KiB response limits and at most 200 accepted public IPv4 peers. Individual
+requests have a four-second deadline covering DNS and the response body.
+Results become available as each tracker completes. Dropping the discovery
+receiver cancels owned work. HTTP tracker destinations are always public even
+when `OUTPACE_TRACKER_ALLOW_NON_GLOBAL=1` permits private UDP trackers.
+
+## Compatibility HLS ownership
+
+`OUTPACE_HLS_IDLE_TIMEOUT_MS` defaults to `60000` and accepts `1..=21600000`.
+Successful media requests and manifest requests keep their own client lease
+alive. Status polling and missing segment probes do not. A pending manifest
+request protects cold startup from idle expiry; cancellation releases that
+protection. The independent six-hour authorization deadline and explicit stop
+still apply. One client's expiry does not stop another client's shared source.
+
+## Release qualification
+
+Synthetic tests cover descriptor routing, URL preservation, malformed metadata,
+tracker response shapes, destination guards, response limits, deadlines and
+client ownership. Passing them does not demonstrate public swarm availability,
+first decoded frame latency or device codec support. Qualify a release using the
+same bounded source, route, resource settings and player before switching an
+existing deployment. Retain the previous immutable image digest for rollback.
+
+Peer-network rewind and durable DVR are separate features. Neither a larger seed
+cache nor these compatibility changes enables an archive by itself.

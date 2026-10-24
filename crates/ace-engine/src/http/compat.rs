@@ -1,4 +1,7 @@
 use super::*;
+use ace_swarm::resolve::{
+    resolve_playback_from_url, resolve_playback_via_catalog, ResolveError, ResolvedTransport,
+};
 
 pub(super) async fn ace_getstream(
     State(s): State<AppState>,
@@ -19,6 +22,9 @@ pub(super) async fn ace_getstream(
             return Json(json!({ "response": null, "error": error })).into_response();
         }
     };
+    if selection.hls_manifest_url.is_some() {
+        return origin_hls_response(&selection, mode == AceGetstreamMode::Json);
+    }
     let Some(network) = ace_network(&s) else {
         return Json(json!({ "response": null, "error": "no ace network registered" }))
             .into_response();
@@ -94,6 +100,9 @@ pub(super) async fn ace_manifest(
             return Json(json!({ "response": null, "error": error })).into_response();
         }
     };
+    if selection.hls_manifest_url.is_some() {
+        return origin_hls_response(&selection, format == "json");
+    }
     let Some(network) = ace_network(&s) else {
         return Json(json!({ "response": null, "error": "no ace network registered" }))
             .into_response();
@@ -162,6 +171,9 @@ pub(super) async fn ace_hls_playback_with_timeout(
     let Some(token) = manifest.strip_suffix(".m3u8") else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let Some(_request) = s.ace_sessions.begin_hls_request(&id, token) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let Some((session_key, expires_at, mut cancel)) = s.ace_sessions.playback(&id, token) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -217,7 +229,7 @@ pub(super) async fn ace_hls_segment(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some((_, session_key)) = s.ace_sessions.validate_token(&token) else {
+    let Some((playback_id, session_key)) = s.ace_sessions.validate_token(&token) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some(network) = ace_network(&s) else {
@@ -235,14 +247,19 @@ pub(super) async fn ace_hls_segment(
         return StatusCode::NOT_FOUND.into_response();
     }
     match pkg.compatibility_segment(seq) {
-        Some(bytes) => (
-            [
-                (header::CONTENT_TYPE, "video/mp2t"),
-                (header::CACHE_CONTROL, "no-store"),
-            ],
-            bytes,
-        )
-            .into_response(),
+        Some(bytes) => {
+            let Some(_request) = s.ace_sessions.begin_hls_request(&playback_id, &token) else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            (
+                [
+                    (header::CONTENT_TYPE, "video/mp2t"),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -472,6 +489,7 @@ pub(super) struct AceStreamSelection {
     pub(super) session_key: String,
     pub(super) content_id: Option<String>,
     pub(super) metadata: StreamMetadata,
+    pub(super) hls_manifest_url: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -501,20 +519,29 @@ async fn resolve_ace_selection(
     let mut selection = ace_selected_stream(params)?;
     let network = ace_network(s);
     if s.resolve_content_ids_in_getstream {
-        if let Some(content_id) = selection.content_id.as_deref() {
-            match resolve_via_catalog(content_id).await {
-                Ok(info) => {
-                    // A client may open this infohash directly later (#164). Signed catalog
-                    // (`resolve_via_catalog`) only, so the descriptor is indexable.
+        let from_catalog = selection.content_id.is_some();
+        let resolution = if let Some(content_id) = selection.content_id.as_deref() {
+            Some(resolve_playback_via_catalog(content_id).await)
+        } else if let Some(url) = crate::transport_url::decode_transport_url(&selection.session_key)
+        {
+            Some(resolve_playback_from_url(&url).await)
+        } else {
+            None
+        };
+        if let Some(resolution) = resolution {
+            if from_catalog {
+                if let Ok(ResolvedTransport::Swarm(info)) = &resolution {
                     if let Some(network) = network.as_deref() {
-                        s.manager.remember_live_descriptor(network, &info);
+                        s.manager.remember_live_descriptor(network, info);
+                        // Open the indexed, validated descriptor without a second catalog fetch.
+                        selection.session_key = infohash_hex(&info.infohash);
                     }
-                    selection =
-                        selection.with_resolved_stream(infohash_hex(&info.infohash), info.metadata);
                 }
-                Err(e) => crate::alog!(
-                    "[ace] content-id catalog resolution failed, falling back to cid: {e:?}"
-                ),
+            }
+            selection =
+                apply_transport_resolution(selection, resolution).map_err(str::to_string)?;
+            if selection.hls_manifest_url.is_some() {
+                return Ok(selection);
             }
         }
     }
@@ -530,6 +557,65 @@ async fn resolve_ace_selection(
     Ok(selection)
 }
 
+fn apply_transport_resolution(
+    mut selection: AceStreamSelection,
+    resolution: Result<ResolvedTransport, ResolveError>,
+) -> Result<AceStreamSelection, &'static str> {
+    match resolution {
+        Ok(ResolvedTransport::Swarm(info)) => {
+            Ok(selection.with_resolved_stream(infohash_hex(&info.infohash), info.metadata))
+        }
+        Ok(ResolvedTransport::Hls {
+            manifest_url,
+            metadata,
+        }) => {
+            crate::alog!("[ace] HLS descriptor: handing playback to the original manifest");
+            selection.hls_manifest_url = Some(manifest_url);
+            selection.metadata = metadata;
+            Ok(selection)
+        }
+        // Recognized HLS descriptors do not describe a piece-based swarm, even if their
+        // origin is missing or invalid. Retrying as cid would hide the actual error.
+        Err(ResolveError::Hls(message)) => {
+            crate::alog!("[ace] HLS descriptor rejected: {message}");
+            Err(message)
+        }
+        Err(error) => {
+            crate::alog!("[ace] transport resolution failed, falling back to provider: {error:?}");
+            Ok(selection)
+        }
+    }
+}
+
+/// HLS descriptors refer to an existing origin. Do not mint fake swarm/control leases or
+/// relabel an HLS manifest as MPEG-TS. The player follows the original URL and owns buffering.
+fn origin_hls_response(selection: &AceStreamSelection, json_mode: bool) -> Response {
+    let url = selection.hls_manifest_url.as_ref().expect("HLS selection");
+    if json_mode {
+        return (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({
+                "response": {
+                    "playback_url": url,
+                    "content_id": selection.content_id,
+                    "transport": "hls",
+                    "metadata": stream_metadata_json(&selection.metadata),
+                },
+                "error": null
+            })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::FOUND,
+        [
+            (header::LOCATION, url.clone()),
+            (header::CACHE_CONTROL, "no-store".into()),
+        ],
+    )
+        .into_response()
+}
+
 pub(super) fn ace_selected_stream(
     params: &HashMap<String, String>,
 ) -> Result<AceStreamSelection, &'static str> {
@@ -541,6 +627,7 @@ pub(super) fn ace_selected_stream(
             session_key: format!("cid:{content_id}"),
             content_id: Some(content_id),
             metadata: StreamMetadata::default(),
+            hls_manifest_url: None,
         });
     }
     if let Some(infohash) = ace_nonempty_param(params, "infohash") {
@@ -551,6 +638,7 @@ pub(super) fn ace_selected_stream(
             session_key: infohash,
             content_id: None,
             metadata: StreamMetadata::default(),
+            hls_manifest_url: None,
         });
     }
     // The legacy `id=` spelling denotes an AceStream content id, not a swarm infohash.
@@ -562,6 +650,7 @@ pub(super) fn ace_selected_stream(
             session_key: format!("cid:{content_id}"),
             content_id: Some(content_id),
             metadata: StreamMetadata::default(),
+            hls_manifest_url: None,
         });
     }
     if let Some(url) = ace_nonempty_param(params, "url") {
@@ -576,6 +665,7 @@ pub(super) fn ace_selected_stream(
             session_key: token,
             content_id: None,
             metadata: StreamMetadata::default(),
+            hls_manifest_url: None,
         });
     }
     if let Some(magnet) = ace_nonempty_param(params, "magnet") {
@@ -586,6 +676,7 @@ pub(super) fn ace_selected_stream(
             session_key: hex,
             content_id: None,
             metadata: StreamMetadata::default(),
+            hls_manifest_url: None,
         });
     }
     Err("missing content_id/infohash/id/url/magnet")
@@ -621,4 +712,95 @@ fn request_base(headers: &HeaderMap) -> String {
         .filter(|h| !h.is_empty())
         .unwrap_or("127.0.0.1:6878");
     format!("http://{host}")
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+    fn params(values: &[(&str, &str)]) -> HashMap<String, String> {
+        values
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+    fn synthetic_hls_selection() -> AceStreamSelection {
+        let selection = ace_selected_stream(&params(&[(
+            "id",
+            "0123456789abcdef0123456789abcdef01234567",
+        )]))
+        .unwrap();
+        let raw = ace_wire::bencode::Bencode::parse(
+            include_bytes!("../../../../tests/vectors/hls-descriptor.bencode")
+                .strip_suffix(b"\n")
+                .unwrap(),
+        )
+        .unwrap();
+        let bytes = ace_wire::transport::encode_transport(&raw);
+        apply_transport_resolution(
+            selection,
+            ace_swarm::resolve::playback_from_transport(&bytes),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn hls_descriptor_redirect_preserves_signed_origin_and_disables_caching() {
+        let selection = synthetic_hls_selection();
+        let response = origin_hls_response(&selection, false);
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response.headers()[header::LOCATION],
+            "https://cdn.example.test/live/master.m3u8?token=a%2Fb&expires=123"
+        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        // A redirect lets the player resolve relative variants/segments/AES keys against
+        // the original URL, without the engine rewriting signed URL/query bytes.
+        assert!(axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn hls_descriptor_json_has_actual_transport_without_fake_swarm_controls() {
+        let response = origin_hls_response(&synthetic_hls_selection(), true);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], serde_json::Value::Null);
+        assert_eq!(json["response"]["transport"], "hls");
+        assert_eq!(
+            json["response"]["playback_url"],
+            "https://cdn.example.test/live/master.m3u8?token=a%2Fb&expires=123"
+        );
+        assert_eq!(
+            json["response"]["metadata"]["title"],
+            "Synthetic HLS fixture"
+        );
+        for key in [
+            "infohash",
+            "stat_url",
+            "command_url",
+            "playback_session_id",
+            "is_encrypted",
+        ] {
+            assert!(json["response"].get(key).is_none(), "must not invent {key}");
+        }
+    }
+
+    #[test]
+    fn recognized_hls_failures_never_fall_back_to_a_piece_based_provider() {
+        let selection = ace_selected_stream(&params(&[(
+            "id",
+            "0123456789abcdef0123456789abcdef01234567",
+        )]))
+        .unwrap();
+        assert_eq!(
+            apply_transport_resolution(selection, Err(ResolveError::Hls("missing manifest"))),
+            Err("missing manifest")
+        );
+    }
 }

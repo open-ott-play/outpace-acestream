@@ -162,6 +162,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Ok(v) = std::env::var("OUTPACE_HLS_STARTUP_TIMEOUT_MS") {
         config.hls.startup_timeout_ms = v.parse()?;
     }
+    if let Ok(v) = std::env::var("OUTPACE_HLS_IDLE_TIMEOUT_MS") {
+        config.ace_hls_idle_timeout_ms = v.parse()?;
+    }
     if let Ok(v) = std::env::var("OUTPACE_MAX_UNCHOKED") {
         config.max_unchoked = v.parse()?;
     }
@@ -198,6 +201,7 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     config.live_recovery.validate()?;
     config.startup_buffer.validate()?;
     config.hls.validate()?;
+    config.ace_hls_idle_timeout()?;
     config.hls_audio.validate()?;
     validate_cache_budget(&config)?;
     Ok(config)
@@ -454,10 +458,8 @@ pub fn bootstrap_peers_from_env() -> Vec<SocketAddrV4> {
 ///   be undiscoverable — so it is dropped with a warning rather than minted into a broken
 ///   descriptor. Ditto entries longer than the announce path's
 ///   [`ace_swarm::discover::MAX_TRACKER_URL_LEN`], which its resolver would skip anyway.
-/// - Well-formed but not lowercase `udp://` (e.g. `http://…`, `ws://…`, `UDP://…`): KEPT —
-///   other consumers of the minted descriptor may use it — but outpace's own self-announce
-///   resolver (`ace_swarm::discover::resolve_trackers`) only strips a literal lowercase
-///   `udp://` prefix, so outpace itself will never announce there; a warning says so.
+/// - Lowercase `udp://`, `http://` and `https://` are self-announced under destination policy.
+///   Other well-formed schemes are kept for descriptor consumers with a warning.
 /// - The kept list is clamped to [`ace_swarm::discover::MAX_TRACKERS`] with a warning — the
 ///   same cap the announce path applies.
 ///
@@ -476,10 +478,10 @@ pub fn broadcast_trackers_from_env() -> Vec<String> {
     let mut out = Vec::new();
     for s in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         match classify_tracker_entry(s) {
-            TrackerEntryClass::Udp => out.push(s.to_string()),
-            TrackerEntryClass::NonUdpScheme => {
+            TrackerEntryClass::SupportedScheme => out.push(s.to_string()),
+            TrackerEntryClass::UnsupportedScheme => {
                 crate::alog!(
-                    "[broadcast] WARNING: OUTPACE_TRACKERS entry {s:?} is not a lowercase udp:// URL; outpace only self-announces to udp:// trackers, so this entry is minted into broadcast descriptors for other clients only"
+                    "[broadcast] WARNING: OUTPACE_TRACKERS entry uses an unsupported scheme; outpace self-announces to lowercase udp://, http://, and https:// trackers, so this entry is minted into broadcast descriptors for other clients only"
                 );
                 out.push(s.to_string());
             }
@@ -510,12 +512,10 @@ pub fn broadcast_trackers_from_env() -> Vec<String> {
 /// branches of [`broadcast_trackers_from_env`] are unit-testable without capturing stderr.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrackerEntryClass {
-    /// Lowercase `udp://…` — minted into descriptors AND self-announced by outpace.
-    Udp,
-    /// Well-formed `scheme://rest` but not lowercase `udp://` (e.g. `http://`, `ws://`,
-    /// `UDP://`). Kept in the minted descriptor for other clients, but never self-announced:
-    /// `ace_swarm::discover::resolve_trackers` only strips a literal lowercase `udp://` prefix.
-    NonUdpScheme,
+    /// Lowercase UDP and HTTP(S), subject to each protocol's destination policy.
+    SupportedScheme,
+    /// Other well-formed schemes are kept in descriptors for other clients only.
+    UnsupportedScheme,
     /// Longer than [`ace_swarm::discover::MAX_TRACKER_URL_LEN`]; the announce path skips such
     /// entries, so minting them would be dead weight — dropped.
     TooLong,
@@ -530,10 +530,10 @@ fn classify_tracker_entry(s: &str) -> TrackerEntryClass {
     }
     match s.split_once("://") {
         Some((scheme, rest)) if !scheme.is_empty() && !rest.is_empty() => {
-            if scheme == "udp" {
-                TrackerEntryClass::Udp
+            if matches!(scheme, "udp" | "http" | "https") {
+                TrackerEntryClass::SupportedScheme
             } else {
-                TrackerEntryClass::NonUdpScheme
+                TrackerEntryClass::UnsupportedScheme
             }
         }
         _ => TrackerEntryClass::Malformed,
@@ -602,6 +602,7 @@ pub async fn build_runtime(
     config.startup_buffer.validate()?;
     config.live_recovery.validate()?;
     config.hls.validate()?;
+    config.ace_hls_idle_timeout()?;
     config.hls_audio.validate()?;
     validate_cache_budget(&config)?;
     preflight_broadcasts(&config)?;
@@ -814,7 +815,9 @@ async fn serve_http_inner(
         manager,
         networks: networks.clone(),
         resolve_content_ids_in_getstream: true,
-        ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
+        ace_sessions: Arc::new(crate::http::AceSessionStore::with_hls_idle_timeout(
+            config.ace_hls_idle_timeout()?,
+        )),
         experimental_ace_compat: config.experimental_ace_compat,
         broadcasts: Some(broadcasts.clone()),
     };
@@ -1500,21 +1503,23 @@ mod tests {
     #[test]
     fn tracker_entry_classification_matches_self_announce_reality() {
         use TrackerEntryClass::*;
-        // Self-announced: only a literal lowercase udp:// scheme (what
-        // ace_swarm::discover::resolve_trackers strips).
-        assert_eq!(classify_tracker_entry("udp://t.local:1/announce"), Udp);
-        // Kept-but-warned: well-formed, but outpace never self-announces to these.
+        // Supported lowercase tracker schemes.
+        assert_eq!(
+            classify_tracker_entry("udp://t.local:1/announce"),
+            SupportedScheme
+        );
+        // HTTP is supported alongside UDP; other schemes below are warning-only.
         assert_eq!(
             classify_tracker_entry("http://t.local/announce"),
-            NonUdpScheme
+            SupportedScheme
         );
         assert_eq!(
             classify_tracker_entry("ws://t.local/announce"),
-            NonUdpScheme
+            UnsupportedScheme
         );
         assert_eq!(
             classify_tracker_entry("UDP://t.local:1/announce"),
-            NonUdpScheme,
+            UnsupportedScheme,
             "resolve_trackers only matches lowercase udp://, so uppercase must be flagged"
         );
         // Dropped-and-warned.

@@ -16,7 +16,44 @@ pub(super) struct AceLease {
     /// receiver in the bounded lease instead, so the manager reaper sees the client until stop,
     /// expiry, or capacity eviction. The receiver is never read; the packager uses its own raw
     /// receiver and remains the sole segmenting pipeline.
-    _hls_pin: Option<Subscription>,
+    hls: Option<AceHlsLease>,
+}
+
+struct AceHlsLease {
+    _pin: Subscription,
+    idle_deadline: Instant,
+    pending_requests: usize,
+}
+
+impl AceLease {
+    fn deadline(&self) -> Instant {
+        match &self.hls {
+            Some(hls) if hls.pending_requests == 0 => self.expires_at.min(hls.idle_deadline),
+            _ => self.expires_at,
+        }
+    }
+}
+
+pub(super) struct AceHlsRequestGuard {
+    sessions: Arc<AceSessionStore>,
+    token: String,
+}
+
+impl Drop for AceHlsRequestGuard {
+    fn drop(&mut self) {
+        let mut leases = self.sessions.leases.lock().unwrap();
+        if let Some(hls) = leases
+            .get_mut(&self.token)
+            .and_then(|lease| lease.hls.as_mut())
+        {
+            hls.pending_requests -= 1;
+            hls.idle_deadline = hls
+                .idle_deadline
+                .max(Instant::now() + self.sessions.hls_idle_timeout);
+        }
+        drop(leases);
+        self.sessions.wake_hls_reaper();
+    }
 }
 
 /// Owns a hidden direct-playback lease for exactly as long as its HTTP body exists.
@@ -37,6 +74,7 @@ impl Drop for AceDirectLeaseGuard {
 pub struct AceSessionStore {
     pub(super) leases: Mutex<HashMap<String, AceLease>>,
     ttl: Duration,
+    hls_idle_timeout: Duration,
     capacity: usize,
     /// A single weak-reference reaper handles every HLS deadline for this store. Mutations bump
     /// the watch generation so capacity eviction, stop, and revoke cancel its current sleep and
@@ -56,16 +94,26 @@ impl Drop for HlsReaperGuard {
 
 impl Default for AceSessionStore {
     fn default() -> Self {
-        Self::new(ACE_TOKEN_TTL, ACE_TOKEN_CAPACITY)
+        Self::with_hls_idle_timeout(Duration::from_secs(60))
     }
 }
 
 impl AceSessionStore {
+    pub(crate) fn with_hls_idle_timeout(idle: Duration) -> Self {
+        Self::with_policy(ACE_TOKEN_TTL, ACE_TOKEN_CAPACITY, idle)
+    }
+
+    #[cfg(test)]
     pub(super) fn new(ttl: Duration, capacity: usize) -> Self {
+        Self::with_policy(ttl, capacity, Duration::from_secs(60))
+    }
+
+    pub(super) fn with_policy(ttl: Duration, capacity: usize, hls_idle_timeout: Duration) -> Self {
         let (hls_reaper_signal, _) = tokio::sync::watch::channel(0);
         Self {
             leases: Mutex::new(HashMap::new()),
             ttl,
+            hls_idle_timeout,
             capacity,
             hls_reaper_signal,
             hls_reaper_started: AtomicBool::new(false),
@@ -155,8 +203,8 @@ impl AceSessionStore {
             .lock()
             .unwrap()
             .values()
-            .filter(|lease| lease._hls_pin.is_some())
-            .map(|lease| lease.expires_at)
+            .filter(|lease| lease.hls.is_some())
+            .map(AceLease::deadline)
             .min()
     }
 
@@ -168,7 +216,7 @@ impl AceSessionStore {
     fn purge_expired(&self, now: Instant) {
         let mut leases = self.leases.lock().unwrap();
         leases.retain(|_, lease| {
-            let keep = lease.expires_at > now;
+            let keep = lease.deadline() > now;
             if !keep {
                 let _ = lease.cancel.send(true);
             }
@@ -200,11 +248,11 @@ impl AceSessionStore {
         if leases.len() >= self.capacity {
             if let Some(oldest) = leases
                 .iter()
-                .min_by_key(|(_, lease)| lease.expires_at)
+                .min_by_key(|(_, lease)| lease.deadline())
                 .map(|(t, _)| t.clone())
             {
                 if let Some(lease) = leases.remove(&oldest) {
-                    hls_schedule_changed |= lease._hls_pin.is_some();
+                    hls_schedule_changed |= lease.hls.is_some();
                     let _ = lease.cancel.send(true);
                 }
             }
@@ -217,7 +265,11 @@ impl AceSessionStore {
                 session_key,
                 expires_at: now + self.ttl,
                 cancel,
-                _hls_pin: hls_pin,
+                hls: hls_pin.map(|pin| AceHlsLease {
+                    _pin: pin,
+                    idle_deadline: now + self.hls_idle_timeout,
+                    pending_requests: 0,
+                }),
             },
         );
         drop(leases);
@@ -235,6 +287,30 @@ impl AceSessionStore {
         pin: Subscription,
     ) {
         self.insert_with_pin(token, playback_id, session_key, now, Some(pin));
+    }
+
+    /// Protect an authorized HLS manifest wait from idle expiry. Absolute authorization
+    /// expiry, stop and eviction still win. Dropping the request releases the protection.
+    pub(super) fn begin_hls_request(
+        self: &Arc<Self>,
+        playback_id: &str,
+        token: &str,
+    ) -> Option<AceHlsRequestGuard> {
+        let now = Instant::now();
+        self.purge_expired(now);
+        let mut leases = self.leases.lock().unwrap();
+        let lease = leases
+            .get_mut(token)
+            .filter(|lease| lease.playback_id == playback_id)?;
+        let hls = lease.hls.as_mut()?;
+        hls.pending_requests += 1;
+        hls.idle_deadline = hls.idle_deadline.max(now + self.hls_idle_timeout);
+        drop(leases);
+        self.wake_hls_reaper();
+        Some(AceHlsRequestGuard {
+            sessions: self.clone(),
+            token: token.to_string(),
+        })
     }
 
     pub(super) fn validate(&self, playback_id: &str, token: &str) -> Option<String> {
@@ -269,7 +345,7 @@ impl AceSessionStore {
     pub(super) fn revoke(&self, playback_id: &str, token: &str) -> bool {
         let mut leases = self.leases.lock().unwrap();
         let matches = leases.get(token).is_some_and(|lease| {
-            lease.playback_id == playback_id && lease.expires_at > Instant::now()
+            lease.playback_id == playback_id && lease.deadline() > Instant::now()
         });
         if matches {
             if let Some(lease) = leases.remove(token) {
@@ -332,5 +408,110 @@ impl AceSessionStore {
     #[cfg(test)]
     pub(super) fn hls_reaper_workers(&self) -> Arc<AtomicUsize> {
         self.hls_reaper_workers.clone()
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+    use crate::provider::TsSource;
+    use crate::session::StreamSession;
+
+    struct PendingSource;
+    #[async_trait::async_trait]
+    impl TsSource for PendingSource {
+        fn stats(&self) -> crate::provider::SourceStats {
+            crate::provider::SourceStats::default()
+        }
+        async fn next(&mut self) -> Option<bytes::Bytes> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_is_per_client_and_control_polling_does_not_renew_it() {
+        let now = Instant::now();
+        let store = Arc::new(AceSessionStore::with_policy(
+            Duration::from_secs(300),
+            8,
+            Duration::from_secs(60),
+        ));
+        let source = StreamSession::start(Box::new(PendingSource), 8);
+        for token in ["abandoned", "watching"] {
+            store.insert_hls_at(
+                token.into(),
+                "shared".into(),
+                "key".into(),
+                now - Duration::from_secs(59),
+                source.subscribe(),
+            );
+        }
+        assert!(store.validate_at("shared", "abandoned", now).is_some());
+        drop(store.begin_hls_request("shared", "watching").unwrap());
+        store.purge_expired(now + Duration::from_secs(2));
+        assert_eq!(source.subscriber_count(), 1);
+        assert!(!store.leases.lock().unwrap().contains_key("abandoned"));
+        assert!(store.leases.lock().unwrap().contains_key("watching"));
+        store.purge_expired(now + Duration::from_secs(61));
+        assert_eq!(source.subscriber_count(), 0);
+        assert!(store.begin_hls_request("shared", "abandoned").is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_request_protects_startup_but_not_absolute_expiry_or_stop() {
+        let now = Instant::now();
+        let store = Arc::new(AceSessionStore::with_policy(
+            Duration::from_secs(300),
+            8,
+            Duration::from_secs(60),
+        ));
+        let source = StreamSession::start(Box::new(PendingSource), 8);
+        store.insert_hls_at(
+            "startup".into(),
+            "id".into(),
+            "key".into(),
+            now,
+            source.subscribe(),
+        );
+        let request = store.begin_hls_request("id", "startup").unwrap();
+        store.purge_expired(now + Duration::from_secs(90));
+        assert_eq!(source.subscriber_count(), 1);
+        drop(request);
+        store.purge_expired(now + Duration::from_secs(120));
+        assert_eq!(source.subscriber_count(), 0);
+        store.insert_hls_at(
+            "absolute".into(),
+            "id".into(),
+            "key".into(),
+            now,
+            source.subscribe(),
+        );
+        let request = store.begin_hls_request("id", "absolute").unwrap();
+        store.purge_expired(now + Duration::from_secs(300));
+        drop(request);
+        assert_eq!(source.subscriber_count(), 0);
+        assert_eq!(store.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn reaper_releases_idle_source_without_another_http_request() {
+        let store = Arc::new(AceSessionStore::with_policy(
+            Duration::from_secs(300),
+            8,
+            Duration::from_millis(100),
+        ));
+        let source = StreamSession::start(Box::new(PendingSource), 8);
+        let token = store.mint_hls("id".into(), "key".into(), source.subscribe());
+        let request = store.begin_hls_request("id", &token).unwrap();
+        tokio::task::yield_now().await;
+        drop(request);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while source.subscriber_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(store.active_count(), 0);
     }
 }

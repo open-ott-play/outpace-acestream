@@ -176,6 +176,12 @@ jobs:
           sha256sum outpace-* > SHA256SUMS
           cat SHA256SUMS
 
+      - name: Validate every binary and corresponding source before publication
+        shell: bash
+        run: |
+          python3 tools/release/prepare_container.py \
+            "$GITHUB_REF_NAME" dist "$RUNNER_TEMP/validated-release" "$GITHUB_SHA"
+
       - name: Publish release
         uses: softprops/action-gh-release@v3
         with:

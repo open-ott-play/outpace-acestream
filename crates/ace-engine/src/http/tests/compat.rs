@@ -1178,3 +1178,44 @@ async fn measured_stats_schema_idle_unknown_and_invalid_token_do_not_start() {
         Some(&serde_json::Value::Null)
     );
 }
+
+#[tokio::test]
+async fn replaced_source_cannot_be_reopened_by_old_direct_playback_token() {
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    let state = stalled_hls_state();
+    let manager = state.manager.clone();
+    let app = router(state);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/ace/getstream?format=json&infohash={id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 8192)
+        .await
+        .unwrap();
+    let metadata: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let playback = metadata["response"]["playback_url"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("http://127.0.0.1:6878")
+        .unwrap();
+    let first = app
+        .clone()
+        .oneshot(Request::get(playback).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert!(manager.stop("stalled", id).await);
+    drop(first);
+    let response = app
+        .clone()
+        .oneshot(Request::get(playback).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(manager.get("stalled", id).await.is_none());
+}

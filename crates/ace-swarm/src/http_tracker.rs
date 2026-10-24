@@ -295,7 +295,7 @@ fn response_peers(body: &[u8]) -> Result<Vec<SocketAddrV4>> {
         if !compact.len().is_multiple_of(6) {
             return Err("malformed compact tracker peers");
         }
-        for bytes in compact.chunks_exact(6).take(MAX_PEERS) {
+        for bytes in compact.as_chunks::<6>().0.iter().take(MAX_PEERS) {
             add(
                 Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]),
                 u16::from_be_bytes([bytes[4], bytes[5]]),

@@ -672,34 +672,123 @@ fn checked_transport_file_hash(blob: &[u8], expected: [u8; 20]) -> bool {
     transport_file_hash(blob) == expected
 }
 
-/// A small TTL cache of resolved `content-id → StreamInfo` so repeated `open()`s of the same
-/// stream don't re-fetch metadata.
+const RESOLVE_CACHE_MAX_ENTRIES: usize = 128;
+const RESOLVE_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+struct ResolveCacheEntry {
+    info: StreamInfo,
+    inserted_at: Instant,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct ResolveCacheState {
+    entries: HashMap<String, ResolveCacheEntry>,
+    bytes: usize,
+}
+
+impl ResolveCacheState {
+    fn prune(&mut self, now: Instant, ttl: Duration) {
+        self.entries.retain(|_, entry| {
+            let keep = now.saturating_duration_since(entry.inserted_at) < ttl;
+            if !keep {
+                self.bytes -= entry.bytes;
+            }
+            keep
+        });
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.bytes -= entry.bytes;
+        }
+    }
+}
+
+/// A bounded TTL cache of resolved `content-id → StreamInfo`. Reads do not renew the TTL.
+/// Both reads and writes remove expired entries; oldest insertions are evicted at 128 entries
+/// or 8 MiB of owned key/descriptor buffer allocations, plus bounded map bookkeeping.
 pub struct ResolveCache {
-    entries: Mutex<HashMap<String, (StreamInfo, Instant)>>,
+    state: Mutex<ResolveCacheState>,
     ttl: Duration,
+    max_entries: usize,
+    max_bytes: usize,
 }
 
 impl ResolveCache {
     pub fn new(ttl: Duration) -> Self {
+        Self::with_limits(ttl, RESOLVE_CACHE_MAX_ENTRIES, RESOLVE_CACHE_MAX_BYTES)
+    }
+
+    fn with_limits(ttl: Duration, max_entries: usize, max_bytes: usize) -> Self {
         ResolveCache {
-            entries: Mutex::new(HashMap::new()),
+            state: Mutex::new(ResolveCacheState::default()),
             ttl,
+            max_entries,
+            max_bytes,
         }
     }
 
     /// Return a cached, unexpired `StreamInfo` for `key`, if any.
     pub fn get(&self, key: &str) -> Option<StreamInfo> {
-        let map = self.entries.lock().unwrap();
-        map.get(key)
-            .and_then(|(info, at)| (at.elapsed() < self.ttl).then(|| info.clone()))
+        self.get_at(key, Instant::now())
+    }
+
+    fn get_at(&self, key: &str, now: Instant) -> Option<StreamInfo> {
+        let mut state = self.state.lock().unwrap();
+        state.prune(now, self.ttl);
+        state.entries.get(key).map(|entry| entry.info.clone())
     }
 
     /// Store `info` under `key` with the current time.
     pub fn put(&self, key: &str, info: StreamInfo) {
-        self.entries
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), (info, Instant::now()));
+        self.put_at(key, info, Instant::now());
+    }
+
+    fn put_at(&self, key: &str, info: StreamInfo, now: Instant) {
+        let mut state = self.state.lock().unwrap();
+        state.prune(now, self.ttl);
+        state.remove(key);
+        let bytes = Self::allocation_bytes(key, &info);
+        // Do not retain an older descriptor when its replacement exceeds the cache budget.
+        // Skipping a hint only causes a later normal provider resolution.
+        if self.max_entries == 0 || bytes > self.max_bytes || self.ttl.is_zero() {
+            return;
+        }
+        while state.entries.len() >= self.max_entries || state.bytes > self.max_bytes - bytes {
+            let oldest = state
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.inserted_at)
+                .map(|(key, _)| key.clone())
+                .expect("only a nonempty cache can exceed its insertion budget");
+            state.remove(&oldest);
+        }
+        state.bytes += bytes;
+        state.entries.insert(
+            key.to_owned(),
+            ResolveCacheEntry {
+                info,
+                inserted_at: now,
+                bytes,
+            },
+        );
+    }
+
+    fn allocation_bytes(key: &str, info: &StreamInfo) -> usize {
+        let mut bytes = key.len().saturating_add(info.source_pubkey.capacity());
+        bytes = bytes.saturating_add(info.metadata.title.as_ref().map_or(0, String::capacity));
+        for strings in [&info.trackers, &info.metadata.categories] {
+            bytes = bytes.saturating_add(
+                strings
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            );
+            for string in strings {
+                bytes = bytes.saturating_add(string.capacity());
+            }
+        }
+        bytes
     }
 }
 
@@ -889,6 +978,86 @@ mod tests {
     use super::*;
     use cbc::cipher::{block_padding::Pkcs7, BlockModeEncrypt, KeyIvInit};
 
+    fn cache_info() -> StreamInfo {
+        StreamInfo {
+            infohash: [7; 20],
+            piece_length: 1,
+            chunk_length: 1,
+            trackers: vec![],
+            metadata: StreamMetadata::default(),
+            sig_len: 0,
+            source_pubkey: vec![],
+        }
+    }
+
+    #[test]
+    fn cache_prunes_unrelated_expired_entries_on_both_reads_and_writes() {
+        let cache = ResolveCache::new(Duration::from_secs(1));
+        let now = Instant::now();
+        cache.put_at("old-a", cache_info(), now);
+        cache.put_at("old-b", cache_info(), now);
+        assert!(cache
+            .get_at("missing", now + Duration::from_secs(1))
+            .is_none());
+        assert!(cache.state.lock().unwrap().entries.is_empty());
+        cache.put_at("old", cache_info(), now);
+        cache.put_at("fresh", cache_info(), now + Duration::from_secs(1));
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.entries.len(), 1);
+        assert!(state.entries.contains_key("fresh"));
+        assert_eq!(state.bytes, "fresh".len());
+    }
+
+    #[test]
+    fn cache_evicts_oldest_insertion_at_entry_and_byte_limits() {
+        let now = Instant::now();
+        let cache = ResolveCache::with_limits(Duration::from_secs(60), 2, 100);
+        cache.put_at("a", cache_info(), now);
+        cache.put_at("b", cache_info(), now + Duration::from_secs(1));
+        assert!(cache.get_at("a", now + Duration::from_secs(2)).is_some());
+        cache.put_at("c", cache_info(), now + Duration::from_secs(3));
+        assert!(cache.get_at("a", now + Duration::from_secs(3)).is_none());
+        assert_eq!(cache.state.lock().unwrap().entries.len(), 2);
+
+        let cache = ResolveCache::with_limits(Duration::from_secs(60), 128, 12);
+        let mut info = cache_info();
+        info.source_pubkey = vec![0; 6];
+        cache.put_at("a", info.clone(), now);
+        cache.put_at("b", info, now + Duration::from_secs(1));
+        assert!(cache.get_at("a", now + Duration::from_secs(1)).is_none());
+        assert_eq!(cache.state.lock().unwrap().bytes, 7);
+        cache.put_at("b", cache_info(), now + Duration::from_secs(2));
+        assert_eq!(cache.state.lock().unwrap().bytes, 1);
+        assert_eq!(cache.state.lock().unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn cache_charges_spare_buffer_capacity_and_drops_oversized_replacements() {
+        let cache = ResolveCache::with_limits(Duration::from_secs(60), 128, 64);
+        for field in ["pubkey", "title", "trackers", "categories"] {
+            cache.put("key", cache_info());
+            let mut oversized = cache_info();
+            match field {
+                "pubkey" => oversized.source_pubkey = Vec::with_capacity(1024),
+                "title" => oversized.metadata.title = Some(String::with_capacity(1024)),
+                "trackers" => oversized.trackers = Vec::with_capacity(64),
+                "categories" => oversized.metadata.categories = Vec::with_capacity(64),
+                _ => unreachable!(),
+            }
+            cache.put("key", oversized);
+            assert!(
+                cache.get("key").is_none(),
+                "oversized {field} must replace stale value with a miss"
+            );
+            assert_eq!(cache.state.lock().unwrap().bytes, 0);
+        }
+        let mut string_capacity = cache_info();
+        string_capacity.trackers.push(String::with_capacity(1024));
+        cache.put("key", string_capacity);
+        assert!(cache.get("key").is_none());
+        cache.put(&"k".repeat(65), cache_info());
+        assert!(cache.state.lock().unwrap().entries.is_empty());
+    }
     #[test]
     fn hls_playback_uses_origin_metadata_instead_of_swarm_geometry() {
         let raw = ace_wire::bencode::Bencode::parse(

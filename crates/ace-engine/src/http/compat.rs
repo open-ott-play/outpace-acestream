@@ -62,16 +62,24 @@ pub(super) async fn ace_getstream(
         return StatusCode::NOT_FOUND.into_response();
     };
     match s.manager.get_or_start(&network, &session_key).await {
-        Ok(session) => ace_stream_session_response(
-            session,
-            expires_at,
-            cancel,
-            Some(AceDirectLeaseGuard {
-                sessions: s.ace_sessions.clone(),
-                playback_id,
-                token,
-            }),
-        ),
+        Ok(session) => {
+            if !s
+                .ace_sessions
+                .bind_generation(&playback_id, &token, &session, None)
+            {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            ace_stream_session_response(
+                session,
+                expires_at,
+                cancel,
+                Some(AceDirectLeaseGuard {
+                    sessions: s.ace_sessions.clone(),
+                    playback_id,
+                    token,
+                }),
+            )
+        }
         Err(_) => {
             s.ace_sessions.revoke(&playback_id, &token);
             StatusCode::NOT_FOUND.into_response()
@@ -108,7 +116,7 @@ pub(super) async fn ace_manifest(
             .into_response();
     };
 
-    let (_pkg, session, pin) = match s
+    let (pkg, session, pin) = match s
         .manager
         .get_or_start_compatibility_hls(&network, &selection.session_key)
         .await
@@ -119,6 +127,12 @@ pub(super) async fn ace_manifest(
     let token = s
         .ace_sessions
         .mint_hls(selection.playback_id.clone(), selection.session_key, pin);
+    if !s
+        .ace_sessions
+        .bind_generation(&selection.playback_id, &token, &session, Some(&pkg))
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let base = request_base(&headers);
     let playback_url = format!("{base}/ace/m/{}/{}.m3u8", selection.playback_id, token);
 
@@ -183,6 +197,9 @@ pub(super) async fn ace_hls_playback_with_timeout(
     let Some(pkg) = s.manager.get_hls(&network, &session_key).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if !s.ace_sessions.matches_hls(&id, token, &pkg) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     // Sampled proxies rewrite absolute engine URLs into their own segment catch-all route.
     // Reuse the playback/control URL policy without trusting additional proxy headers.
     let prefix = format!("{}/ace/c/{token}", request_base(&headers));
@@ -246,6 +263,9 @@ pub(super) async fn ace_hls_segment(
     {
         return StatusCode::NOT_FOUND.into_response();
     }
+    if !s.ace_sessions.matches_hls(&playback_id, &token, &pkg) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     match pkg.compatibility_segment(seq) {
         Some(bytes) => {
             let Some(_request) = s.ace_sessions.begin_hls_request(&playback_id, &token) else {
@@ -274,8 +294,24 @@ pub(super) async fn ace_playback(
     let Some((session_key, expires_at, cancel)) = s.ace_sessions.playback(&id, &token) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match s.manager.get_or_start(&network, &session_key).await {
-        Ok(session) => ace_stream_session_response(session, expires_at, cancel, None),
+    let opened = match s.ace_sessions.bound_session(&id, &token) {
+        Err(()) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(Some(bound)) => {
+            let current = s.manager.get(&network, &session_key).await;
+            if !current.is_some_and(|current| Arc::ptr_eq(&current, &bound)) {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            Ok(bound)
+        }
+        Ok(None) => s.manager.get_or_start(&network, &session_key).await,
+    };
+    match opened {
+        Ok(session) => {
+            if !s.ace_sessions.bind_generation(&id, &token, &session, None) {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            ace_stream_session_response(session, expires_at, cancel, None)
+        }
         Err(error) => {
             // Provider messages may embed identifiers or credentials. Log only the typed
             // category, and keep both logs and response bodies independent of that text.
@@ -347,6 +383,13 @@ pub(super) async fn ace_stat(
         }));
     };
 
+    match s.ace_sessions.bound_session(&id, &token) {
+        Err(()) => return Json(json!({"response": null, "error": "playback generation expired"})),
+        Ok(Some(bound)) if !Arc::ptr_eq(&bound, &session) => {
+            return Json(json!({"response": null, "error": "playback generation expired"}))
+        }
+        _ => {}
+    }
     let stats = session.stats().await;
     Json(json!({
         "response": {

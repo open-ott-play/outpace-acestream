@@ -274,7 +274,7 @@ pub struct StreamManager {
     vod_cache: Mutex<HashMap<(String, String), VodCacheEntry>>,
     /// Serializes VOD *resolution* so concurrent first reads for the same id (a manifest fetch
     /// racing an eager segment fetch) trigger exactly one `provider.resolve_vod()`.
-    vod_resolve_lock: Mutex<()>,
+    vod_resolve_locks: StdMutex<HashMap<StreamKey, Weak<Mutex<()>>>>,
     buffer: usize,
     hls: HlsConfig,
     normalizer: Option<crate::hls_audio::PreparedNormalizer>,
@@ -315,7 +315,7 @@ impl StreamManager {
             hls_finalization: Mutex::new(()),
             session_start_locks: StdMutex::new(HashMap::new()),
             vod_cache: Mutex::new(HashMap::new()),
-            vod_resolve_lock: Mutex::new(()),
+            vod_resolve_locks: StdMutex::new(HashMap::new()),
             buffer,
             hls,
             normalizer,
@@ -374,7 +374,8 @@ impl StreamManager {
         }
         // Serialize resolution and re-check: a concurrent request may have resolved this id while
         // we waited, so we must not resolve (and discover) a second time.
-        let _resolving = self.vod_resolve_lock.lock().await;
+        let resolve_lock = Self::key_lock(&self.vod_resolve_locks, &key);
+        let _resolving = resolve_lock.lock().await;
         if let Some(v) = self.cached_vod(&key).await {
             return Ok(v);
         }
@@ -400,7 +401,14 @@ impl StreamManager {
     }
 
     fn session_start_lock(&self, key: &StreamKey) -> Arc<Mutex<()>> {
-        let mut locks = self.session_start_locks.lock().unwrap();
+        Self::key_lock(&self.session_start_locks, key)
+    }
+
+    fn key_lock(
+        locks: &StdMutex<HashMap<StreamKey, Weak<Mutex<()>>>>,
+        key: &StreamKey,
+    ) -> Arc<Mutex<()>> {
+        let mut locks = locks.lock().unwrap();
         locks.retain(|_, lock| lock.strong_count() > 0);
         if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
             return lock;
@@ -411,6 +419,14 @@ impl StreamManager {
         lock
     }
 
+    /// Reuse a live source, or the generation published by another start while this caller
+    /// waited. A finite replacement may already have ended: queued callers still share that
+    /// one acquisition instead of reopening once per waiter. Only a later fresh acquisition
+    /// that observed this ended generation on entry may replace it again.
+    fn reuse_session(current: &Arc<StreamSession>, observed: Option<&Arc<StreamSession>>) -> bool {
+        !current.is_finished() || observed.is_none_or(|old| !Arc::ptr_eq(old, current))
+    }
+
     /// Get the running session for `(network, id)` or start one via the provider. Returns
     /// `NotFound` if the network is unregistered.
     pub async fn get_or_start(
@@ -419,27 +435,59 @@ impl StreamManager {
         id: &str,
     ) -> Result<Arc<StreamSession>, ProviderError> {
         let key = (network.to_string(), id.to_string());
-        {
-            let map = self.sessions.lock().await;
-            if let Some(s) = map.get(&key) {
-                return Ok(s.clone());
-            }
+        let observed = self.sessions.lock().await.get(&key).cloned();
+        if let Some(session) = observed.as_ref().filter(|s| !s.is_finished()) {
+            return Ok(session.clone());
         }
         // Serialize same-key starts and re-check: direct and HLS callers share this lock, while
         // unrelated provider opens remain concurrent.
+        let mut transition = HlsTransition::begin(self.hls_transitions.clone(), key.clone());
         let start_lock = self.session_start_lock(&key);
         let _starting = start_lock.lock().await;
+        if transition.is_cancelled() {
+            return Err(ProviderError::NotFound);
+        }
         {
             let map = self.sessions.lock().await;
-            if let Some(s) = map.get(&key) {
+            if let Some(s) = map
+                .get(&key)
+                .filter(|s| Self::reuse_session(s, observed.as_ref()))
+            {
                 return Ok(s.clone());
             }
         }
         let provider = self.registry.get(network).ok_or(ProviderError::NotFound)?;
         let source = provider.open(id).await?;
         let session = StreamSession::start(source, self.buffer);
-        let mut map = self.sessions.lock().await;
-        Ok(map.entry(key).or_insert(session).clone())
+        // Publication ends the pending transition before old-worker cleanup finishes.
+        // Keep the replacement owned until this request can attach its real receiver.
+        let _transition_pin = session.subscribe().into_pin();
+        // A completed generation may still have clients draining its queued data. Publish
+        // the new source without reusing its old HLS worker or segment namespace.
+        let obsolete = {
+            let _finalizing = self.hls_finalization.lock().await;
+            if transition.finish()
+                || self
+                    .shutting_down
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(ProviderError::NotFound);
+            }
+            self.sessions
+                .lock()
+                .await
+                .insert(key.clone(), session.clone());
+            let obsolete = self.packagers.lock().await.remove(&key);
+            if let Some(entry) = &obsolete {
+                entry.media.stop();
+                entry.control.cancel();
+            }
+            obsolete
+        };
+        if let Some(entry) = obsolete {
+            entry.control.join().await;
+        }
+        Ok(session)
     }
 
     /// Peek at an already-running session without starting one.
@@ -457,9 +505,18 @@ impl StreamManager {
         network: &str,
         id: &str,
     ) -> Result<Arc<HlsPackager>, ProviderError> {
-        let (pkg, _session, _transition_pin) =
-            self.get_or_start_pinned_hls(network, id, true).await?;
+        let (pkg, _pin) = self.get_or_start_hls_with_pin(network, id).await?;
         Ok(pkg)
+    }
+
+    /// Keep native first-playlist startup alive until its request finishes or is cancelled.
+    pub(crate) async fn get_or_start_hls_with_pin(
+        self: &Arc<Self>,
+        network: &str,
+        id: &str,
+    ) -> Result<(Arc<HlsPackager>, Subscription), ProviderError> {
+        let (pkg, _session, pin) = self.get_or_start_pinned_hls(network, id, true).await?;
+        Ok((pkg, pin))
     }
 
     /// Get (or lazily start) a compatibility HLS packager without recording native activity.
@@ -486,6 +543,7 @@ impl StreamManager {
         {
             return Err(ProviderError::NotFound);
         }
+        let observed = self.sessions.lock().await.get(&key).cloned();
         let mut transition = HlsTransition::begin(self.hls_transitions.clone(), key.clone());
         let start_lock = self.session_start_lock(&key);
 
@@ -495,7 +553,13 @@ impl StreamManager {
             return Err(ProviderError::NotFound);
         }
 
-        let existing_session = self.sessions.lock().await.get(&key).cloned();
+        let existing_session = self
+            .sessions
+            .lock()
+            .await
+            .get(&key)
+            .filter(|session| Self::reuse_session(session, observed.as_ref()))
+            .cloned();
         let mut source: Option<Box<dyn TsSource>> = if existing_session.is_none() {
             let provider = self.registry.get(network).ok_or(ProviderError::NotFound)?;
             Some(provider.open(id).await?)
@@ -513,10 +577,13 @@ impl StreamManager {
             return Err(ProviderError::NotFound);
         }
 
+        // Whether to replace is decided before provider I/O. A source that ends while we
+        // hold the per-key start lock can still be drained; a later acquisition replaces it.
+        let replacing = existing_session.is_none();
         let session = {
             let mut sessions = self.sessions.lock().await;
-            if let Some(session) = sessions.get(&key) {
-                session.clone()
+            if let Some(session) = existing_session {
+                session
             } else {
                 let session = StreamSession::start(
                     source
@@ -531,6 +598,14 @@ impl StreamManager {
         let transition_pin = session.subscribe();
         let pkg = {
             let mut packagers = self.packagers.lock().await;
+            if replacing {
+                if let Some(obsolete) = packagers.remove(&key) {
+                    obsolete.media.stop();
+                    obsolete.control.cancel();
+                    // WorkerControl transfers unfinished joins to the manager's cleanup
+                    // tracker on drop; no provider work runs under this map lock.
+                }
+            }
             packagers
                 .entry(key)
                 .or_insert_with(|| {
@@ -614,6 +689,10 @@ impl StreamManager {
     }
 
     async fn reap_idle_at(&self, now: Instant) {
+        self.vod_cache
+            .lock()
+            .await
+            .retain(|_, (_, accessed)| now.saturating_duration_since(*accessed) < self.grace);
         let controls = {
             let _finalizing = self.hls_finalization.lock().await;
             let pending_hls: HashSet<_> = self
@@ -1338,6 +1417,474 @@ mod tests {
         );
         drop(old);
         (manager, cleanup_started, release_cleanup)
+    }
+
+    type SourceResult = Result<Box<dyn TsSource>, ProviderError>;
+
+    struct ReopenProvider {
+        sources: Mutex<tokio::sync::mpsc::UnboundedReceiver<SourceResult>>,
+        opened: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    #[async_trait]
+    impl StreamProvider for ReopenProvider {
+        fn network(&self) -> &'static str {
+            "reopen"
+        }
+
+        async fn open(&self, _: &str) -> SourceResult {
+            self.opened.send(()).unwrap();
+            self.sources.lock().await.recv().await.unwrap()
+        }
+    }
+
+    struct FinishedSource;
+
+    #[async_trait]
+    impl TsSource for FinishedSource {
+        async fn next(&mut self) -> Option<bytes::Bytes> {
+            None
+        }
+
+        fn stats(&self) -> SourceStats {
+            SourceStats::default()
+        }
+    }
+
+    fn reopen_manager() -> (
+        Arc<StreamManager>,
+        tokio::sync::mpsc::UnboundedSender<SourceResult>,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) {
+        let (sources, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (opened_tx, opened) = tokio::sync::mpsc::unbounded_channel();
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(ReopenProvider {
+            sources: Mutex::new(rx),
+            opened: opened_tx,
+        }));
+        (StreamManager::new(registry), sources, opened)
+    }
+
+    async fn wait_finished(session: &StreamSession) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !session.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("synthetic source must reach EOF");
+    }
+
+    async fn reopen_acquire(
+        manager: &Arc<StreamManager>,
+        hls: bool,
+    ) -> Result<Arc<StreamSession>, ProviderError> {
+        if hls {
+            manager
+                .get_or_start_compatibility_hls("reopen", "same")
+                .await
+                .map(|(_, session, _)| session)
+        } else {
+            manager.get_or_start("reopen", "same").await
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_replacement_stays_owned_while_old_hls_cleanup_waits() {
+        let (manager, sources, mut opened) = reopen_manager();
+        sources.send(Ok(Box::new(FinishedSource))).unwrap();
+        let (media, old_session, _old_pin) = manager
+            .get_or_start_compatibility_hls("reopen", "same")
+            .await
+            .unwrap();
+        opened.recv().await.unwrap();
+        wait_finished(&old_session).await;
+
+        let cleanup_started = Arc::new(Notify::new());
+        let release_cleanup = Arc::new(Notify::new());
+        let started = cleanup_started.clone();
+        let release = release_cleanup.clone();
+        let control = manager.cleanup.spawn(move |mut cancel| async move {
+            while cancel.changed().await.is_ok() && !*cancel.borrow() {}
+            started.notify_one();
+            release.notified().await;
+        });
+        let previous = manager.packagers.lock().await.insert(
+            ("reopen".into(), "same".into()),
+            HlsEntry { media, control },
+        );
+        drop(previous);
+        sources.send(Ok(Box::new(IdleSource))).unwrap();
+        let replacement_request = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.get_or_start("reopen", "same").await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), cleanup_started.notified())
+            .await
+            .expect("replacement must reach old-worker cleanup");
+        assert!(!replacement_request.is_finished());
+        manager.reap_idle_at(Instant::now()).await;
+        let published = manager
+            .get("reopen", "same")
+            .await
+            .expect("pending direct response must keep replacement registered");
+        assert!(!Arc::ptr_eq(&old_session, &published));
+        release_cleanup.notify_one();
+        let returned = tokio::time::timeout(Duration::from_secs(1), replacement_request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&published, &returned));
+        assert_eq!(returned.subscriber_count(), 0);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ended_session_reopen_is_singleflight_even_when_replacement_immediately_ends() {
+        for first_hls in [false, true] {
+            let (manager, sources, mut opened) = reopen_manager();
+            sources.send(Ok(Box::new(FinishedSource))).unwrap();
+            let (old_pkg, old_session, old_pin) = manager
+                .get_or_start_compatibility_hls("reopen", "same")
+                .await
+                .unwrap();
+            opened.recv().await.unwrap();
+            wait_finished(&old_session).await;
+            assert_ne!(
+                old_pkg.wait_available(Duration::from_secs(1)).await,
+                crate::hls::HlsStatus::Ready
+            );
+
+            let first = reopen_acquire(&manager, first_hls);
+            let second = reopen_acquire(&manager, !first_hls);
+            tokio::pin!(first, second);
+            assert!(futures::poll!(first.as_mut()).is_pending());
+            opened.try_recv().expect("one replacement provider open");
+            assert!(futures::poll!(second.as_mut()).is_pending());
+            assert!(opened.try_recv().is_err(), "second acquisition must wait");
+
+            sources.send(Ok(Box::new(FinishedSource))).unwrap();
+            let replacement = first.await.unwrap();
+            assert!(!Arc::ptr_eq(&old_session, &replacement));
+            if !first_hls {
+                assert!(manager.get_hls("reopen", "same").await.is_none());
+            }
+            wait_finished(&replacement).await;
+            let joined = tokio::time::timeout(Duration::from_secs(1), second)
+                .await
+                .expect("queued caller must not open another finite source")
+                .unwrap();
+            assert!(Arc::ptr_eq(&replacement, &joined));
+            assert!(opened.try_recv().is_err());
+            let new_pkg = manager.get_hls("reopen", "same").await.unwrap();
+            assert!(!Arc::ptr_eq(&old_pkg, &new_pkg));
+            assert_eq!(old_session.subscriber_count(), 1);
+            assert_eq!(replacement.subscriber_count(), 0);
+
+            // A genuinely later request observes the completed replacement and may retry.
+            sources.send(Ok(Box::new(IdleSource))).unwrap();
+            let fresh = reopen_acquire(&manager, first_hls).await.unwrap();
+            assert!(!Arc::ptr_eq(&replacement, &fresh));
+            opened.try_recv().expect("fresh acquisition reopens once");
+            assert!(!fresh.is_finished());
+            drop(old_pin);
+            assert_eq!(fresh.subscriber_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_reopen_preserves_old_generation_then_allows_retry() {
+        for hls in [false, true] {
+            let (manager, sources, mut opened) = reopen_manager();
+            sources.send(Ok(Box::new(FinishedSource))).unwrap();
+            let (old_pkg, old, _pin) = manager
+                .get_or_start_compatibility_hls("reopen", "same")
+                .await
+                .unwrap();
+            opened.recv().await.unwrap();
+            wait_finished(&old).await;
+
+            sources.send(Err(ProviderError::NotFound)).unwrap();
+            assert!(reopen_acquire(&manager, hls).await.is_err());
+            assert!(Arc::ptr_eq(
+                &old,
+                &manager.get("reopen", "same").await.unwrap()
+            ));
+            assert!(Arc::ptr_eq(
+                &old_pkg,
+                &manager.get_hls("reopen", "same").await.unwrap()
+            ));
+            assert!(manager.hls_transitions.lock().unwrap().pending.is_empty());
+
+            sources.send(Ok(Box::new(IdleSource))).unwrap();
+            let fresh = reopen_acquire(&manager, hls).await.unwrap();
+            assert!(!Arc::ptr_eq(&old, &fresh));
+            assert!(!fresh.is_finished());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_reopen_preserves_old_client_queue_and_allows_a_later_start() {
+        let (manager, sources, mut opened) = reopen_manager();
+        sources
+            .send(TestProvider { chunks: 2 }.open("finite").await)
+            .unwrap();
+        let old = reopen_acquire(&manager, false).await.unwrap();
+        let mut old_client = old.subscribe();
+        opened.recv().await.unwrap();
+        wait_finished(&old).await;
+
+        let mut cancelled = Box::pin(reopen_acquire(&manager, true));
+        assert!(futures::poll!(cancelled.as_mut()).is_pending());
+        opened.try_recv().unwrap();
+        drop(cancelled);
+        assert!(manager.hls_transitions.lock().unwrap().pending.is_empty());
+        assert!(manager.hls_transitions.lock().unwrap().cancelled.is_empty());
+        assert!(Arc::ptr_eq(
+            &old,
+            &manager.get("reopen", "same").await.unwrap()
+        ));
+
+        sources.send(Ok(Box::new(IdleSource))).unwrap();
+        let fresh = reopen_acquire(&manager, false).await.unwrap();
+        assert!(!Arc::ptr_eq(&old, &fresh));
+        for _ in 0..2 {
+            assert!(matches!(
+                old_client.rx.recv().await,
+                Ok(crate::session::StreamEvent::Data(_))
+            ));
+        }
+        assert!(matches!(
+            old_client.rx.recv().await,
+            Err(tokio::sync::broadcast::error::RecvError::Closed)
+        ));
+        assert_eq!(fresh.subscriber_count(), 0);
+        drop(old_client);
+        assert_eq!(fresh.subscriber_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_reopen_cohort_but_not_a_later_acquisition() {
+        for first_hls in [false, true] {
+            let (manager, sources, mut opened) = reopen_manager();
+            sources.send(Ok(Box::new(FinishedSource))).unwrap();
+            let old = reopen_acquire(&manager, true).await.unwrap();
+            opened.recv().await.unwrap();
+            wait_finished(&old).await;
+
+            let first = reopen_acquire(&manager, first_hls);
+            let queued = reopen_acquire(&manager, !first_hls);
+            tokio::pin!(first, queued);
+            assert!(futures::poll!(first.as_mut()).is_pending());
+            opened.try_recv().unwrap();
+            assert!(futures::poll!(queued.as_mut()).is_pending());
+            assert!(manager.stop("reopen", "same").await);
+            assert!(manager.get("reopen", "same").await.is_none());
+            assert!(manager.get_hls("reopen", "same").await.is_none());
+
+            let after_stop = reopen_acquire(&manager, !first_hls);
+            tokio::pin!(after_stop);
+            assert!(futures::poll!(after_stop.as_mut()).is_pending());
+            sources.send(Ok(Box::new(IdleSource))).unwrap();
+            assert!(first.await.is_err());
+            assert!(queued.await.is_err());
+            sources.send(Ok(Box::new(IdleSource))).unwrap();
+            let fresh = after_stop.await.unwrap();
+            assert!(!Arc::ptr_eq(&old, &fresh));
+            assert!(Arc::ptr_eq(
+                &fresh,
+                &manager.get("reopen", "same").await.unwrap()
+            ));
+            assert!(manager.hls_transitions.lock().unwrap().pending.is_empty());
+            assert!(manager.hls_transitions.lock().unwrap().cancelled.is_empty());
+        }
+    }
+
+    struct ParallelVodProvider {
+        entered: tokio::sync::mpsc::UnboundedSender<String>,
+        release: Arc<Notify>,
+    }
+
+    struct EmptyParallelVod;
+
+    #[async_trait]
+    impl VodContent for EmptyParallelVod {
+        fn content_length(&self) -> u64 {
+            0
+        }
+
+        async fn open_range(
+            &self,
+            _: u64,
+            _: u64,
+        ) -> Result<Box<dyn crate::provider::VodByteSource>, ProviderError> {
+            Err(ProviderError::NotFound)
+        }
+    }
+
+    #[async_trait]
+    impl StreamProvider for ParallelVodProvider {
+        fn network(&self) -> &'static str {
+            "parallel-vod"
+        }
+
+        async fn open(&self, _: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+            Ok(Box::new(IdleSource))
+        }
+
+        async fn resolve_vod(&self, id: &str) -> Result<Box<dyn VodContent>, ProviderError> {
+            self.entered.send(id.to_owned()).unwrap();
+            self.release.notified().await;
+            Ok(Box::new(EmptyParallelVod))
+        }
+    }
+
+    fn parallel_vod_manager() -> (
+        Arc<StreamManager>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+        Arc<Notify>,
+    ) {
+        let (entered, events) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(ParallelVodProvider {
+            entered,
+            release: release.clone(),
+        }));
+        (StreamManager::new(registry), events, release)
+    }
+
+    #[tokio::test]
+    async fn distinct_vod_resolutions_enter_provider_concurrently() {
+        let (manager, mut entered, release) = parallel_vod_manager();
+        let first = manager.resolve_vod("parallel-vod", "first");
+        let second = manager.resolve_vod("parallel-vod", "second");
+        tokio::pin!(first, second);
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        assert_eq!(entered.try_recv().unwrap(), "first");
+        assert_eq!(
+            entered
+                .try_recv()
+                .expect("another key must not wait for the first provider"),
+            "second"
+        );
+        release.notify_waiters();
+        assert!(first.await.is_ok());
+        assert!(second.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn same_key_vod_resolutions_share_one_pending_provider_call() {
+        let (manager, mut entered, release) = parallel_vod_manager();
+        let first = manager.resolve_vod("parallel-vod", "same");
+        let second = manager.resolve_vod("parallel-vod", "same");
+        tokio::pin!(first, second);
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        assert_eq!(entered.try_recv().unwrap(), "same");
+        assert!(entered.try_recv().is_err());
+        release.notify_waiters();
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(entered.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_vod_resolution_releases_its_key_lock_and_retry_is_not_blocked() {
+        let (manager, mut entered, release) = parallel_vod_manager();
+        let mut cancelled = Box::pin(manager.resolve_vod("parallel-vod", "cancelled"));
+        assert!(futures::poll!(cancelled.as_mut()).is_pending());
+        assert_eq!(entered.try_recv().unwrap(), "cancelled");
+        drop(cancelled);
+        assert!(manager
+            .vod_resolve_locks
+            .lock()
+            .unwrap()
+            .values()
+            .all(|lock| lock.upgrade().is_none()));
+
+        let mut retry = Box::pin(manager.resolve_vod("parallel-vod", "cancelled"));
+        assert!(futures::poll!(retry.as_mut()).is_pending());
+        assert_eq!(entered.try_recv().unwrap(), "cancelled");
+        // VOD and live protocols do not share their per-key start mutexes.
+        assert!(manager
+            .get_or_start("parallel-vod", "cancelled")
+            .await
+            .is_ok());
+        release.notify_waiters();
+        assert!(retry.await.is_ok());
+        assert!(manager
+            .vod_resolve_locks
+            .lock()
+            .unwrap()
+            .values()
+            .all(|lock| lock.upgrade().is_none()));
+    }
+
+    #[tokio::test]
+    async fn idle_reaper_releases_vod_cache_without_another_request() {
+        use crate::provider::{VodByteSource, VodContent};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct TrackedVod(Arc<AtomicUsize>);
+        impl Drop for TrackedVod {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        #[async_trait]
+        impl VodContent for TrackedVod {
+            fn content_length(&self) -> u64 {
+                0
+            }
+            async fn open_range(
+                &self,
+                _: u64,
+                _: u64,
+            ) -> Result<Box<dyn VodByteSource>, ProviderError> {
+                Err(ProviderError::NotFound)
+            }
+        }
+        let manager = StreamManager::new(ProviderRegistry::new());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let now = Instant::now();
+        let idle: Arc<dyn VodContent> = Arc::new(TrackedVod(drops.clone()));
+        let idle_weak = Arc::downgrade(&idle);
+        let active: Arc<dyn VodContent> = Arc::new(TrackedVod(drops.clone()));
+        let active_weak = Arc::downgrade(&active);
+        let in_use: Arc<dyn VodContent> = Arc::new(TrackedVod(drops.clone()));
+        manager.vod_cache.lock().await.extend([
+            (
+                ("test".to_owned(), "idle".to_owned()),
+                (idle, now - manager.grace),
+            ),
+            (("test".to_owned(), "active".to_owned()), (active, now)),
+            (
+                ("test".to_owned(), "in-use".to_owned()),
+                (in_use.clone(), now - manager.grace),
+            ),
+        ]);
+        manager.reap_idle_at(now).await;
+        assert!(
+            idle_weak.upgrade().is_none(),
+            "the unused cache must be freed without any new request"
+        );
+        assert!(
+            active_weak.upgrade().is_some(),
+            "recent access retains its cache"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            Arc::strong_count(&in_use),
+            1,
+            "expiry removes only the cache owner, preserving an active range reader"
+        );
+        drop(in_use);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 
     #[test]

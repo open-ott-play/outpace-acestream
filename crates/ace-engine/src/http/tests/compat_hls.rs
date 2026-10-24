@@ -943,3 +943,37 @@ async fn ace_hls_returns_404_after_a_segment_leaves_the_native_window() {
         StatusCode::NOT_FOUND
     );
 }
+
+#[tokio::test]
+async fn replaced_source_cannot_be_read_or_stopped_by_old_hls_token() {
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    let state = stalled_hls_state();
+    let manager = state.manager.clone();
+    let app = router(state.clone());
+    let (playback_id, manifest, stop_old) = mint_stalled_hls(&app, id).await;
+    let old = manager.get("stalled", id).await.unwrap();
+    assert!(manager.stop("stalled", id).await);
+    let (_, _, _) = mint_stalled_hls(&app, id).await;
+    let current = manager.get("stalled", id).await.unwrap();
+    assert!(!Arc::ptr_eq(&old, &current));
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        app.clone().oneshot(
+            Request::get(format!("/ace/m/{playback_id}/{manifest}"))
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("stale playback must fail without waiting for new media")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let _ = app
+        .oneshot(Request::get(stop_old).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &current,
+        &manager.get("stalled", id).await.unwrap()
+    ));
+}

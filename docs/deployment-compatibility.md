@@ -38,6 +38,17 @@ request protects cold startup from idle expiry; cancellation releases that
 protection. The independent six-hour authorization deadline and explicit stop
 still apply. One client's expiry does not stop another client's shared source.
 
+Playback tokens bind to the source and HLS packager created for that playback.
+After the source ends, a fresh request may open a replacement; queued requests
+share that replacement even if it also ends immediately. Old tokens cannot read,
+reopen, or stop the replacement. Pending startup and replacement cleanup keep
+their source owned until the requesting client can take over.
+
+Resolved live metadata is cached for its original TTL, with 128-entry and 8 MiB
+owned-buffer limits. Reads do not prolong stale descriptors. VOD resolution is
+serialized per source, so a slow catalog request cannot block unrelated sources;
+idle cached VOD handles are released by the normal reaper.
+
 ## Release qualification
 
 Synthetic tests cover descriptor routing, URL preservation, malformed metadata,

@@ -164,8 +164,8 @@ pub(super) async fn stream_file_with_hls_timeout(
             Ok(id) => id,
             Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
         };
-        return match s.manager.get_or_start_hls(&network, &id).await {
-            Ok(pkg) => {
+        return match s.manager.get_or_start_hls_with_pin(&network, &id).await {
+            Ok((pkg, _request_pin)) => {
                 let prefix = format!(
                     "/streams/{network}/{}/seg",
                     native_public_stream_id(&network, &id)

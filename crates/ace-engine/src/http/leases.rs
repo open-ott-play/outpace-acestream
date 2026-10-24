@@ -1,7 +1,8 @@
-use crate::session::Subscription;
+use crate::hls::HlsPackager;
+use crate::session::{SessionPin, StreamSession, Subscription};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 const ACE_TOKEN_TTL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -13,14 +14,20 @@ pub(super) struct AceLease {
     expires_at: Instant,
     cancel: tokio::sync::watch::Sender<bool>,
     /// An HLS client has no long-lived response body to own its subscriber count. Keep one
-    /// receiver in the bounded lease instead, so the manager reaper sees the client until stop,
-    /// expiry, or capacity eviction. The receiver is never read; the packager uses its own raw
-    /// receiver and remains the sole segmenting pipeline.
+    /// source pin in the bounded lease instead, so the manager reaper sees the client until stop,
+    /// expiry, or capacity eviction. This retains no unread broadcast receiver; the packager
+    /// remains the sole segmenting pipeline.
     hls: Option<AceHlsLease>,
+    generation: Option<AceGeneration>,
+}
+
+struct AceGeneration {
+    source: Weak<StreamSession>,
+    hls: Option<Weak<HlsPackager>>,
 }
 
 struct AceHlsLease {
-    _pin: Subscription,
+    _pin: SessionPin,
     idle_deadline: Instant,
     pending_requests: usize,
 }
@@ -265,8 +272,9 @@ impl AceSessionStore {
                 session_key,
                 expires_at: now + self.ttl,
                 cancel,
+                generation: None,
                 hls: hls_pin.map(|pin| AceHlsLease {
-                    _pin: pin,
+                    _pin: pin.into_pin(),
                     idle_deadline: now + self.hls_idle_timeout,
                     pending_requests: 0,
                 }),
@@ -287,6 +295,77 @@ impl AceSessionStore {
         pin: Subscription,
     ) {
         self.insert_with_pin(token, playback_id, session_key, now, Some(pin));
+    }
+
+    /// Bind once to the source actually opened for this token. A later source with the
+    /// same channel key is a different playback generation and must not inherit the token.
+    pub(super) fn bind_generation(
+        &self,
+        id: &str,
+        token: &str,
+        source: &Arc<StreamSession>,
+        hls: Option<&Arc<HlsPackager>>,
+    ) -> bool {
+        let now = Instant::now();
+        self.purge_expired(now);
+        let mut leases = self.leases.lock().unwrap();
+        let Some(lease) = leases
+            .get_mut(token)
+            .filter(|lease| lease.playback_id == id)
+        else {
+            return false;
+        };
+        if let Some(generation) = &lease.generation {
+            return generation
+                .source
+                .upgrade()
+                .is_some_and(|bound| Arc::ptr_eq(&bound, source))
+                && match (&generation.hls, hls) {
+                    (None, None) => true,
+                    (Some(bound), Some(hls)) => bound
+                        .upgrade()
+                        .is_some_and(|bound| Arc::ptr_eq(&bound, hls)),
+                    _ => false,
+                };
+        }
+        lease.generation = Some(AceGeneration {
+            source: Arc::downgrade(source),
+            hls: hls.map(Arc::downgrade),
+        });
+        true
+    }
+
+    pub(super) fn bound_session(
+        &self,
+        id: &str,
+        token: &str,
+    ) -> Result<Option<Arc<StreamSession>>, ()> {
+        self.purge_expired(Instant::now());
+        let leases = self.leases.lock().unwrap();
+        let lease = leases
+            .get(token)
+            .filter(|lease| lease.playback_id == id)
+            .ok_or(())?;
+        match &lease.generation {
+            None => Ok(None),
+            Some(generation) => generation.source.upgrade().map(Some).ok_or(()),
+        }
+    }
+
+    pub(super) fn matches_hls(&self, id: &str, token: &str, hls: &Arc<HlsPackager>) -> bool {
+        let leases = self.leases.lock().unwrap();
+        leases
+            .get(token)
+            .filter(|lease| lease.playback_id == id)
+            .is_some_and(|lease| {
+                lease.generation.as_ref().is_some_and(|generation| {
+                    generation
+                        .hls
+                        .as_ref()
+                        .and_then(Weak::upgrade)
+                        .is_some_and(|bound| Arc::ptr_eq(&bound, hls))
+                })
+            })
     }
 
     /// Protect an authorized HLS manifest wait from idle expiry. Absolute authorization

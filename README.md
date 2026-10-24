@@ -91,6 +91,10 @@ source and identify the release revision through OCI labels.
 
 ## Status
 
+See the [development roadmap](docs/roadmap.md) for the integration baseline,
+measured optimization work, and the planned peer-timeshift and optional DVR
+stages. Historical playback is not implemented by this release.
+
 The live byte path is built and proven against real public swarms:
 
 - protocol recovery and interop vectors are in place;

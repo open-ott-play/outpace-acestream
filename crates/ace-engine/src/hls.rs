@@ -3619,7 +3619,9 @@ mod tests {
     fn default_byte_budget_can_publish_high_bitrate_hevc_before_target_time() {
         let p = HlsPackager::new(HlsConfig::default(), None);
         p.feed(&pat(PMT_PID));
-        p.feed(&pmt_codec(PMT_PID, VIDEO_PID, 0x24));
+        let mut table = pmt(PMT_PID, VIDEO_PID);
+        table[17] = 0x24; // PMT elementary stream_type: HEVC
+        p.feed(&table);
         // 15,000 TS packets/sec = 22.56 Mbit/sec; the default 65,536 packet cap fills
         // before the five-second target. Keyframes every second allow clean shorter cuts.
         for i in 0..450_001 {

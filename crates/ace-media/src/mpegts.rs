@@ -294,7 +294,7 @@ impl TsResync {
 }
 
 /// Tracks the MPEG-TS tables and video PID needed to identify a candidate access point.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct VideoAccessPointState {
     allow_mpeg2: bool,
     preserve_transport_identity: bool,

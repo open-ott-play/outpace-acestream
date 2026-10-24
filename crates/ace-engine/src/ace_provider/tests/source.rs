@@ -90,7 +90,6 @@ async fn startup_readiness_stays_ordered_through_producer_reservoir_and_broadcas
         _sampler: None,
         worker: None,
         rx,
-        worker: tokio::spawn(async {}),
         discontinuity: false,
         startup_complete: false,
         peers: Arc::new(AtomicU32::new(0)),

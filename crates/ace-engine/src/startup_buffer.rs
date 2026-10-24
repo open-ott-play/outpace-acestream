@@ -752,10 +752,10 @@ mod tests {
     #[test]
     fn no_pcr_duration_uses_descriptor_bytes_per_second() {
         let mut reservoir = StartupReservoir::new(config(1_000, 4096, 10_000), Some(1_000));
-        assert_eq!(reservoir.push(Bytes::from(vec![b'a'; 500])), None);
+        assert_eq!(reservoir.push(Bytes::from(vec![b'a'; 500]), true), None);
         assert_eq!(reservoir.duration(), Duration::from_millis(500));
         assert_eq!(
-            reservoir.push(Bytes::from(vec![b'b'; 500])),
+            reservoir.push(Bytes::from(vec![b'b'; 500]), true),
             Some(ReleaseReason::TargetDuration)
         );
         assert_eq!(reservoir.duration(), Duration::from_secs(1));

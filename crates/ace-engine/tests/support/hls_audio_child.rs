@@ -153,6 +153,10 @@ pub fn run(mode: ChildMode) {
             } else {
                 ""
             };
+            // The smoke probe writes a full input fixture. Drain it before exiting
+            // so a small OS pipe cannot turn the intended empty-output failure
+            // into an unrelated broken-pipe/process failure.
+            let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
             for line in listing.lines() {
                 // Omit the selected capability name, following FFmpeg's
                 // flag/name listing format rather than comparing the whole row.

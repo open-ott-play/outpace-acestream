@@ -168,11 +168,14 @@ async fn durable_provider_cache_control(mode: CacheProducer) {
         }
     });
     static NEXT_CACHE: AtomicU64 = AtomicU64::new(0);
-    let cache_dir = std::env::temp_dir().join(format!(
-        "outpace-warm-provider-{}-{}",
-        std::process::id(),
-        NEXT_CACHE.fetch_add(1, Ordering::Relaxed)
-    ));
+    let cache_dir = std::env::temp_dir()
+        .canonicalize()
+        .expect("canonical test temp directory")
+        .join(format!(
+            "outpace-warm-provider-{}-{}",
+            std::process::id(),
+            NEXT_CACHE.fetch_add(1, Ordering::Relaxed)
+        ));
     let make_cache = || WarmPeerCache::new(&cache_dir, true);
     let first = make_cache();
     let mut source = open_cached_session(
@@ -482,11 +485,14 @@ async fn retained_signed_resume_credit_control(mode: ResumeCredit) {
         drop(gap_ready);
     }
     static SERIAL: AtomicU64 = AtomicU64::new(0);
-    let cache_dir = std::env::temp_dir().join(format!(
-        "outpace-resume-credit-{}-{}",
-        std::process::id(),
-        SERIAL.fetch_add(1, Ordering::Relaxed)
-    ));
+    let cache_dir = std::env::temp_dir()
+        .canonicalize()
+        .expect("canonical test temp directory")
+        .join(format!(
+            "outpace-resume-credit-{}-{}",
+            std::process::id(),
+            SERIAL.fetch_add(1, Ordering::Relaxed)
+        ));
     let make_cache = || WarmPeerCache::new(&cache_dir, true);
     let first = make_cache();
     let seed = SeedConfig {

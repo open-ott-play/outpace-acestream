@@ -12,7 +12,7 @@
 //! [`crate::routes`] only parses compatibility routes. [`VodHlsLayout`] separately describes
 //! the static segment geometry and playlist for VOD.
 
-use crate::config::HlsConfig;
+use crate::config::{HlsConfig, HLS_SEGMENT_GRACE_MAX_BYTES};
 use crate::session::{StreamEvent, StreamSession};
 use ace_media::audio::LiveAudioSelection;
 use ace_media::mpegts::{
@@ -27,7 +27,6 @@ const TS_PACKET: usize = 188;
 #[cfg(test)]
 const PCR_MODULUS: u64 = 1 << 33;
 const SDT_PID: u16 = 0x0011;
-const HLS_SEGMENT_GRACE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const SEGMENT_GRACE_MAX_COUNT: usize = 32;
 const SEGMENT_GRACE_MAX_AGE: Duration = Duration::from_secs(120);
 
@@ -228,6 +227,8 @@ impl HlsPackager {
             return;
         }
         st.generation = generation;
+        // Normalized generations start only after their source catch-up gate.
+        st.startup_complete = true;
         st.strict = true;
         st.access.enable_mpeg2();
         st.access.preserve_transport_identity();
@@ -2343,9 +2344,9 @@ mod tests {
         p.feed(&pcr_packet(VIDEO_PID, 18_000, false, false, 2));
         p.feed(&pcr_packet(VIDEO_PID, 27_000, false, false, 3));
 
-        assert!(p.segment(0).is_none());
+        assert_eq!(p.segment(0).unwrap().len(), 5 * TS_PACKET);
         let st = p.state.lock().unwrap();
-        assert!(st.cur.is_empty());
+        assert_eq!(st.cur.len(), 3 * TS_PACKET);
         assert!(st
             .segments
             .iter()
@@ -3006,7 +3007,12 @@ mod tests {
         assert_eq!(segment.len(), 4 * TS_PACKET);
         assert_eq!(&segment[3 * TS_PACKET..], first.as_slice());
         p.feed(&third);
-        let next_segment = p.segment(1).unwrap();
+        // The short timed continuation containing the PCR packet is retained too.
+        assert!(p
+            .segment(1)
+            .unwrap()
+            .ends_with(&pcr_packet(VIDEO_PID, 108_000, false, false, 0)));
+        let next_segment = p.segment(2).unwrap();
         assert!(next_segment.ends_with(&second));
         assert_eq!(
             ace_media::mpegts::read_sdt_service_name(&segment).as_deref(),
@@ -3369,9 +3375,9 @@ mod tests {
         let retained: Vec<_> = st
             .segments
             .iter()
-            .flat_map(|seg| seg.bytes.chunks_exact(TS_PACKET))
-            .chain(st.cur.chunks_exact(TS_PACKET))
-            .filter(|packet| ts_pid(packet) == VIDEO_PID)
+            .flat_map(|seg| seg.bytes.as_chunks::<TS_PACKET>().0.iter())
+            .chain(st.cur.as_chunks::<TS_PACKET>().0.iter())
+            .filter(|packet| ts_pid(*packet) == VIDEO_PID)
             .map(|packet| packet.to_vec())
             .collect();
         assert_eq!(
@@ -3485,17 +3491,19 @@ mod tests {
             let retained: Vec<_> = st
                 .segments
                 .iter()
-                .flat_map(|seg| seg.bytes.chunks_exact(TS_PACKET))
-                .chain(st.cur.chunks_exact(TS_PACKET))
-                .filter(|packet| ts_pid(packet) == VIDEO_PID)
+                .flat_map(|seg| seg.bytes.as_chunks::<TS_PACKET>().0.iter())
+                .chain(st.cur.as_chunks::<TS_PACKET>().0.iter())
+                .filter(|packet| ts_pid(*packet) == VIDEO_PID)
                 .map(|packet| packet.to_vec())
                 .collect();
             assert_eq!(retained, media);
             for seg in &st.segments {
                 let first = seg
                     .bytes
-                    .chunks_exact(TS_PACKET)
-                    .find(|packet| ts_pid(packet) == VIDEO_PID)
+                    .as_chunks::<TS_PACKET>()
+                    .0
+                    .iter()
+                    .find(|packet| ts_pid(*packet) == VIDEO_PID)
                     .unwrap();
                 assert_ne!(first[5] & 0x40, 0);
                 assert!(seg.duration < p.seg_duration && seg.duration > 0.0);

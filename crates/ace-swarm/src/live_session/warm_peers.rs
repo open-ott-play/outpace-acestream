@@ -898,11 +898,14 @@ mod tests {
     }
     fn temp() -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        std::env::temp_dir().join(format!(
-            "outpace-warm-file-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ))
+        std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical test temp directory")
+            .join(format!(
+                "outpace-warm-file-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ))
     }
     fn peer(port: u16) -> SocketAddrV4 {
         SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port)

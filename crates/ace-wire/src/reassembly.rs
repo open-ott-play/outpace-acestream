@@ -64,7 +64,7 @@ pub struct PieceReassembler {
     /// (Acestream live pieces carry a per-piece RSA source signature as their last `sig_len`
     /// bytes; emitting it would inject non-TS bytes at every piece boundary — see B0/note 27).
     piece_trailer: u64,
-    /// Broadcaster's DER SubjectPublicKeyInfo (the transport descriptor's `pubkey` field).
+    /// Broadcaster's parsed public key (from the descriptor's DER `pubkey` field).
     /// When set, every completed piece's in-band RSA source signature — its trailing
     /// `piece_trailer` bytes — is verified before the piece is marked complete; a piece that
     /// fails is dropped and never emitted, so unauthenticated peer bytes can't reach the

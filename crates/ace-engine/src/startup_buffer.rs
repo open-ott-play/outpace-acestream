@@ -111,26 +111,44 @@ impl StartupReservoir {
     fn observe_bytes(&mut self, bytes: &[u8]) -> Option<usize> {
         let prior_bytes = self.queued_bytes;
         let mut retain_from = None;
-        for (index, &byte) in bytes.iter().enumerate() {
-            self.partial.push(byte);
-            if self.partial.len() != TS_PACKET_LEN {
-                continue;
-            }
-            let mut packet = [0_u8; TS_PACKET_LEN];
-            packet.copy_from_slice(&self.partial);
-            self.partial.clear();
-            let timing = ts_timing(&packet);
-            if self.clock.observe(timing) == ClockObservation::Reset {
-                retain_from = Some(prior_bytes + index + 1 - TS_PACKET_LEN);
-                self.first_clean_byte = None;
-                self.release_clock_duration = None;
-                self.release_bytes = 0;
-                if !timing.discontinuity {
-                    let _ = self.clock.observe(timing);
+        let mut consumed = 0;
+        if !self.partial.is_empty() {
+            let take = (TS_PACKET_LEN - self.partial.len()).min(bytes.len());
+            self.partial.extend_from_slice(&bytes[..take]);
+            consumed = take;
+            if self.partial.len() == TS_PACKET_LEN {
+                // Only a packet straddling two chunks needs a scratch copy. Whole packets below
+                // borrow the input directly instead of pushing/copying every media byte.
+                let packet: [u8; TS_PACKET_LEN] = self.partial.as_slice().try_into().unwrap();
+                self.partial.clear();
+                if self.observe_packet(&packet) {
+                    retain_from = Some(prior_bytes + consumed - TS_PACKET_LEN);
                 }
             }
         }
+        let (packets, remainder) = bytes[consumed..].as_chunks::<TS_PACKET_LEN>();
+        for packet in packets {
+            if self.observe_packet(packet) {
+                retain_from = Some(prior_bytes + consumed);
+            }
+            consumed += TS_PACKET_LEN;
+        }
+        self.partial.extend_from_slice(remainder);
         retain_from
+    }
+
+    fn observe_packet(&mut self, packet: &[u8; TS_PACKET_LEN]) -> bool {
+        let timing = ts_timing(packet);
+        if self.clock.observe(timing) != ClockObservation::Reset {
+            return false;
+        }
+        self.first_clean_byte = None;
+        self.release_clock_duration = None;
+        self.release_bytes = 0;
+        if !timing.discontinuity {
+            let _ = self.clock.observe(timing);
+        }
+        true
     }
 
     fn discard_prefix(&mut self, retain_from: usize, chunk: &mut Bytes) {
@@ -831,5 +849,68 @@ mod tests {
         assert_eq!(buffered.next().await.unwrap(), Bytes::from_static(b"x"));
         drop(buffered);
         assert!(dropped.load(Ordering::SeqCst));
+    }
+    #[test]
+    fn packet_batching_preserves_reset_boundaries_for_every_chunk_split() {
+        let modulus = 1_u64 << 33;
+        let packets = [
+            packet(PID, Some(modulus - 90_000), false, b'a'),
+            packet(PID, Some(modulus - 45_000), false, b'b'),
+            packet(PID + 1, Some(5_000_000), false, b'x'),
+            packet(PID, Some(45_000), false, b'c'), // forward wrap, not a reset
+            packet(PID, Some(10_000), false, b'd'), // backwards PCR retains this packet
+            packet(PID, Some(100_000), false, b'e'),
+            packet(PID, Some(200_000), true, b'f'), // last reset wins, no clock seed
+            packet(PID, Some(50_000), false, b'g'),
+            packet(PID, Some(140_000), false, b'h'),
+            packet(PID, Some(230_000), false, b'i'), // trailing partial is not timed yet
+        ];
+        let mut data: Vec<u8> = packets.iter().flat_map(|p| p.iter().copied()).collect();
+        data.truncate(data.len() - TS_PACKET_LEN / 2);
+        let expected = &data[6 * TS_PACKET_LEN..];
+        let check = |chunks: Vec<&[u8]>| {
+            let mut reservoir = StartupReservoir::new(config(60_000, 16_384, 60_000), None);
+            for chunk in chunks {
+                assert_eq!(reservoir.push(Bytes::copy_from_slice(chunk), true), None);
+                assert!(reservoir.partial.len() < TS_PACKET_LEN);
+            }
+            let retained: Vec<_> = reservoir
+                .queue
+                .iter()
+                .flat_map(|chunk| chunk.bytes.iter().copied())
+                .collect();
+            assert_eq!(retained, expected);
+            assert_eq!(reservoir.queued_bytes, expected.len());
+            assert_eq!(reservoir.clock.elapsed(), Some(Duration::from_secs(1)));
+            assert_eq!(reservoir.partial, packets[9][..TS_PACKET_LEN / 2]);
+        };
+        // Includes empty chunks, every header/PCR/payload split, and both resets in one chunk.
+        for split in 0..=data.len() {
+            check(vec![&data[..split], &data[split..]]);
+        }
+        for size in [1, 2, 7, 73, 187, 188, 189, 376, 1316, 16_384] {
+            check(data.chunks(size).collect());
+        }
+    }
+
+    #[test]
+    fn packet_batching_reports_the_last_reset_offset_in_queued_coordinates() {
+        let first = packet(PID, Some(0), false, b'a');
+        let reset = packet(PID, Some(90_000), true, b'b');
+        let resumed = packet(PID, Some(0), false, b'c');
+        let second_reset = packet(PID, Some(90_000), true, b'd');
+        for split in 1..TS_PACKET_LEN {
+            let mut reservoir = StartupReservoir::new(config(60_000, 16_384, 60_000), None);
+            let prefix = [first.as_ref(), &reset[..split]].concat();
+            reservoir.push(Bytes::from(prefix), false);
+            let suffix = [&reset[split..], resumed.as_ref(), second_reset.as_ref()].concat();
+            assert_eq!(reservoir.observe_bytes(&suffix), Some(3 * TS_PACKET_LEN));
+            assert_eq!(
+                reservoir.clock.elapsed(),
+                None,
+                "transport reset is not a PCR seed"
+            );
+            assert!(reservoir.partial.is_empty());
+        }
     }
 }

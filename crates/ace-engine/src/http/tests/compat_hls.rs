@@ -893,7 +893,7 @@ async fn ace_hls_rejects_forged_future_evicted_and_expired_segments() {
 }
 
 #[tokio::test]
-async fn ace_hls_returns_404_after_a_segment_leaves_the_native_window() {
+async fn ace_hls_retains_advertised_segment_after_it_leaves_the_native_window() {
     let id = "0123456789abcdef0123456789abcdef01234567";
     let app = router(ace_hls_state(Duration::from_secs(60), 8));
     let start = app
@@ -940,7 +940,7 @@ async fn ace_hls_returns_404_after_a_segment_leaves_the_native_window() {
             .await
             .unwrap()
             .status(),
-        StatusCode::NOT_FOUND
+        StatusCode::OK
     );
 }
 

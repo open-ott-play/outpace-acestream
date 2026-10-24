@@ -598,14 +598,17 @@ async fn open_rejects_transport_url_id_with_bad_scheme() {
 #[tokio::test]
 async fn warm_peer_hints_never_grant_descriptor_authority() {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    let dir = std::env::temp_dir().join(format!(
-        "outpace-190-authority-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = std::env::temp_dir()
+        .canonicalize()
+        .expect("canonical test temp directory")
+        .join(format!(
+            "outpace-190-authority-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
     std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
     let path = dir.join("recent-peers-v1");
     let now = std::time::SystemTime::now()

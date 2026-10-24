@@ -13,6 +13,9 @@ pub use ace_swarm::live_session::{
     MAX_LIVE_RECOVERY_PIECE_ADVANCE, MAX_LIVE_RECOVERY_REASM_PIECES_AHEAD,
 };
 
+/// Extra backing storage for advertised segments evicted from the live window.
+pub(crate) const HLS_SEGMENT_GRACE_MAX_BYTES: usize = 64 * 1024 * 1024;
+
 /// Absolute ceiling for one configured in-memory retention pool. The address-space-relative
 /// limit below is stricter on 32-bit targets; this ceiling keeps a single pool bounded on 64-bit
 /// targets where `isize::MAX` is far larger than a practical allocation.
@@ -161,7 +164,8 @@ impl Default for HlsConfig {
             // It must comfortably hold one target-duration segment of a peaky high-bitrate
             // stream -- e.g. 2160p HEVC in a high-motion scene can burst well past its ~3 MB
             // average -- so a keyframe-aligned cut lands before the ceiling in the common case.
-            // Worst-case retained memory is bounded at (window + 1) * this (~86 MB here).
+            // Live storage is bounded at (window + 1) * this; advertised-segment grace
+            // adds at most HLS_SEGMENT_GRACE_MAX_BYTES.
             segment_packets: 65_536,
             window_segments: 8,
             segment_duration_ms: 5000,
@@ -222,6 +226,7 @@ impl HlsConfig {
             .ok_or("OUTPACE_HLS_WINDOW_SEGMENTS overflows on this target")?;
         let retained_bytes = segment_bytes
             .checked_mul(retained_segments)
+            .and_then(|bytes| bytes.checked_add(HLS_SEGMENT_GRACE_MAX_BYTES as u64))
             .ok_or("configured HLS retained byte count overflows")?;
         let safe_limit = safe_in_memory_pool_limit(max_object_bytes);
         if retained_bytes > safe_limit {
@@ -455,12 +460,18 @@ pub fn load_or_create_identity(data_dir: &Path) -> std::io::Result<Identity> {
     std::fs::create_dir_all(data_dir)?;
     let path = data_dir.join("identity.seed");
     let seed: [u8; 32] = match std::fs::read(&path) {
-        Ok(b) if b.len() == 32 => b.try_into().unwrap(),
-        _ => {
+        Ok(bytes) => bytes.try_into().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "identity.seed must contain exactly 32 bytes; existing identity was preserved",
+            )
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let s: [u8; 32] = rand::random();
             write_private(&path, &s)?;
             s
         }
+        Err(error) => return Err(error),
     };
     Ok(Identity::from_seed(seed))
 }
@@ -471,8 +482,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)?;
     f.write_all(bytes)
@@ -480,7 +490,12 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, bytes)
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?
+        .write_all(bytes)
 }
 
 #[cfg(test)]
@@ -598,7 +613,8 @@ mod tests {
         let object_limit = i32::MAX as u64;
         let safe_limit = safe_in_memory_pool_limit(object_limit);
         let segment_packets = 3;
-        let max_retained_segments = safe_limit / (segment_packets * 188);
+        let max_retained_segments =
+            (safe_limit - HLS_SEGMENT_GRACE_MAX_BYTES as u64) / (segment_packets * 188);
         let mut config = HlsConfig {
             segment_packets: usize::try_from(segment_packets).unwrap(),
             window_segments: usize::try_from(max_retained_segments - 1).unwrap(),
@@ -791,6 +807,47 @@ mod tests {
     #[test]
     fn default_seed_ttl_is_300s() {
         assert_eq!(Config::default().seed_ttl_secs, 300);
+    }
+    #[test]
+    fn invalid_identity_is_preserved_instead_of_rotating() {
+        let dir = std::env::temp_dir().join(format!(
+            "outpace-invalid-identity-{}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("identity.seed");
+        for length in [0, 31, 33] {
+            let original = vec![0x55; length];
+            std::fs::write(&path, &original).unwrap();
+            let error = load_or_create_identity(&dir)
+                .err()
+                .expect("invalid identity must fail closed");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn first_identity_write_never_overwrites_an_existing_seed() {
+        let dir =
+            std::env::temp_dir().join(format!("outpace-racing-identity-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("identity.seed");
+        let original = [0x55; 32];
+        write_private(&path, &original).unwrap();
+        let error = write_private(&path, &[0xaa; 32]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 

@@ -351,11 +351,13 @@ impl HlsPackager {
     }
 
     /// Preserve completed media as a final playlist; never publish an incomplete EOF tail.
-    fn finish(&self) {
+    pub(crate) fn finish(&self) {
         let mut st = self.state.lock().unwrap();
         st.ended = true;
         Self::reset_partial(&mut st, false);
-        if st.status != HlsStatus::Ready {
+        // EOF cleanup must not hide an already reported worker failure or undo
+        // an explicit stop that won the race with the source ending.
+        if matches!(st.status, HlsStatus::Starting | HlsStatus::Recovering) {
             st.status = HlsStatus::Stopped;
         }
         self.ready.notify_waiters();
@@ -3693,5 +3695,13 @@ mod tests {
             ready.wait_available(Duration::from_secs(60)).await,
             HlsStatus::Ready
         );
+
+        let failed = HlsPackager::new(HlsConfig::default(), None);
+        failed.fail_generation(GenerationId(0), HlsFailure::ChildExit);
+        failed.finish();
+        assert_eq!(failed.status(), HlsStatus::Failed(HlsFailure::ChildExit));
+        ready.stop();
+        ready.finish();
+        assert_eq!(ready.status(), HlsStatus::Stopped);
     }
 }

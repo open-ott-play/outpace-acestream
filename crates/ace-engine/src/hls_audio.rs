@@ -382,10 +382,10 @@ pub(crate) fn spawn_worker(
                     seed: None,
                     budget: InputBudget::new(),
                 };
-                if let Err(reason) = worker.run(cancel).await {
-                    media.fail_generation(worker.recovery.generation, reason);
-                } else {
-                    media.stop();
+                match worker.run(cancel).await {
+                    Err(reason) => media.fail_generation(worker.recovery.generation, reason),
+                    Ok(WorkerEnd::Eof) => media.finish(),
+                    Ok(WorkerEnd::Cancelled) => media.stop(),
                 }
             }
         }
@@ -503,8 +503,14 @@ struct EnabledWorker {
     seed: Option<[u8; 188]>,
     budget: InputBudget,
 }
+#[derive(Debug, PartialEq, Eq)]
+enum WorkerEnd {
+    Eof,
+    Cancelled,
+}
 enum Turn {
     Recover(RecoveryReason, Option<[u8; 188]>),
+    Eof,
     Stop,
 }
 impl EnabledWorker {
@@ -534,27 +540,27 @@ impl EnabledWorker {
         self.seed = seed;
         Ok(())
     }
-    async fn run(&mut self, mut cancel: watch::Receiver<bool>) -> Result<(), HlsFailure> {
+    async fn run(&mut self, mut cancel: watch::Receiver<bool>) -> Result<WorkerEnd, HlsFailure> {
         self.media
             .begin_generation(self.recovery.generation, self.deadline, false);
         loop {
             let mut classifier = Classifier::new();
             let opening = loop {
                 if *cancel.borrow() {
-                    return Ok(());
+                    return Ok(WorkerEnd::Cancelled);
                 }
                 let item = if let Some(packet) = self.seed.take() {
                     SourceItem::Packet(packet)
                 } else {
                     tokio::select! { biased;
-                        _ = process::cancelled(&mut cancel) => return Ok(()),
+                        _ = process::cancelled(&mut cancel) => return Ok(WorkerEnd::Cancelled),
                         _ = tokio::time::sleep_until(self.deadline) => return Err(HlsFailure::Deadline),
                         item = self.source.next(&self.budget) => item,
                     }
                 };
                 match item {
                     SourceItem::Failed(reason) => return Err(reason),
-                    SourceItem::Closed => return Ok(()),
+                    SourceItem::Closed => return Ok(WorkerEnd::Eof),
                     SourceItem::Recovery(reason) => {
                         self.invalidate(reason, None)?;
                         classifier = Classifier::new();
@@ -600,7 +606,8 @@ impl EnabledWorker {
                 .await
                 .unwrap_or(Err(HlsFailure::Pump))?
                 {
-                    Turn::Stop => return Ok(()),
+                    Turn::Stop => return Ok(WorkerEnd::Cancelled),
+                    Turn::Eof => return Ok(WorkerEnd::Eof),
                     Turn::Recover(reason, seed) => self.invalidate(reason, seed)?,
                 }
             } else {
@@ -639,7 +646,7 @@ impl EnabledWorker {
                     .catch_unwind();
                     tokio::pin!(producer);
                     tokio::select! { biased;
-                        result = &mut child => { result?; return Ok(()); },
+                        result = &mut child => { result?; return Ok(WorkerEnd::Cancelled); },
                         turn = &mut producer => turn.unwrap_or(Err(HlsFailure::Pump)),
                     }
                 };
@@ -670,7 +677,10 @@ impl EnabledWorker {
                         }
                         child_cancel.send_replace(true);
                         let _ = child.await;
-                        return other.map(|_| ());
+                        return other.map(|turn| match turn {
+                            Turn::Eof => WorkerEnd::Eof,
+                            _ => WorkerEnd::Cancelled,
+                        });
                     }
                 }
             }
@@ -701,7 +711,7 @@ impl EnabledWorker {
             };
             match item {
                 SourceItem::Failed(reason) => return Err(reason),
-                SourceItem::Closed => return Ok(Turn::Stop),
+                SourceItem::Closed => return Ok(Turn::Eof),
                 SourceItem::Recovery(reason) => return Ok(Turn::Recover(reason, None)),
                 SourceItem::Packet(mut packet) => {
                     if !validate_packet(&packet)? {
@@ -870,7 +880,7 @@ mod task4_tests {
     }
 
     async fn wait_for_blocked_transform(
-        task: &tokio::task::JoinHandle<Result<(), HlsFailure>>,
+        task: &tokio::task::JoinHandle<Result<WorkerEnd, HlsFailure>>,
         counters: &process::test_support::Counters,
         probe: &PacketSourceProbe,
     ) -> bool {

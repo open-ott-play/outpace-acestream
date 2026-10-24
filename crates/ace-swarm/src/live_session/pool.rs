@@ -700,20 +700,11 @@ pub(super) async fn follow_peer_pool_with_discovery(
                     {
                         continue;
                     }
-                    PieceStore::shared_put_chunk_with_header(
-                        store,
-                        piece,
-                        lc.chunk,
-                        lc.piece_header,
-                        &lc.data,
-                    )
-                    .await;
-                    let begin = lc.chunk as u64 * info.chunk_length;
-                    let contribution = match continuity
-                        .reasm
-                        .add_block_with_contribution(piece, begin, &lc.data)
+                    let accepted = match continuity
+                        .receive_live_chunk(&lc, info.chunk_length, store, Instant::now())
+                        .await
                     {
-                        Ok(contribution) => contribution,
+                        Ok(accepted) => accepted,
                         Err(e) => {
                             if e == ace_wire::WireError::SignatureRejected {
                                 continuity.recovery_event(RecoveryEvent::SignatureReject);
@@ -730,7 +721,7 @@ pub(super) async fn follow_peer_pool_with_discovery(
                             continue;
                         }
                     };
-                    if contribution {
+                    if accepted.contributed {
                         continuity
                             .piece_producers
                             .entry(piece)
@@ -741,10 +732,10 @@ pub(super) async fn follow_peer_pool_with_discovery(
                             })
                             .or_insert(Some(addr));
                     }
-                    // Request receipt/activity accounting is independent of durable byte
-                    // provenance; retain its existing behavior for completed-piece no-ops.
+                    // Only verified completion releases request slots; only new bytes
+                    // count as progress toward the pool activity deadline.
                     continuity.note_chunk(piece, lc.chunk, chunks_per_piece);
-                    made_activity = true;
+                    made_activity |= accepted.progressed;
                     #[cfg(test)]
                     if let Some(observer) = &continuity.contribution_observer {
                         let _ = observer.send((piece, addr));
@@ -770,7 +761,9 @@ pub(super) async fn follow_peer_pool_with_discovery(
                             continuity.authenticated_logged = true;
                             crate::alog!("[ace] discovery stage=authenticated-contiguous");
                         }
-                        for output in continuity.resync_output(&ready) {
+                        let outputs = continuity.resync_output(&ready);
+                        let output_count = outputs.len();
+                        for (index, output) in outputs.into_iter().enumerate() {
                             let aligned = output.bytes;
                             if continuity.emitted == 0 {
                                 crate::alog!("[ace] discovery stage=first-source-output");
@@ -790,6 +783,8 @@ pub(super) async fn follow_peer_pool_with_discovery(
                                 .send(LiveOutput {
                                     bytes: aligned,
                                     discontinuity: output.discontinuity,
+                                    startup_complete: index + 1 == output_count
+                                        && continuity.output_startup_complete(),
                                 })
                                 .await
                                 .is_err()

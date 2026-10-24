@@ -581,3 +581,41 @@ fn prefetch_start_bounds_huge_depth_and_peer_window() {
     assert_eq!(prefetch_start(180, 200, 64), 180);
     assert_eq!(prefetch_start(0, 20, u64::MAX), 0);
 }
+
+#[test]
+fn startup_head_is_fixed_and_hole_closing_batch_marks_only_its_end_ready() {
+    let (mut c, _) = Continuity::fresh(&info(), 100, 105, 5, LiveRecoveryConfig::default());
+    c.head = 110; // Ordinary live-head updates must not move the initial barrier.
+    for piece in 100..105 {
+        c.reasm.add_block(piece, 0, b"data").unwrap();
+    }
+    assert_eq!(c.reasm.take_ready().len(), 20);
+    assert!(!c.output_startup_complete());
+    c.reasm.add_block(106, 0, b"last").unwrap();
+    assert!(c.reasm.take_ready().is_empty());
+    assert!(!c.output_startup_complete());
+    c.reasm.add_block(105, 0, b"hole").unwrap();
+    let batch = c.reasm.take_ready();
+    assert_eq!(batch, b"holelast");
+    assert_eq!(c.startup_head, 105);
+    assert!(c.output_startup_complete()); // Attached to the whole eight-byte batch.
+    c.head = 200;
+    assert!(c.output_startup_complete());
+}
+
+#[test]
+fn pre_start_gap_takes_a_new_fixed_head_but_established_playback_never_regates() {
+    let (mut c, _) = Continuity::fresh(&info(), 100, 105, 5, LiveRecoveryConfig::default());
+    c.resume("127.0.0.1:1234".parse().unwrap(), 120, 130);
+    assert_eq!(c.startup_head, 130);
+    c.reasm.add_block(120, 0, b"data").unwrap();
+    assert!(!c.reasm.take_ready().is_empty());
+    assert!(!c.output_startup_complete());
+    c.reasm.skip_to(130);
+    c.reasm.add_block(130, 0, b"head").unwrap();
+    assert!(!c.reasm.take_ready().is_empty());
+    assert!(c.output_startup_complete());
+    c.resume("127.0.0.1:1234".parse().unwrap(), 140, 150);
+    assert_eq!(c.startup_head, 130);
+    assert!(c.output_startup_complete());
+}

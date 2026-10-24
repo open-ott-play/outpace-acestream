@@ -92,6 +92,7 @@ async fn buffered_provider(config: StartupBufferConfig) -> Box<dyn TsSource> {
                 [pat(PMT), pmt(PMT, VIDEO, 0x1b), packet(VIDEO, b'a', true)].concat(),
             ),
             discontinuity: false,
+            startup_complete: true,
         },
         LiveOutput {
             bytes: Bytes::from(
@@ -103,12 +104,14 @@ async fn buffered_provider(config: StartupBufferConfig) -> Box<dyn TsSource> {
                 .concat(),
             ),
             discontinuity: false,
+            startup_complete: true,
         },
         LiveOutput {
             bytes: Bytes::from(
                 [pat(PMT), pmt(PMT, VIDEO, 0x1b), packet(VIDEO, b'r', true)].concat(),
             ),
             discontinuity: true,
+            startup_complete: true,
         },
     ] {
         tx.send(chunk).await.unwrap();
@@ -118,7 +121,9 @@ async fn buffered_provider(config: StartupBufferConfig) -> Box<dyn TsSource> {
         metrics: None,
         _sampler: None,
         rx,
+        worker: None,
         discontinuity: false,
+        startup_complete: true,
         peers: Arc::new(AtomicU32::new(0)),
         downloaded: Arc::new(AtomicU64::new(0)),
         uploaded: Arc::new(AtomicU64::new(0)),

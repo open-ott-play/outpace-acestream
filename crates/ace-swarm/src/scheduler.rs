@@ -36,6 +36,7 @@ impl PeerView {
 pub struct Scheduler {
     max_in_flight: usize,
     requested: BTreeSet<u64>,
+    completed: BTreeSet<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +102,19 @@ impl ActivePeers {
         next_needed: u64,
         head: u64,
     ) -> Vec<PeerAssignment> {
+        self.assign_if(scheduler, next_needed, head, |_| true)
+    }
+
+    /// Admit each scheduled request before recording peer ownership. A driver can reject
+    /// work when its bounded command queue is full without losing the request or clearing
+    /// an earlier, still-outstanding retry on this or another peer.
+    pub fn assign_if(
+        &mut self,
+        scheduler: &mut Scheduler,
+        next_needed: u64,
+        head: u64,
+        mut admit: impl FnMut(PeerAssignment) -> bool,
+    ) -> Vec<PeerAssignment> {
         let views: Vec<PeerView> = self
             .peers
             .iter()
@@ -114,12 +128,45 @@ impl ActivePeers {
             .collect();
         let assigned = scheduler.assign(next_needed, head, &views);
         let mut out = Vec::with_capacity(assigned.len());
+        let mut attempted = BTreeSet::new();
         for (peer_id, piece) in assigned {
+            attempted.insert(piece);
             if let Some(peer) = self.peers.get_mut(&peer_id) {
-                peer.in_flight.insert(piece);
-                out.push(PeerAssignment { peer_id, piece });
+                let assignment = PeerAssignment { peer_id, piece };
+                if admit(assignment) {
+                    peer.in_flight.insert(piece);
+                    out.push(assignment);
+                } else {
+                    scheduler.on_drop(piece);
+                }
             } else {
                 scheduler.on_drop(piece);
+            }
+        }
+        // Normal scheduling prefers peers with spare capacity, giving slow requests a
+        // chance on another peer first. If every usable peer is full, a timeout retry to
+        // an existing owner needs no NEW slot. Scan only bounded ownership sets, not the
+        // untrusted live head, and never dispatch the same piece twice in one pass.
+        if next_needed <= head {
+            for (&peer_id, peer) in &self.peers {
+                if !peer.unchoked {
+                    continue;
+                }
+                for &piece in peer.in_flight.range(next_needed..=head) {
+                    if piece < peer.min_piece
+                        || piece > peer.max_piece
+                        || scheduler.requested.contains(&piece)
+                        || scheduler.completed.contains(&piece)
+                        || !attempted.insert(piece)
+                    {
+                        continue;
+                    }
+                    let assignment = PeerAssignment { peer_id, piece };
+                    if admit(assignment) {
+                        scheduler.requested.insert(piece);
+                        out.push(assignment);
+                    }
+                }
             }
         }
         out
@@ -199,6 +246,7 @@ impl Scheduler {
         Scheduler {
             max_in_flight: max_in_flight.max(1),
             requested: BTreeSet::new(),
+            completed: BTreeSet::new(),
         }
     }
 
@@ -210,6 +258,7 @@ impl Scheduler {
     pub fn assign(&mut self, next_needed: u64, head: u64, peers: &[PeerView]) -> Vec<(u64, u64)> {
         // Drop bookkeeping for pieces we've moved past.
         self.requested.retain(|&p| p >= next_needed);
+        self.completed.retain(|&p| p >= next_needed);
 
         // Remaining capacity per peer for this tick (only unchoked peers can serve).
         let mut cap: Vec<(PeerView, usize)> = peers
@@ -218,20 +267,26 @@ impl Scheduler {
             .map(|p| (*p, self.max_in_flight.saturating_sub(p.in_flight)))
             .collect();
 
-        // Bound the scan (and thus per-tick fan-out) to the number of request slots we can
-        // actually fill this tick. `head` comes from untrusted peer `Have`/window
-        // advertisements, so an implausibly large jump must not make us iterate over billions
-        // of piece indices and tie up the session task. We never assign more than the total
-        // spare capacity, so scanning that far past the cursor suffices; anything beyond is
-        // scheduled on later ticks as the cursor advances, and a genuinely evicted cursor is
-        // moved forward by the driver's skip-evicted-gap path.
-        let total_spare: u64 = cap.iter().map(|(_, c)| *c as u64).sum();
-        let ceiling = head.min(next_needed.saturating_add(total_spare));
+        let mut total_spare = cap
+            .iter()
+            .fold(0usize, |total, (_, spare)| total.saturating_add(*spare));
+        if total_spare == 0 {
+            return Vec::new();
+        }
+
+        // Keep the scan horizon at the configured capacity of the eligible peers. Free
+        // slots limit assignments, not the lookahead: shrinking the horizon to spare slots
+        // hides new pieces behind outstanding/completed indices and leaves capacity idle
+        // after an out-of-order completion. This is the same bounded horizon as the initial
+        // empty pipeline; it advances with the cursor and never follows an untrusted head
+        // arbitrarily far or expands with the completed-piece set.
+        let horizon = (self.max_in_flight as u64).saturating_mul(cap.len() as u64);
+        let ceiling = head.min(next_needed.saturating_add(horizon));
 
         let mut out = Vec::new();
         let mut piece = next_needed;
         while piece <= ceiling {
-            if !self.requested.contains(&piece) {
+            if !self.requested.contains(&piece) && !self.completed.contains(&piece) {
                 // Prefer the peer with the most spare capacity that covers this piece —
                 // spreads load and keeps the rarest-window peers in reserve.
                 if let Some(slot) = cap
@@ -241,10 +296,17 @@ impl Scheduler {
                 {
                     out.push((slot.0.id, piece));
                     slot.1 -= 1;
+                    total_spare -= 1;
                     self.requested.insert(piece);
                 }
             }
-            piece += 1;
+            if total_spare == 0 {
+                break;
+            }
+            let Some(next) = piece.checked_add(1) else {
+                break;
+            };
+            piece = next;
         }
         out
     }
@@ -252,6 +314,7 @@ impl Scheduler {
     /// A request completed: free its slot (the reassembler now owns the bytes).
     pub fn on_complete(&mut self, piece: u64) {
         self.requested.remove(&piece);
+        self.completed.insert(piece);
     }
 
     /// A request failed / the peer dropped: requeue the piece for reassignment.
@@ -259,8 +322,8 @@ impl Scheduler {
         self.requested.remove(&piece);
     }
 
-    /// Every outstanding request was tied to a peer that dropped. Requeue all pieces so
-    /// another peer can be assigned from the same playback cursor.
+    /// Every outstanding request was tied to a peer that dropped. Requeue those requests,
+    /// preserving completed pieces still held by the reassembler across the reconnect.
     pub fn clear_in_flight(&mut self) {
         self.requested.clear();
     }
@@ -471,5 +534,128 @@ mod tests {
         // Window advanced to 3 (live edge moved); stale entries pruned.
         s.assign(3, 4, &[peer(1, 0, 4, true, 5)]);
         assert_eq!(s.in_flight_count(), 2); // only 3,4 remain
+    }
+    #[test]
+    fn out_of_order_completion_refills_without_shrinking_the_horizon() {
+        let mut s = Scheduler::new(4);
+        assert_eq!(
+            s.assign(0, u64::MAX, &[peer(1, 0, u64::MAX, true, 0)]),
+            vec![(1, 0), (1, 1), (1, 2), (1, 3)]
+        );
+        // The cursor still needs 0, but completion of 1 frees a slot. The remaining
+        // outstanding indices must not hide piece 4 from that slot.
+        s.on_complete(1);
+        assert_eq!(
+            s.assign(0, u64::MAX, &[peer(1, 0, u64::MAX, true, 3)]),
+            vec![(1, 4)]
+        );
+        assert_eq!(s.in_flight_count(), 4);
+
+        // Further completions leave free slots, but all pieces inside the fixed horizon
+        // are already requested or complete. Do not re-request them or expand the horizon.
+        for piece in [2, 3, 4] {
+            s.on_complete(piece);
+        }
+        assert!(s
+            .assign(0, u64::MAX, &[peer(1, 0, u64::MAX, true, 1)])
+            .is_empty());
+        assert_eq!(s.in_flight_count(), 1);
+    }
+
+    #[test]
+    fn cursor_progress_keeps_the_configured_pipeline_full() {
+        let mut s = Scheduler::new(4);
+        s.assign(0, 100, &[peer(1, 0, 100, true, 0)]);
+        for completed in 0..8 {
+            s.on_complete(completed);
+            assert_eq!(
+                s.assign(completed + 1, 100, &[peer(1, 0, 100, true, 3)]),
+                vec![(1, completed + 4)]
+            );
+            assert_eq!(s.in_flight_count(), 4);
+        }
+    }
+
+    #[test]
+    fn bounded_horizon_terminates_at_the_largest_piece_index() {
+        let mut s = Scheduler::new(4);
+        let p = peer(1, u64::MAX - 1, u64::MAX, true, 0);
+        assert_eq!(
+            s.assign(u64::MAX - 1, u64::MAX, &[p]),
+            vec![(1, u64::MAX - 1), (1, u64::MAX)]
+        );
+        s.on_complete(u64::MAX);
+        assert!(s
+            .assign(
+                u64::MAX - 1,
+                u64::MAX,
+                &[peer(1, u64::MAX - 1, u64::MAX, true, 1)]
+            )
+            .is_empty());
+    }
+
+    #[test]
+    fn completed_out_of_order_piece_is_not_requested_again() {
+        let mut active = ActivePeers::new();
+        active.insert(1, addr(), win(0, 10));
+        active.set_unchoked(1, true);
+        let mut scheduler = Scheduler::new(4);
+        active.assign(&mut scheduler, 0, 3);
+        active.complete_everywhere(1);
+        scheduler.on_complete(1);
+
+        // Piece 1 is already in the reassembler while piece 0 still holds the cursor.
+        assert!(active.assign(&mut scheduler, 0, 3).is_empty());
+        scheduler.on_drop(1);
+        assert!(active.assign(&mut scheduler, 0, 3).is_empty());
+        assert_eq!(active.in_flight_count(1), 3);
+
+        // Reconnect resets outstanding ownership, but the reassembler keeps piece 1.
+        scheduler.clear_in_flight();
+        active.remove(1);
+        active.insert(2, addr(), win(0, 10));
+        active.set_unchoked(2, true);
+        let requested = active.assign(&mut scheduler, 0, 3);
+        assert_eq!(
+            requested
+                .iter()
+                .map(|request| request.piece)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3]
+        );
+
+        // The completed exclusion is discarded once playback passes it.
+        active.assign(&mut scheduler, 2, 3);
+        assert!(scheduler.completed.is_empty());
+    }
+
+    #[test]
+    fn rejected_admission_preserves_existing_retry_ownership() {
+        let mut active = ActivePeers::new();
+        active.insert(1, addr(), win(0, 10));
+        active.set_unchoked(1, true);
+        let mut scheduler = Scheduler::new(4);
+        active.assign(&mut scheduler, 5, 5);
+        scheduler.on_drop(5);
+
+        // A rejected retransmit to the same peer must keep its original request slot.
+        assert!(active.assign_if(&mut scheduler, 5, 5, |_| false).is_empty());
+        assert_eq!(active.in_flight_count(1), 1);
+        assert_eq!(scheduler.in_flight_count(), 0);
+
+        active.insert(2, addr(), win(0, 10));
+        active.set_unchoked(2, true);
+        assert!(active
+            .assign_if(&mut scheduler, 5, 5, |assignment| {
+                assert_eq!(assignment.peer_id, 2);
+                false
+            })
+            .is_empty());
+        assert_eq!(active.in_flight_count(1), 1);
+        assert_eq!(active.in_flight_count(2), 0);
+        assert_eq!(scheduler.in_flight_count(), 0);
+
+        assert_eq!(active.assign(&mut scheduler, 5, 5).len(), 1);
+        assert_eq!(active.in_flight_count(2), 1);
     }
 }

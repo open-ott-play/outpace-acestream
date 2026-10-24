@@ -6,17 +6,54 @@
 //! stream the media layer (MPEG-TS) consumes. Pure logic; pairs with [`crate::live`].
 
 use crate::{Result, WireError};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 struct Partial {
     buf: Vec<u8>,
-    /// Offsets (`begin`) of the blocks already written, so a block delivered more than once
-    /// is counted toward completion only once. Blocks are chunk-aligned and non-overlapping
-    /// (`begin = chunk * chunk_length`), so a repeated `begin` is a genuine duplicate.
-    filled_offsets: BTreeSet<u64>,
-    /// Distinct bytes written so far, derived from `filled_offsets`; the piece is complete
+    /// Disjoint, nonadjacent half-open byte ranges already received. Coalescing keeps
+    /// ordinary in-order chunks in one entry and handles short retries and overlapping blocks.
+    covered: BTreeMap<u64, u64>,
+    /// Distinct bytes written so far, derived from `covered`; the piece is complete
     /// when this reaches `piece_length`.
     filled: u64,
+}
+
+impl Partial {
+    fn cover(&mut self, begin: u64, end: u64) -> bool {
+        let mut start = begin;
+        let mut end = end;
+        if let Some((&previous_start, &previous_end)) = self.covered.range(..=begin).next_back() {
+            if previous_end >= begin {
+                start = previous_start;
+                end = end.max(previous_end);
+            }
+        }
+        let mut previously_covered = 0;
+        loop {
+            let next = self
+                .covered
+                .range(start..=end)
+                .next()
+                .map(|(&a, &b)| (a, b));
+            let Some((a, b)) = next else { break };
+            self.covered.remove(&a);
+            previously_covered += b - a;
+            end = end.max(b);
+        }
+        self.covered.insert(start, end);
+        let added = end - start - previously_covered;
+        self.filled += added;
+        added > 0
+    }
+}
+
+/// Whether a block changed a partial piece and covered any previously missing bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BlockAcceptance {
+    /// Nonempty bytes were written, including an overwrite of existing bytes.
+    pub contributed: bool,
+    /// Previously missing bytes were received. Only this should refresh retry timers.
+    pub progressed: bool,
 }
 
 /// Reassembles chunk blocks into ordered piece bytes for a live download.
@@ -33,7 +70,7 @@ pub struct PieceReassembler {
     /// fails is dropped and never emitted, so unauthenticated peer bytes can't reach the
     /// consumer (B0/note 27). `None` (a bare-infohash stream with no known source key) leaves
     /// verification off, stripping the trailer without authenticating it.
-    verify_pubkey: Option<Vec<u8>>,
+    verify_pubkey: Option<crate::live_auth::LivePieceVerifier>,
     /// Largest distance ahead of `next_emit` an incoming piece index may have before it is
     /// rejected. Peers deliver `piece` blocks for untrusted indices, and every new index
     /// allocates a full `piece_length` buffer retained until the intervening pieces arrive; a
@@ -80,9 +117,9 @@ impl PieceReassembler {
     /// An empty or unparseable `pubkey_der` is a no-op (verification stays off) — a bare
     /// infohash carries no source key, so its pieces can only be stripped, not authenticated.
     pub fn with_source_pubkey(mut self, pubkey_der: Vec<u8>) -> Self {
-        if let Some(sig_len) = crate::live_auth::signature_len_from_pubkey_der(&pubkey_der) {
-            self.piece_trailer = (sig_len as u64).min(self.piece_length);
-            self.verify_pubkey = Some(pubkey_der);
+        if let Some(verifier) = crate::live_auth::LivePieceVerifier::from_der(&pubkey_der) {
+            self.piece_trailer = (verifier.signature_len() as u64).min(self.piece_length);
+            self.verify_pubkey = Some(verifier);
         }
         self
     }
@@ -103,7 +140,7 @@ impl PieceReassembler {
     /// pieces (`index < start/next_emit`) are dropped; blocks for indices more than
     /// [`Self::with_max_pieces_ahead`] beyond `next_emit` are rejected (an unsolicited
     /// far-future index that would otherwise pin a `piece_length` buffer — issue #13).
-    /// Assumes non-overlapping blocks that together cover `[0, piece_length)`.
+    /// Tracks exact byte coverage, including short retries and overlapping blocks.
     pub fn add_block(&mut self, index: u64, begin: u64, block: &[u8]) -> Result<()> {
         self.add_block_with_contribution(index, begin, block)
             .map(|_| ())
@@ -119,8 +156,30 @@ impl PieceReassembler {
         begin: u64,
         block: &[u8],
     ) -> Result<bool> {
+        self.add_block_with_acceptance(index, begin, block)
+            .map(|accepted| accepted.contributed)
+    }
+
+    /// Like [`Self::add_block`], but report only newly covered bytes as progress.
+    pub fn add_block_with_progress(
+        &mut self,
+        index: u64,
+        begin: u64,
+        block: &[u8],
+    ) -> Result<bool> {
+        self.add_block_with_acceptance(index, begin, block)
+            .map(|accepted| accepted.progressed)
+    }
+
+    /// Accept a block while keeping byte progress separate from producer provenance.
+    pub fn add_block_with_acceptance(
+        &mut self,
+        index: u64,
+        begin: u64,
+        block: &[u8],
+    ) -> Result<BlockAcceptance> {
         if index < self.next_emit || self.complete.contains_key(&index) {
-            return Ok(false); // stale or already complete
+            return Ok(BlockAcceptance::default()); // stale or already complete
         }
         if index >= self.next_emit.saturating_add(self.max_ahead) {
             // Outside the accept window: reject before allocating a piece buffer. The caller
@@ -136,20 +195,17 @@ impl PieceReassembler {
         if end > self.piece_length {
             return Err(WireError::Invalid("block exceeds piece length"));
         }
+        if block.is_empty() {
+            return Ok(BlockAcceptance::default());
+        }
         let p = self.partial.entry(index).or_insert_with(|| Partial {
             buf: vec![0u8; self.piece_length as usize],
-            filled_offsets: BTreeSet::new(),
+            covered: BTreeMap::new(),
             filled: 0,
         });
         p.buf[begin as usize..end as usize].copy_from_slice(block);
-        // Count each distinct block once. A duplicate delivery (same `begin`) — which the
-        // retransmit path produces by re-requesting a whole piece from a second peer without
-        // cancelling the first — must not inflate `filled` and prematurely complete the piece
-        // with a still-zero gap where a genuinely-missing chunk belongs (issue #90).
-        if p.filled_offsets.insert(begin) {
-            p.filled += block.len() as u64;
-        }
-        if p.filled >= self.piece_length {
+        let progressed = p.cover(begin, end);
+        if p.filled == self.piece_length {
             let done = self.partial.remove(&index).unwrap();
             if let Some(pubkey) = &self.verify_pubkey {
                 // Authenticate before the piece can ever be emitted. A forged/corrupt piece is
@@ -159,13 +215,31 @@ impl PieceReassembler {
                 let (payload, sig) =
                     crate::live_auth::split_piece(&done.buf, self.piece_trailer as usize)
                         .ok_or(WireError::Invalid("live-source piece trailer split failed"))?;
-                if !crate::live_auth::verify_piece(pubkey, payload, sig) {
+                if !pubkey.verify(payload, sig) {
                     return Err(WireError::SignatureRejected);
                 }
             }
             self.complete.insert(index, done.buf);
         }
-        Ok(!block.is_empty())
+        Ok(BlockAcceptance {
+            contributed: true,
+            progressed,
+        })
+    }
+
+    /// Whether a complete, accepted piece is waiting to be emitted.
+    pub fn has_complete_piece(&self, index: u64) -> bool {
+        self.complete.contains_key(&index)
+    }
+
+    /// Full accepted wire bytes, including the signature trailer, for safe seeding.
+    pub fn complete_piece(&self, index: u64) -> Option<&[u8]> {
+        self.complete.get(&index).map(Vec::as_slice)
+    }
+
+    /// Whether incomplete bytes remain for this piece.
+    pub fn has_partial_piece(&self, index: u64) -> bool {
+        self.partial.contains_key(&index)
     }
 
     /// Discard only incomplete bytes for a rejected piece before requesting it again.
@@ -220,6 +294,101 @@ impl PieceReassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_coverage_full_retries_repair_initial_short_blocks() {
+        let mut r = PieceReassembler::new(4, 0);
+        assert!(r.add_block_with_progress(0, 0, &[1]).unwrap());
+        assert!(r.add_block_with_progress(0, 2, &[3]).unwrap());
+        assert!(!r.has_complete_piece(0));
+        assert!(r.add_block_with_progress(0, 0, &[1, 2]).unwrap());
+        assert!(!r.has_complete_piece(0));
+        assert!(r.add_block_with_progress(0, 2, &[3, 4]).unwrap());
+        assert_eq!(r.take_ready(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn block_coverage_overlaps_do_not_complete_a_piece_with_a_hole() {
+        let mut r = PieceReassembler::new(6, 0);
+        assert!(r.add_block_with_progress(0, 0, &[1, 2, 3]).unwrap());
+        assert!(r.add_block_with_progress(0, 1, &[2, 3, 4]).unwrap());
+        assert!(
+            !r.has_complete_piece(0),
+            "overlapping bytes count only once"
+        );
+        assert!(!r.add_block_with_progress(0, 2, &[3]).unwrap());
+        assert!(r.add_block_with_progress(0, 4, &[5, 6]).unwrap());
+        assert_eq!(r.take_ready(), vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn block_coverage_matches_an_exhaustive_byte_oracle() {
+        const LEN: usize = 5;
+        let ranges: Vec<_> = (0..=LEN)
+            .flat_map(|begin| (begin..=LEN).map(move |end| (begin, end)))
+            .collect();
+        // All 9,261 sequences of three ranges include short retries, overlaps,
+        // adjacent ranges, bridging two islands, duplicates and empty blocks.
+        for &first in &ranges {
+            for &second in &ranges {
+                for &third in &ranges {
+                    let mut r = PieceReassembler::new(LEN as u64, 0);
+                    let mut received = [false; LEN];
+                    for (begin, end) in [first, second, third] {
+                        let expected_progress = received[begin..end].contains(&false);
+                        received[begin..end].fill(true);
+                        let complete = received.iter().all(|&byte| byte);
+                        assert_eq!(
+                            r.add_block_with_progress(0, begin as u64, &vec![0x47; end - begin])
+                                .unwrap(),
+                            expected_progress,
+                            "ranges {first:?}, {second:?}, {third:?}; block {begin}..{end}"
+                        );
+                        assert_eq!(r.has_complete_piece(0), complete);
+                        if let Some(partial) = r.partial.get(&0) {
+                            assert_eq!(
+                                partial.filled as usize,
+                                received.iter().filter(|&&byte| byte).count()
+                            );
+                            let mut covered = [false; LEN];
+                            let mut previous_end = None;
+                            for (&start, &stop) in &partial.covered {
+                                assert!(start < stop && stop <= LEN as u64);
+                                if let Some(previous_end) = previous_end {
+                                    assert!(previous_end < start, "adjacent ranges must merge");
+                                }
+                                covered[start as usize..stop as usize].fill(true);
+                                previous_end = Some(stop);
+                            }
+                            assert_eq!(covered, received);
+                        }
+                    }
+                    let expected = if received.iter().all(|&byte| byte) {
+                        vec![0x47; LEN]
+                    } else {
+                        Vec::new()
+                    };
+                    assert_eq!(r.take_ready(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn block_progress_excludes_duplicate_empty_stale_and_rejected_data() {
+        let mut r = PieceReassembler::new(4, 1).with_max_pieces_ahead(2);
+        assert!(!r.add_block_with_progress(0, 0, &[1, 2]).unwrap());
+        assert!(!r.add_block_with_progress(1, 0, &[]).unwrap());
+        assert!(!r.add_block_with_progress(1, 4, &[]).unwrap());
+        assert!(r.add_block_with_progress(1, 0, &[1, 2]).unwrap());
+        assert!(!r.add_block_with_progress(1, 0, &[9, 9]).unwrap());
+        assert!(r.add_block_with_progress(3, 0, &[1, 2]).is_err());
+        assert!(r.add_block_with_progress(1, 3, &[1, 2]).is_err());
+        assert!(r.add_block_with_progress(1, 2, &[3, 4]).unwrap());
+        assert!(!r.add_block_with_progress(1, 2, &[3, 4]).unwrap());
+        assert_eq!(r.take_ready(), vec![9, 9, 3, 4]);
+        assert!(!r.add_block_with_progress(1, 0, &[1, 2]).unwrap());
+    }
 
     #[test]
     fn ready_chunks_observe_only_contiguous_media_without_trailers() {

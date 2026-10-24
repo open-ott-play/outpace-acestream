@@ -22,7 +22,7 @@ pub struct TsTiming {
 
 /// Parse the PID, PCR base, and discontinuity indicator from a complete TS packet.
 pub fn ts_timing(packet: &[u8; TS_PACKET_LEN]) -> TsTiming {
-    if packet[0] != TS_SYNC || packet[3] & 0x20 == 0 {
+    if packet[0] != TS_SYNC || packet[1] & 0x80 != 0 || packet[3] & 0x20 == 0 {
         return TsTiming {
             pid: 0,
             pcr: None,
@@ -31,7 +31,11 @@ pub fn ts_timing(packet: &[u8; TS_PACKET_LEN]) -> TsTiming {
     }
     let pid = ts_pid(packet);
     let adaptation_len = packet[4] as usize;
-    if adaptation_len == 0 || adaptation_len > 183 {
+    let has_payload = packet[3] & 0x10 != 0;
+    if adaptation_len == 0
+        || (has_payload && adaptation_len > 182)
+        || (!has_payload && adaptation_len != 183)
+    {
         return TsTiming {
             pid,
             pcr: None,
@@ -347,7 +351,12 @@ impl VideoAccessPointState {
     }
 
     pub fn observe(&mut self, packet: &[u8]) -> bool {
-        if packet.len() != TS_PACKET_LEN || packet[0] != 0x47 {
+        if packet.len() != TS_PACKET_LEN
+            || packet[0] != TS_SYNC
+            || packet[1] & 0x80 != 0
+            || packet[3] & 0xc0 != 0
+            || ts_payload_offset(packet).is_none()
+        {
             return false;
         }
         let pid = ts_pid(packet);
@@ -2763,5 +2772,59 @@ mod tests {
             "must re-lock on the aligned run after junk"
         );
         assert!(packet_count(&out) >= 3, "should emit the recovered packets");
+    }
+    #[test]
+    fn corrupt_or_invalid_adaptation_packets_do_not_move_the_pcr_clock() {
+        let mut packet = ts(VIDEO_PID, true, true, &[]);
+        packet[4] = 7;
+        packet[5] = 0x10;
+        packet[6..12].copy_from_slice(&[0, 0, 0, 45, 0x7e, 0]);
+        assert_eq!(
+            ts_timing(packet.as_slice().try_into().unwrap()).pcr,
+            Some(90)
+        );
+        for variant in 0..4 {
+            let mut bad = packet.clone();
+            match variant {
+                0 => bad[1] |= 0x80, // uncorrectable transport error
+                1 => bad[4] = 183,   // AFC=3 must leave at least one payload byte
+                2 => bad[4] = 255,
+                _ => bad[3] = 0x20, // adaptation-only must fill the packet
+            }
+            bad[5] |= 0x80;
+            let timing = ts_timing(bad.as_slice().try_into().unwrap());
+            assert_eq!(timing.pcr, None, "invalid clock variant {variant}");
+            assert!(
+                !timing.discontinuity,
+                "invalid packet must not reset a good clock"
+            );
+        }
+        // The TS scrambling bits apply to the payload, not the adaptation clock.
+        packet[3] |= 0x80;
+        assert_eq!(
+            ts_timing(packet.as_slice().try_into().unwrap()).pcr,
+            Some(90)
+        );
+    }
+
+    #[test]
+    fn corrupt_or_payloadless_packets_cannot_select_a_video_access_point() {
+        let mut state = VideoAccessPointState::new();
+        state.observe(&pat(PMT_PID));
+        state.observe(&pmt(PMT_PID, VIDEO_PID));
+        for variant in 0..4 {
+            let mut bad = random_access_packet(VIDEO_PID);
+            match variant {
+                0 => bad[1] |= 0x80, // transport_error_indicator
+                1 => bad[3] |= 0x80, // scrambled payload
+                2 => bad[4] = 255,   // adaptation exceeds the packet
+                _ => {
+                    bad[3] = 0x20;
+                    bad[4] = 183;
+                } // no payload
+            }
+            assert!(!state.observe(&bad), "invalid access variant {variant}");
+        }
+        assert!(state.observe(&random_access_packet(VIDEO_PID)));
     }
 }

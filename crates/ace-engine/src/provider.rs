@@ -64,6 +64,10 @@ pub trait TsSource: Send {
     fn take_discontinuity(&mut self) -> bool {
         false
     }
+    /// Whether the most recently returned media has reached the initial live head.
+    fn startup_complete(&self) -> bool {
+        true
+    }
     fn stats(&self) -> SourceStats;
     fn stats_handle(&self) -> Option<StatsHandle> {
         None

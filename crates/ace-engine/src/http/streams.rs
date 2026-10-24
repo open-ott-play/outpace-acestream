@@ -228,7 +228,7 @@ fn stream_session_response(session: Arc<StreamSession>) -> Response {
     let stream = futures::stream::unfold((sub, gate), |(mut sub, mut gate)| async move {
         loop {
             match sub.rx.recv().await {
-                Ok(StreamEvent::Data(chunk)) => {
+                Ok(StreamEvent::Data(chunk) | StreamEvent::StartupData(chunk)) => {
                     let out = gate.push(&chunk);
                     if out.is_empty() {
                         continue; // still waiting for the first keyframe
@@ -274,7 +274,7 @@ pub(super) fn ace_stream_session_response(
                         if changed.is_err() || *cancel.borrow() { return None; }
                     }
                     received = sub.rx.recv() => match received {
-                        Ok(StreamEvent::Data(chunk)) => {
+                        Ok(StreamEvent::Data(chunk) | StreamEvent::StartupData(chunk)) => {
                             let out = gate.push(&chunk);
                             if out.is_empty() { continue; }
                             return Some((Ok::<_, std::io::Error>(Bytes::from(out)), (sub, gate, cancel, expires_at, direct_lease)));

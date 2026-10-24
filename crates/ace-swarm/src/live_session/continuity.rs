@@ -51,12 +51,15 @@ impl Continuity {
                 scheduler: Scheduler::new(live_recovery.max_piece_advance as usize),
                 active_peers: ActivePeers::new(),
                 received_chunks: BTreeMap::new(),
+                piece_headers: BTreeMap::new(),
                 piece_producers: BTreeMap::new(),
                 #[cfg(test)]
                 contribution_observer: None,
                 requested_at: HashMap::new(),
                 next_needed_since: Instant::now(),
                 head: max_piece,
+                startup_head: max_piece,
+                startup_complete: false,
                 startup_deadline: None,
                 request_floor: Arc::new(AtomicU64::new(start)),
                 prefetch,
@@ -94,6 +97,7 @@ impl Continuity {
             self.arm_output_gate();
         }
         self.piece_producers.retain(|&piece, _| piece >= resume);
+        self.piece_headers.retain(|&piece, _| piece >= resume);
         resume
     }
 
@@ -121,17 +125,28 @@ impl Continuity {
     pub(super) fn release_rejected_piece(&mut self, piece: u64) {
         self.reasm.discard_partial(piece);
         self.received_chunks.remove(&piece);
+        self.piece_headers.remove(&piece);
         self.piece_producers.remove(&piece);
         self.scheduler.on_drop(piece);
         self.active_peers.complete_everywhere(piece);
         self.requested_at.remove(&piece);
     }
 
+    /// The reassembler uses an exclusive, saturating upper acceptance bound.
+    pub(super) fn request_head(&self) -> u64 {
+        self.head.min(
+            self.reasm
+                .next_needed()
+                .saturating_add(self.live_recovery.max_reasm_pieces_ahead)
+                .saturating_sub(1),
+        )
+    }
+
     pub(super) fn note_chunk(&mut self, piece: u64, chunk: u16, chunks_per_piece: u16) -> bool {
-        let chunks_per_piece = chunks_per_piece.max(1) as usize;
+        let _ = chunks_per_piece;
         let chunks = self.received_chunks.entry(piece).or_default();
         chunks.insert(chunk);
-        if chunks.len() >= chunks_per_piece {
+        if self.reasm.has_complete_piece(piece) {
             self.received_chunks.remove(&piece);
             self.scheduler.on_complete(piece);
             // The piece may have been re-requested from more than one peer (retransmission);
@@ -142,6 +157,67 @@ impl Continuity {
         } else {
             false
         }
+    }
+
+    /// Publish only a fully assembled and source-verified wire piece to the seed cache.
+    /// Duplicate writes count for producer provenance, but cannot postpone a missing-byte retry.
+    pub(super) async fn receive_live_chunk(
+        &mut self,
+        chunk: &LiveChunk,
+        chunk_length: u64,
+        store: &Arc<tokio::sync::Mutex<PieceStore>>,
+        now: Instant,
+    ) -> ace_wire::Result<ace_wire::reassembly::BlockAcceptance> {
+        let piece = u64::from(chunk.piece);
+        let next = self.reasm.next_needed();
+        self.piece_headers.retain(|&index, _| index >= next);
+        if piece < next || self.reasm.has_complete_piece(piece) {
+            return Ok(Default::default());
+        }
+        if chunk_length == 0 || chunk.data.len() as u64 > chunk_length {
+            return Err(ace_wire::WireError::Invalid("invalid live chunk length"));
+        }
+        let begin = u64::from(chunk.chunk)
+            .checked_mul(chunk_length)
+            .ok_or(ace_wire::WireError::Invalid("live chunk offset overflow"))?;
+        let accepted = match self
+            .reasm
+            .add_block_with_acceptance(piece, begin, &chunk.data)
+        {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                if !self.reasm.has_partial_piece(piece) {
+                    self.piece_headers.remove(&piece);
+                }
+                return Err(error);
+            }
+        };
+        if accepted.progressed {
+            if let Some(requested_at) = self.requested_at.get_mut(&piece) {
+                *requested_at = now;
+            }
+        }
+        if !accepted.contributed {
+            return Ok(accepted);
+        }
+        let header = self
+            .piece_headers
+            .entry(piece)
+            .or_insert(chunk.piece_header);
+        if *header == [0; 8] && chunk.piece_header != [0; 8] {
+            *header = chunk.piece_header;
+        }
+        if let Some(bytes) = self.reasm.complete_piece(piece) {
+            let header = self
+                .piece_headers
+                .remove(&piece)
+                .expect("accepted piece header");
+            for (index, bytes) in bytes.chunks(chunk_length as usize).enumerate() {
+                PieceStore::shared_put_chunk_with_header(store, piece, index as u16, header, bytes)
+                    .await;
+            }
+        }
+        Ok(accepted)
     }
 
     /// Pieces still outstanding past the configured request timeout — candidates to re-request.
@@ -177,6 +253,7 @@ impl Continuity {
         self.active_peers.prune_below(floor);
         self.requested_at.retain(|&p, _| p >= floor);
         self.received_chunks.retain(|&p, _| p >= floor);
+        self.piece_headers.retain(|&p, _| p >= floor);
         self.piece_producers.retain(|&p, _| p >= floor);
         self.next_needed_since = now;
         Some(floor)
@@ -205,12 +282,16 @@ impl Continuity {
         self.active_peers.prune_below(target);
         self.requested_at.retain(|&p, _| p >= target);
         self.received_chunks.retain(|&p, _| p >= target);
+        self.piece_headers.retain(|&p, _| p >= target);
         self.piece_producers.retain(|&p, _| p >= target);
         self.next_needed_since = now;
         Some(target)
     }
 
     pub(super) fn arm_output_gate(&mut self) {
+        if !self.startup_complete {
+            self.startup_head = self.head;
+        }
         if let Some(recovery) = self.transport_recovery.take() {
             crate::alog!(
                 "[mpegts] transport recovery superseded by piece skip: discarded_bytes={} withheld_bytes={} duration_ms={} loss_events={}",
@@ -244,6 +325,7 @@ impl Continuity {
         (!output.bytes.is_empty()).then(|| LiveOutput {
             bytes: Bytes::from(output.bytes),
             discontinuity: self.take_discontinuity(),
+            startup_complete: false,
         })
     }
 
@@ -283,6 +365,11 @@ impl Continuity {
             chunks.push(suffix);
         }
         chunks
+    }
+
+    pub(super) fn output_startup_complete(&mut self) -> bool {
+        self.startup_complete |= self.reasm.next_needed() > self.startup_head;
+        self.startup_complete
     }
 
     pub(super) fn take_discontinuity(&mut self) -> bool {

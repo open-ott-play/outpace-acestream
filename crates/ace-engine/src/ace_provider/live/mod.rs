@@ -5,7 +5,9 @@ pub(super) struct AceSource {
     pub(super) metrics: Option<Arc<crate::live_stats::LiveMetrics>>,
     pub(super) _sampler: Option<crate::live_stats::MetricsSampler>,
     pub(super) rx: mpsc::Receiver<LiveOutput>,
+    pub(super) worker: Option<tokio::task::JoinHandle<()>>,
     pub(super) discontinuity: bool,
+    pub(super) startup_complete: bool,
     pub(super) peers: Arc<AtomicU32>,
     pub(super) downloaded: Arc<AtomicU64>,
     pub(super) uploaded: Arc<AtomicU64>,
@@ -13,15 +15,27 @@ pub(super) struct AceSource {
     pub(super) metadata: StreamMetadata,
 }
 
+impl Drop for AceSource {
+    fn drop(&mut self) {
+        if let Some(worker) = &self.worker {
+            worker.abort();
+        }
+    }
+}
+
 #[async_trait]
 impl TsSource for AceSource {
     async fn next(&mut self) -> Option<Bytes> {
         let output = self.rx.recv().await?;
         self.discontinuity = output.discontinuity;
+        self.startup_complete = output.startup_complete;
         Some(output.bytes)
     }
     fn take_discontinuity(&mut self) -> bool {
         std::mem::take(&mut self.discontinuity)
+    }
+    fn startup_complete(&self) -> bool {
+        self.startup_complete
     }
     fn stats(&self) -> SourceStats {
         if let Some(metrics) = &self.metrics {
@@ -122,7 +136,7 @@ impl AceProvider {
         let metadata = info.metadata.clone();
         let announce_port = self.announce_peer_port.clone();
         let reachability = self.reachability.clone();
-        tokio::spawn(async move {
+        let worker = tokio::spawn(async move {
             // Run the download loop and the periodic seeder self-announce concurrently;
             // whichever ends first (normally `follow_live`, when the consumer drops) tears
             // down the other — no separate lifecycle to manage.
@@ -135,7 +149,9 @@ impl AceProvider {
             metrics: Some(metrics),
             _sampler: Some(sampler),
             rx,
+            worker: Some(worker),
             discontinuity: false,
+            startup_complete: false,
             peers: peer_count,
             downloaded: stats_downloaded,
             uploaded: stats_uploaded,

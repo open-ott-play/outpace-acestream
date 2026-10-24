@@ -11,12 +11,14 @@ use tokio::sync::{broadcast, Mutex};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamEvent {
     Data(Bytes),
+    /// Media that precedes the source's initial live-head catch-up boundary.
+    StartupData(Bytes),
     Discontinuity,
 }
 
 /// A live session: pulls from one `TsSource` and broadcasts TS chunks to subscribers.
 pub struct StreamSession {
-    tx: broadcast::Sender<StreamEvent>,
+    tx: broadcast::WeakSender<StreamEvent>,
     subscribers: Arc<AtomicU64>,
     stats: Arc<Mutex<SourceStats>>,
     live_stats: Option<StatsHandle>,
@@ -33,15 +35,28 @@ impl Drop for StreamSession {
     }
 }
 
-/// A subscription that decrements the live subscriber count on drop.
-pub struct Subscription {
-    pub rx: broadcast::Receiver<StreamEvent>,
+/// Counts one source owner without retaining unread broadcast data.
+pub struct SessionPin {
     count: Arc<AtomicU64>,
 }
 
-impl Drop for Subscription {
+impl Drop for SessionPin {
     fn drop(&mut self) {
         self.count.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A subscription that decrements the live subscriber count on drop.
+pub struct Subscription {
+    pub rx: broadcast::Receiver<StreamEvent>,
+    pin: SessionPin,
+}
+
+impl Subscription {
+    /// Transfer ownership unchanged while dropping this unread receiver. HLS leases need
+    /// a source pin, but their packager already owns the receiver that consumes the media.
+    pub fn into_pin(self) -> SessionPin {
+        self.pin
     }
 }
 
@@ -54,7 +69,8 @@ impl StreamSession {
         let stats = Arc::new(Mutex::new(SourceStats::default()));
         let metadata = source.metadata();
         let live_stats = source.stats_handle();
-        let pump_tx = tx.clone();
+        let weak_tx = tx.downgrade();
+        let pump_tx = tx;
         let pump_stats = stats.clone();
         let pump = tokio::spawn(async move {
             while let Some(chunk) = source.next().await {
@@ -63,11 +79,16 @@ impl StreamSession {
                     let _ = pump_tx.send(StreamEvent::Discontinuity);
                 }
                 // Err just means no live receivers right now; keep pulling (live).
-                let _ = pump_tx.send(StreamEvent::Data(chunk));
+                let event = if source.startup_complete() {
+                    StreamEvent::Data(chunk)
+                } else {
+                    StreamEvent::StartupData(chunk)
+                };
+                let _ = pump_tx.send(event);
             }
         });
         Arc::new(StreamSession {
-            tx,
+            tx: weak_tx,
             subscribers: Arc::new(AtomicU64::new(0)),
             stats,
             live_stats,
@@ -79,8 +100,10 @@ impl StreamSession {
     pub fn subscribe(&self) -> Subscription {
         self.subscribers.fetch_add(1, Ordering::SeqCst);
         Subscription {
-            rx: self.tx.subscribe(),
-            count: self.subscribers.clone(),
+            rx: self.raw_receiver(),
+            pin: SessionPin {
+                count: self.subscribers.clone(),
+            },
         }
     }
 
@@ -88,10 +111,22 @@ impl StreamSession {
         self.subscribers.load(Ordering::SeqCst)
     }
 
+    /// The source pump has exited (including EOF or failure). Old subscribers may still
+    /// drain their queued data, but a fresh playback acquisition may start a new session.
+    pub fn is_finished(&self) -> bool {
+        self.pump.is_finished()
+    }
+
     /// A receiver that does NOT count as a client (used by internal consumers like the HLS
     /// packager, which must not pin the session open against idle teardown).
     pub fn raw_receiver(&self) -> broadcast::Receiver<StreamEvent> {
-        self.tx.subscribe()
+        if let Some(tx) = self.tx.upgrade() {
+            tx.subscribe()
+        } else {
+            // A late subscriber must observe EOF too, without creating a new live sender.
+            let (_tx, rx) = broadcast::channel(1);
+            rx
+        }
     }
 
     pub async fn stats(&self) -> SourceStats {

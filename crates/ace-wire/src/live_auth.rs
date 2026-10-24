@@ -105,13 +105,28 @@ impl LiveSourceAuth {
 /// DER SubjectPublicKeyInfo (the transport descriptor's `pubkey` field). Scheme: RSASSA-
 /// PKCS1-v1_5 with SHA1 — see the module docs for how this was recovered.
 pub fn verify_piece(pubkey_der: &[u8], payload: &[u8], signature: &[u8]) -> bool {
-    let Ok(pubkey) = RsaPublicKey::from_public_key_der(pubkey_der) else {
-        return false;
-    };
-    let digest = Sha1::digest(payload);
-    pubkey
-        .verify(Pkcs1v15Sign::new::<Sha1>(), &digest, signature)
-        .is_ok()
+    LivePieceVerifier::from_der(pubkey_der)
+        .is_some_and(|verifier| verifier.verify(payload, signature))
+}
+
+/// A source key parsed once for all pieces in a live stream.
+pub(crate) struct LivePieceVerifier(RsaPublicKey);
+
+impl LivePieceVerifier {
+    pub(crate) fn from_der(der: &[u8]) -> Option<Self> {
+        RsaPublicKey::from_public_key_der(der).ok().map(Self)
+    }
+
+    pub(crate) fn signature_len(&self) -> usize {
+        self.0.size()
+    }
+
+    pub(crate) fn verify(&self, payload: &[u8], signature: &[u8]) -> bool {
+        let digest = Sha1::digest(payload);
+        self.0
+            .verify(Pkcs1v15Sign::new::<Sha1>(), &digest, signature)
+            .is_ok()
+    }
 }
 
 /// The live-source signature length for a broadcaster's `pubkey` (the transport descriptor's
@@ -282,5 +297,31 @@ w7burR2QqD9OS/n92TGQ2S3yyv5k6oG00re0J44=\n\
                 "piece {idx}: re-signing must match the real engine byte-for-byte"
             );
         }
+    }
+    #[test]
+    fn cached_verifier_matches_der_verification_for_valid_corrupt_and_wrong_key_pieces() {
+        let source = LiveSourceAuth::generate();
+        let other = LiveSourceAuth::generate();
+        let der = source.pubkey_der();
+        let verifier = LivePieceVerifier::from_der(&der).unwrap();
+        assert_eq!(verifier.signature_len(), source.signature_len());
+        for payload in [
+            b"synthetic first piece".as_slice(),
+            b"synthetic second piece",
+        ] {
+            let valid = source.sign(payload);
+            let mut corrupt = valid.clone();
+            corrupt[0] ^= 1;
+            for signature in [&valid, &corrupt, &other.sign(payload)] {
+                assert_eq!(
+                    verifier.verify(payload, signature),
+                    verify_piece(&der, payload, signature)
+                );
+            }
+            assert!(verifier.verify(payload, &valid));
+            assert!(!verifier.verify(b"changed payload", &valid));
+        }
+        assert!(LivePieceVerifier::from_der(&[]).is_none());
+        assert!(LivePieceVerifier::from_der(b"invalid DER").is_none());
     }
 }

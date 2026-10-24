@@ -1,7 +1,13 @@
 use super::*;
 
 pub(super) fn prefer_window(candidate: &WireLivePosition, current: &WireLivePosition) -> bool {
-    let score = |w: &WireLivePosition| (w.max_piece, w.position, -w.distance_from_source);
+    let score = |w: &WireLivePosition| {
+        (
+            w.max_piece,
+            w.position,
+            std::cmp::Reverse(w.distance_from_source),
+        )
+    };
     score(candidate) > score(current)
 }
 

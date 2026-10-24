@@ -489,3 +489,68 @@ fn recovery_channel_capacities_are_checked() {
     };
     assert!(recovery_channel_capacities(invalid).is_err());
 }
+
+#[tokio::test]
+async fn full_command_queue_defers_requests_and_sweep_retries_without_new_events() {
+    let (mut c, _) = Continuity::fresh(&info(), 0, 100, 100, default_live_recovery());
+    let addr = "127.0.0.1:1".parse().unwrap();
+    let (peer, mut commands) = test_pool_peer(addr);
+    for _ in 0..8 {
+        peer.commands
+            .try_send(PeerCommand::Send(PeerMessage::KeepAlive))
+            .unwrap();
+    }
+    let mut peers = BTreeMap::from([(1, peer)]);
+    c.register_active_peer(1, addr, live_pos(0, 100));
+    c.set_peer_unchoked(1, true);
+    assert!(advance_pool_requests(&mut peers, &mut c, 2)
+        .await
+        .is_empty());
+    assert!(c.requested_at.is_empty());
+    assert_eq!(c.active_peers.in_flight_count(1), 0);
+    for _ in 0..8 {
+        commands.try_recv().unwrap();
+    }
+    retransmit_stalled_requests(&mut peers, &mut c, 2, Instant::now()).await;
+    assert!(matches!(
+        commands.try_recv(),
+        Ok(PeerCommand::RequestPiece { piece: 0, .. })
+    ));
+    shutdown_peer_runtimes(&mut peers);
+}
+
+#[tokio::test]
+async fn saturated_control_queue_drops_peer_without_blocking_pool() {
+    let (mut c, _) = Continuity::fresh(&info(), 0, 0, 0, default_live_recovery());
+    let addr = "127.0.0.1:1".parse().unwrap();
+    let (peer, _commands) = test_pool_peer(addr);
+    for _ in 0..8 {
+        peer.commands
+            .try_send(PeerCommand::Send(PeerMessage::KeepAlive))
+            .unwrap();
+    }
+    let mut peers = BTreeMap::from([(1, peer)]);
+    assert_eq!(
+        send_peer_command(1, PeerMessage::Unchoke, &mut peers, &mut c).await,
+        Some(addr)
+    );
+    assert!(peers.is_empty());
+}
+
+#[test]
+fn request_head_keeps_the_saturating_upper_bound_exclusive() {
+    let (mut c, _) = Continuity::fresh(&info(), 0, 100, 100, default_live_recovery());
+    c.head = u64::MAX;
+    c.reasm.skip_to(u64::MAX - 1);
+    assert_eq!(c.request_head(), u64::MAX - 1);
+    assert!(c.reasm.add_block(u64::MAX, 0, b"data").is_err());
+}
+
+#[test]
+fn peer_distance_ordering_handles_minimum_signed_distance() {
+    let mut preferred = live_pos(0, 1);
+    preferred.distance_from_source = i64::MIN;
+    let other = live_pos(0, 1);
+    assert!(prefer_window(&preferred, &other));
+    assert!(!prefer_window(&other, &preferred));
+}

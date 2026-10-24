@@ -36,7 +36,7 @@ struct StartupReservoir {
     config: StartupBufferConfig,
     /// Raw transport descriptor rate in bytes/s; measured source stats remain bits/s.
     bitrate: Option<u64>,
-    queue: VecDeque<Bytes>,
+    queue: VecDeque<BufferedChunk>,
     queued_bytes: usize,
     clock: SelectedPcrClock,
     partial: Vec<u8>,
@@ -44,6 +44,11 @@ struct StartupReservoir {
     release_clock_duration: Option<Duration>,
     release_bytes: usize,
     phase: Phase,
+}
+
+struct BufferedChunk {
+    bytes: Bytes,
+    startup_complete: bool,
 }
 
 impl StartupReservoir {
@@ -66,7 +71,7 @@ impl StartupReservoir {
         }
     }
 
-    fn push(&mut self, mut chunk: Bytes) -> Option<ReleaseReason> {
+    fn push(&mut self, mut chunk: Bytes, startup_complete: bool) -> Option<ReleaseReason> {
         if self.phase != Phase::Collecting {
             return match self.phase {
                 Phase::Draining(reason) => Some(reason),
@@ -85,7 +90,10 @@ impl StartupReservoir {
         }
         let crosses_cap = self.queued_bytes.saturating_add(chunk.len()) > self.config.max_bytes;
         self.queued_bytes += chunk.len();
-        self.queue.push_back(chunk);
+        self.queue.push_back(BufferedChunk {
+            bytes: chunk,
+            startup_complete,
+        });
 
         let reason = if crosses_cap {
             Some(ReleaseReason::ByteLimit)
@@ -136,13 +144,14 @@ impl StartupReservoir {
 
         let mut discard = retain_from;
         while discard > 0 {
-            let front_len = self.queue.front().map_or(0, Bytes::len);
+            let front_len = self.queue.front().map_or(0, |chunk| chunk.bytes.len());
             if discard < front_len {
-                let retained = self
+                let mut retained = self
                     .queue
                     .pop_front()
                     .expect("front length came from queue");
-                self.queue.push_front(retained.slice(discard..));
+                retained.bytes = retained.bytes.slice(discard..);
+                self.queue.push_front(retained);
                 self.queued_bytes -= discard;
                 break;
             }
@@ -221,9 +230,9 @@ impl StartupReservoir {
         self.phase = Phase::Draining(reason);
     }
 
-    fn pop_front(&mut self) -> Option<Bytes> {
+    fn pop_front(&mut self) -> Option<BufferedChunk> {
         let chunk = self.queue.pop_front()?;
-        self.queued_bytes -= chunk.len();
+        self.queued_bytes -= chunk.bytes.len();
         Some(chunk)
     }
 
@@ -267,6 +276,7 @@ pub struct StartupBufferedSource {
     reservoir: StartupReservoir,
     pending_discontinuity: bool,
     released_chunk_discontinuity: bool,
+    released_chunk_startup_complete: bool,
 }
 
 impl StartupBufferedSource {
@@ -276,6 +286,7 @@ impl StartupBufferedSource {
         config: StartupBufferConfig,
         bitrate: Option<u64>,
     ) -> Box<dyn TsSource> {
+        let released_chunk_startup_complete = inner.startup_complete();
         let stats = Arc::new(StartupStatsReader {
             inner: inner.stats_handle(),
             observed: Mutex::new(StartupObservation {
@@ -289,6 +300,7 @@ impl StartupBufferedSource {
             reservoir: StartupReservoir::new(config, bitrate),
             pending_discontinuity: false,
             released_chunk_discontinuity: false,
+            released_chunk_startup_complete,
         })
     }
 
@@ -315,7 +327,7 @@ impl StartupBufferedSource {
                     self.reservoir.discontinuity();
                     self.pending_discontinuity = true;
                 }
-                self.reservoir.push(chunk);
+                self.reservoir.push(chunk, self.inner.startup_complete());
             }
             None => self.reservoir.release(ReleaseReason::EndOfStream),
         }
@@ -334,7 +346,8 @@ impl TsSource for StartupBufferedSource {
                         self.released_chunk_discontinuity =
                             std::mem::take(&mut self.pending_discontinuity);
                         self.publish_stats();
-                        return Some(chunk);
+                        self.released_chunk_startup_complete = chunk.startup_complete;
+                        return Some(chunk.bytes);
                     }
                     self.reservoir.finish_drain();
                     self.publish_stats();
@@ -353,6 +366,14 @@ impl TsSource for StartupBufferedSource {
             self.inner.take_discontinuity()
         } else {
             std::mem::take(&mut self.released_chunk_discontinuity)
+        }
+    }
+
+    fn startup_complete(&self) -> bool {
+        if self.reservoir.phase == Phase::Released {
+            self.inner.startup_complete()
+        } else {
+            self.released_chunk_startup_complete
         }
     }
 
@@ -774,13 +795,13 @@ mod tests {
     #[test]
     fn reservoir_never_exceeds_cap_plus_one_chunk() {
         let mut reservoir = StartupReservoir::new(config(10_000, 200, 10_000), None);
-        assert!(reservoir.push(Bytes::from(vec![0; 150])).is_none());
+        assert!(reservoir.push(Bytes::from(vec![0; 150]), true).is_none());
         assert_eq!(
-            reservoir.push(Bytes::from(vec![0; 100])),
+            reservoir.push(Bytes::from(vec![0; 100]), true),
             Some(ReleaseReason::ByteLimit)
         );
         assert_eq!(reservoir.queued_bytes(), 250);
-        assert!(reservoir.push(Bytes::from(vec![0; 100])).is_some());
+        assert!(reservoir.push(Bytes::from(vec![0; 100]), true).is_some());
         assert_eq!(reservoir.queued_bytes(), 250);
     }
 

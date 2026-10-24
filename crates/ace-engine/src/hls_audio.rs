@@ -475,6 +475,9 @@ impl PacketSource {
                         #[cfg(test)]
                         self.update_probe();
                     }
+                    // Wait for live-head catch-up before normalizing; this prevents
+                    // old queued media from opening the normalized HLS playlist.
+                    Ok(StreamEvent::StartupData(_)) => continue,
                     Ok(StreamEvent::Discontinuity) => {
                         self.discard_partial();
                         return SourceItem::Recovery(RecoveryReason::Source);

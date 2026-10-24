@@ -5,7 +5,7 @@
 //! window, and live playlist rendering. It uses [`ace_media::mpegts::SelectedPcrClock`] and
 //! [`ace_media::mpegts::VideoAccessPointState`] for pure media analysis. Segments carry cached
 //! PAT/PMT tables and prefer video access-point boundaries; the packet ceiling can force a
-//! mid-GOP continuation once the target duration is reached, or discard an incomplete run.
+//! mid-GOP continuation once PCR has advanced, or discard an incomplete run.
 //!
 //! [`crate::manager`] manages shared packagers and session lifecycle. [`crate::http`] handles
 //! HTTP playlist and segment requests, using this module's readiness and media accessors;
@@ -27,6 +27,9 @@ const TS_PACKET: usize = 188;
 #[cfg(test)]
 const PCR_MODULUS: u64 = 1 << 33;
 const SDT_PID: u16 = 0x0011;
+const HLS_SEGMENT_GRACE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const SEGMENT_GRACE_MAX_COUNT: usize = 32;
+const SEGMENT_GRACE_MAX_AGE: Duration = Duration::from_secs(120);
 
 /// A monotonically increasing token fencing writes from retired workers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -71,6 +74,8 @@ pub struct HlsPackager {
 }
 
 struct HlsState {
+    startup_complete: bool,
+    ended: bool,
     generation: GenerationId,
     status: HlsStatus,
     deadline: Option<tokio::time::Instant>,
@@ -86,11 +91,14 @@ struct HlsState {
     media_seq: u64,
     discontinuity_sequence: u64,
     segments: VecDeque<HlsSegment>,
+    retired_segments: VecDeque<RetiredHlsSegment>,
+    retired_bytes: usize,
     cur: Vec<u8>,
     scanned_packets: usize,
     clock: SelectedPcrClock,
     /// Selected PCR retained only to rebase the clock at a segment boundary.
     boundary_timing: Option<TsTiming>,
+    clean_boundary: Option<CleanBoundary>,
     max_segment_duration: f32,
     discontinuity_pending: bool,
     /// A provider recovery announces its boundary out of band and also marks the first resumed
@@ -104,10 +112,29 @@ struct HlsState {
     filter_sdt: bool,
 }
 
+struct CleanBoundary {
+    offset: usize,
+    duration: f32,
+    timing: Option<TsTiming>,
+    access: VideoAccessPointState,
+}
+
 struct HlsSegment {
     bytes: Bytes,
+    /// Charge the Vec allocation transferred into Bytes, including spare capacity.
+    allocation_bytes: usize,
     duration: f32,
     discontinuity: bool,
+    /// Largest playlist duration advertising this segment, plus its own duration (RFC 8216
+    /// 6.2.2), bounded by our maximum grace. None means no player was given this URI.
+    advertised_grace: Option<Duration>,
+}
+
+struct RetiredHlsSegment {
+    seq: u64,
+    bytes: Bytes,
+    allocation_bytes: usize,
+    expires_at: Instant,
 }
 
 impl HlsPackager {
@@ -133,6 +160,8 @@ impl HlsPackager {
         Arc::new(HlsPackager {
             state: Mutex::new(HlsState {
                 generation: GenerationId(0),
+                startup_complete: true,
+                ended: false,
                 status: HlsStatus::Starting,
                 deadline: None,
                 strict: false,
@@ -143,10 +172,13 @@ impl HlsPackager {
                 media_seq: 0,
                 discontinuity_sequence: 0,
                 segments: VecDeque::new(),
+                retired_segments: VecDeque::new(),
+                retired_bytes: 0,
                 cur: Vec::new(),
                 scanned_packets: 0,
                 clock: SelectedPcrClock::new(),
                 boundary_timing: None,
+                clean_boundary: None,
                 max_segment_duration: config.segment_duration_secs(),
                 discontinuity_pending: false,
                 deduplicate_source_marker: false,
@@ -170,6 +202,8 @@ impl HlsPackager {
         {
             let mut st = media.state.lock().unwrap();
             st.strict = strict;
+            // Normalization discards historical StartupData before opening its media gate.
+            st.startup_complete = strict;
             st.generation_opening = strict;
             if strict {
                 st.access.enable_mpeg2();
@@ -269,7 +303,7 @@ impl HlsPackager {
         if native_access {
             st.last_access = Some(Instant::now());
         }
-        Ok(Self::render_playlist(&st, prefix))
+        Ok(Self::render_playlist(&mut st, prefix))
     }
 
     pub async fn wait_available(&self, timeout: Duration) -> HlsStatus {
@@ -305,13 +339,25 @@ impl HlsPackager {
                 _ = cancel.changed() => { if *cancel.borrow() { break; } }
                 event = rx.recv() => match event {
                     Ok(StreamEvent::Data(chunk)) => self.feed(&chunk),
+                    Ok(StreamEvent::StartupData(chunk)) => self.feed_source(&chunk, false),
                     Ok(StreamEvent::Discontinuity) => self.discontinuity(),
                     Err(RecvError::Lagged(_)) => self.receiver_lag(),
-                    Err(RecvError::Closed) => break,
+                    Err(RecvError::Closed) => { self.finish(); return; },
                 }
             }
         }
         self.stop();
+    }
+
+    /// Preserve completed media as a final playlist; never publish an incomplete EOF tail.
+    fn finish(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.ended = true;
+        Self::reset_partial(&mut st, false);
+        if st.status != HlsStatus::Ready {
+            st.status = HlsStatus::Stopped;
+        }
+        self.ready.notify_waiters();
     }
 
     /// Drop media accumulated before a known gap and mark the first complete segment after it.
@@ -336,6 +382,7 @@ impl HlsPackager {
         st.scanned_packets = 0;
         st.clock.reset();
         st.boundary_timing = None;
+        st.clean_boundary = None;
         st.discontinuity_pending = true;
         st.deduplicate_source_marker = deduplicate_source_marker;
         st.access.reset();
@@ -346,11 +393,21 @@ impl HlsPackager {
 
     /// Append contiguous TS bytes, emitting PCR-timed, preferably random-access-aligned segments.
     fn feed(&self, data: &[u8]) {
+        self.feed_source(data, true);
+    }
+
+    fn feed_source(&self, data: &[u8], startup_complete: bool) {
         let mut st = self.state.lock().unwrap();
-        if matches!(st.status, HlsStatus::Stopped | HlsStatus::Failed(_)) {
-            return;
-        }
         self.feed_locked(&mut st, data);
+        // The marker describes the end of this batch, never producer-ahead progress.
+        st.startup_complete |= startup_complete;
+        if st.startup_complete
+            && st.status == HlsStatus::Starting
+            && st.segments.len() >= self.startup_segments
+        {
+            st.status = HlsStatus::Ready;
+            self.ready.notify_waiters();
+        }
     }
 
     fn feed_locked(&self, st: &mut HlsState, data: &[u8]) {
@@ -403,6 +460,7 @@ impl HlsPackager {
         if st.cur.len() == self.max_segment_bytes {
             self.scan_lookahead(st, packet);
         } else {
+            self.reserve_current(st, TS_PACKET);
             st.cur.extend_from_slice(packet);
             self.scan(st);
         }
@@ -433,6 +491,7 @@ impl HlsPackager {
                     st.scanned_packets = 0;
                     st.clock.reset();
                     st.boundary_timing = None;
+                    st.clean_boundary = None;
                     st.discontinuity_pending = true;
                     st.awaiting_access_point = true;
                     continue;
@@ -477,6 +536,7 @@ impl HlsPackager {
                 }
                 let trailing = st.cur.split_off(packet_offset + TS_PACKET);
                 st.cur.clear();
+                self.reserve_current(st, prefix.len() + TS_PACKET + trailing.len());
                 st.cur.extend_from_slice(&prefix);
                 st.cur.extend_from_slice(&packet);
                 st.cur.extend_from_slice(&trailing);
@@ -495,6 +555,7 @@ impl HlsPackager {
                 st.discontinuity_pending = true;
                 st.deduplicate_source_marker = false;
                 st.awaiting_access_point = true;
+                st.clean_boundary = None;
                 continue;
             }
             let elapsed = st.clock.elapsed().map(|duration| duration.as_secs_f32());
@@ -506,6 +567,7 @@ impl HlsPackager {
                     .access
                     .table_prefix()
                     .expect("an observed video access point has PAT/PMT state");
+                self.reserve_current(st, prefix.len());
                 st.cur.splice(0..0, prefix.iter().copied());
                 st.scanned_packets = prefix.len() / TS_PACKET;
                 st.clock.reset();
@@ -513,6 +575,19 @@ impl HlsPackager {
                     st.clock.observe(boundary);
                 }
                 continue;
+            }
+            // Keep only the latest viable cut. It must free enough space for matching tables
+            // and the one lookahead packet when its tail becomes the following segment.
+            if is_access_point && elapsed.is_some_and(|duration| duration > 0.0) {
+                let prefix_len = if st.filter_sdt { 3 } else { 2 } * TS_PACKET;
+                if packet_offset >= prefix_len + TS_PACKET {
+                    st.clean_boundary = Some(CleanBoundary {
+                        offset: packet_offset,
+                        duration: elapsed.unwrap(),
+                        timing: st.boundary_timing,
+                        access: st.access.clone(),
+                    });
+                }
             }
             st.scanned_packets += 1;
         }
@@ -551,14 +626,42 @@ impl HlsPackager {
 
         let elapsed = st.clock.elapsed().map(|duration| duration.as_secs_f32());
 
-        // Once a full target duration has elapsed, emit the ceiling-full segment even if this
+        // A keyframe in lookahead is the latest possible clean cut. Otherwise rewind to the
+        // latest interior keyframe and replay its bounded tail, restoring the tables and PCR
+        // selected at that boundary rather than the state observed later in the run.
+        if !is_access_point {
+            if let Some(boundary) = st.clean_boundary.take() {
+                self.emit(st, boundary.offset, boundary.duration);
+                st.access = boundary.access;
+                let prefix = st
+                    .access
+                    .table_prefix()
+                    .expect("saved clean boundary has tables");
+                debug_assert!(prefix.len() + st.cur.len() + TS_PACKET <= self.max_segment_bytes);
+                // Reserve the bounded continuation once: a nearly-full tail must not trigger
+                // Vec's geometric growth beyond the configured byte budget when adding tables.
+                st.cur.reserve_exact(self.max_segment_bytes - st.cur.len());
+                st.cur.splice(0..0, prefix.iter().copied());
+                st.cur.extend_from_slice(packet);
+                st.scanned_packets = prefix.len() / TS_PACKET;
+                st.clock.reset();
+                st.boundary_timing = boundary.timing;
+                if let Some(timing) = boundary.timing {
+                    st.clock.observe(timing);
+                }
+                self.scan(st);
+                return;
+            }
+        }
+
+        // Once PCR has advanced, emit the ceiling-full segment even if this
         // boundary packet is not a keyframe. On a peaky or long-GOP stream (e.g. 2160p HEVC in a
         // high-motion scene) the next keyframe can land just past the byte ceiling; discarding
         // the run there would stall the playlist. Emitting keeps playback advancing. A run forced
         // out this way does not end on a keyframe, so the continuation segment starts mid-GOP --
         // seamless for sequential live playback, with the next keyframe re-aligning boundaries.
         // It is not a transport discontinuity, so no #EXT-X-DISCONTINUITY is emitted.
-        if elapsed.is_some_and(|duration| duration >= self.seg_duration) {
+        if elapsed.is_some_and(|duration| duration > 0.0) {
             let duration = elapsed.unwrap_or(self.seg_duration);
             let boundary_timing = st.boundary_timing;
             self.emit(st, self.max_segment_bytes, duration);
@@ -585,6 +688,20 @@ impl HlsPackager {
         }
     }
 
+    fn reserve_current(&self, st: &mut HlsState, additional: usize) {
+        let required = st.cur.len() + additional;
+        debug_assert!(required <= self.max_segment_bytes);
+        if required > st.cur.capacity() {
+            let capacity = st
+                .cur
+                .capacity()
+                .saturating_mul(2)
+                .max(required)
+                .min(self.max_segment_bytes);
+            st.cur.reserve_exact(capacity - st.cur.len());
+        }
+    }
+
     fn seed_clean_run(
         &self,
         st: &mut HlsState,
@@ -594,11 +711,13 @@ impl HlsPackager {
     ) {
         debug_assert!(prefix.len() + TS_PACKET <= self.max_segment_bytes);
         st.cur.clear();
+        self.reserve_current(st, prefix.len() + TS_PACKET);
         st.cur.extend_from_slice(prefix);
         st.cur.extend_from_slice(packet);
         st.scanned_packets = st.cur.len() / TS_PACKET;
         st.clock.reset();
         st.boundary_timing = None;
+        st.clean_boundary = None;
         Self::observe_clock(st, timing);
         st.awaiting_access_point = false;
     }
@@ -608,6 +727,7 @@ impl HlsPackager {
         st.scanned_packets = 0;
         st.clock.reset();
         st.boundary_timing = None;
+        st.clean_boundary = None;
         st.discontinuity_pending = true;
         st.deduplicate_source_marker = false;
         st.awaiting_access_point = true;
@@ -627,26 +747,31 @@ impl HlsPackager {
     }
 
     fn emit(&self, st: &mut HlsState, end: usize, duration: f32) {
+        self.emit_at(st, end, duration, Instant::now());
+    }
+
+    fn emit_at(&self, st: &mut HlsState, end: usize, duration: f32, now: Instant) {
+        st.clean_boundary = None;
+        Self::prune_segment_grace(st, now);
         let was_ready = st.status == HlsStatus::Ready;
-        // Evict before splitting/pushing so emission never transiently retains `window + 1`
-        // completed segments in addition to the current segment. Configuration accounts for
-        // exactly `window` completed segments plus `cur`.
+        // Grace storage is separate, bounded and never advertised as part of the live window.
         while st.segments.len() >= self.window {
-            if st
-                .segments
-                .pop_front()
-                .is_some_and(|segment| segment.discontinuity)
-            {
+            let segment = st.segments.pop_front().unwrap();
+            if segment.discontinuity {
                 st.discontinuity_sequence += 1;
             }
+            Self::retain_advertised_segment(st, st.media_seq, segment, now);
             st.media_seq += 1;
         }
         let rest = st.cur.split_off(end);
         let mut seg = std::mem::replace(&mut st.cur, rest);
         st.audio.emitted(&mut seg);
         let discontinuity = std::mem::take(&mut st.discontinuity_pending);
+        let allocation_bytes = seg.capacity();
         st.segments.push_back(HlsSegment {
             bytes: Bytes::from(seg),
+            allocation_bytes,
+            advertised_grace: None,
             duration,
             discontinuity,
         });
@@ -656,12 +781,48 @@ impl HlsPackager {
         } else {
             st.segments.len()
         };
-        if !was_ready && count >= self.startup_segments {
+        if st.startup_complete && !was_ready && count >= self.startup_segments {
             st.status = HlsStatus::Ready;
             self.ready.notify_waiters();
         }
         st.max_segment_duration = st.max_segment_duration.max(duration);
         st.scanned_packets = 0;
+    }
+
+    fn prune_segment_grace(st: &mut HlsState, now: Instant) {
+        // Different segment/playlist durations produce non-monotonic expiry deadlines.
+        st.retired_segments.retain(|segment| {
+            if segment.expires_at <= now {
+                st.retired_bytes -= segment.allocation_bytes;
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn retain_advertised_segment(st: &mut HlsState, seq: u64, segment: HlsSegment, now: Instant) {
+        let Some(grace) = segment.advertised_grace else {
+            return;
+        };
+        let charge = segment.allocation_bytes;
+        if charge > HLS_SEGMENT_GRACE_MAX_BYTES {
+            return;
+        }
+        // Resource caps take precedence over the grace promise for extreme bitrate/bursts.
+        while st.retired_segments.len() >= SEGMENT_GRACE_MAX_COUNT
+            || st.retired_bytes > HLS_SEGMENT_GRACE_MAX_BYTES - charge
+        {
+            let evicted = st.retired_segments.pop_front().unwrap();
+            st.retired_bytes -= evicted.allocation_bytes;
+        }
+        st.retired_bytes += charge;
+        st.retired_segments.push_back(RetiredHlsSegment {
+            seq,
+            bytes: segment.bytes,
+            allocation_bytes: charge,
+            expires_at: now + grace,
+        });
     }
 
     /// Whether the configured startup cushion of independently joinable segments is available.
@@ -692,16 +853,26 @@ impl HlsPackager {
     pub fn playlist_with_segment_prefix(&self, segment_prefix: &str) -> String {
         let mut st = self.state.lock().unwrap();
         st.last_access = Some(Instant::now());
-        Self::render_playlist(&st, segment_prefix)
+        Self::render_playlist(&mut st, segment_prefix)
     }
 
     /// Render the retained live window for a compatibility route without refreshing native HLS
     /// activity. Compatibility lifetime is controlled by its explicit subscription pin.
     pub fn compatibility_playlist_with_segment_prefix(&self, segment_prefix: &str) -> String {
-        Self::render_playlist(&self.state.lock().unwrap(), segment_prefix)
+        Self::render_playlist(&mut self.state.lock().unwrap(), segment_prefix)
     }
 
-    fn render_playlist(st: &HlsState, segment_prefix: &str) -> String {
+    fn render_playlist(st: &mut HlsState, segment_prefix: &str) -> String {
+        Self::prune_segment_grace(st, Instant::now());
+        let playlist_duration: f64 = st.segments.iter().map(|s| f64::from(s.duration)).sum();
+        for segment in &mut st.segments {
+            let grace = Duration::from_secs_f64(
+                (playlist_duration + f64::from(segment.duration))
+                    .min(SEGMENT_GRACE_MAX_AGE.as_secs_f64()),
+            );
+            segment.advertised_grace =
+                Some(segment.advertised_grace.unwrap_or_default().max(grace));
+        }
         let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:3\n");
         out.push_str(&format!(
             "#EXT-X-TARGETDURATION:{}\n",
@@ -729,6 +900,9 @@ impl HlsPackager {
                 st.media_seq + i as u64
             ));
         }
+        if st.ended {
+            out.push_str("#EXT-X-ENDLIST\n");
+        }
         out
     }
 
@@ -754,7 +928,7 @@ impl HlsPackager {
     /// Fetch a retained segment by its absolute sequence number.
     pub fn segment(&self, seq: u64) -> Option<Bytes> {
         let mut st = self.state.lock().unwrap();
-        let bytes = Self::retained_segment(&st, seq);
+        let bytes = Self::retained_segment(&mut st, seq, Instant::now());
         if bytes.is_some() {
             st.last_access = Some(Instant::now());
         }
@@ -763,12 +937,17 @@ impl HlsPackager {
 
     /// Fetch a retained segment for a compatibility route without refreshing native HLS activity.
     pub fn compatibility_segment(&self, seq: u64) -> Option<Bytes> {
-        Self::retained_segment(&self.state.lock().unwrap(), seq)
+        Self::retained_segment(&mut self.state.lock().unwrap(), seq, Instant::now())
     }
 
-    fn retained_segment(st: &HlsState, seq: u64) -> Option<Bytes> {
+    fn retained_segment(st: &mut HlsState, seq: u64, now: Instant) -> Option<Bytes> {
+        Self::prune_segment_grace(st, now);
         if seq < st.media_seq {
-            return None;
+            return st
+                .retired_segments
+                .iter()
+                .find(|segment| segment.seq == seq)
+                .map(|segment| segment.bytes.clone());
         }
         st.segments
             .get((seq - st.media_seq) as usize)
@@ -1579,9 +1758,9 @@ mod tests {
         p.feed(&pat);
         p.feed(&pmt);
         p.feed(&video_access_packet(VIDEO_PID, 0));
-        p.feed(&pcr_packet(VIDEO_PID, 9_000, false, false, 1));
-        p.feed(&pcr_packet(VIDEO_PID, 18_000, false, false, 2));
-        p.feed(&pcr_packet(VIDEO_PID, 27_000, false, false, 3));
+        p.feed(&pcr_packet(VIDEO_PID, 0, false, false, 1));
+        p.feed(&pcr_packet(VIDEO_PID, 0, false, false, 2));
+        p.feed(&pcr_packet(VIDEO_PID, 0, false, false, 3));
 
         assert!(p.segment(0).is_none());
         assert!(p.state.lock().unwrap().cur.is_empty());
@@ -1733,6 +1912,8 @@ mod tests {
             .into_iter()
             .map(|duration| HlsSegment {
                 bytes: Bytes::new(),
+                allocation_bytes: 0,
+                advertised_grace: None,
                 duration,
                 discontinuity: false,
             })
@@ -2983,5 +3164,524 @@ mod tests {
                 &video_access_packet(VIDEO_PID, start_pcr + i as u64 * 108_000),
             );
         }
+    }
+    fn emit_synthetic_at(p: &HlsPackager, marker: u8, duration: f32, now: Instant) {
+        let mut state = p.state.lock().unwrap();
+        state.cur = vec![marker; TS_PACKET * 3];
+        p.emit_at(&mut state, TS_PACKET * 3, duration, now);
+    }
+
+    #[test]
+    fn advertised_segment_survives_fast_backlog_without_moving_the_live_edge() {
+        let p = HlsPackager::new(HlsConfig::default(), None);
+        let now = Instant::now();
+        for seq in 0..6 {
+            emit_synthetic_at(&p, seq, 6.0, now);
+        }
+        let initial = p.compatibility_playlist_with_segment_prefix("/ace/c/synthetic");
+        assert!(initial.contains("/5.ts"));
+        let expected = p.compatibility_segment(5).unwrap();
+        for seq in 6..14 {
+            emit_synthetic_at(&p, seq, 6.0, now + Duration::from_secs(4));
+        }
+        let current = p.compatibility_playlist_with_segment_prefix("/ace/c/synthetic");
+        assert!(current.contains("#EXT-X-MEDIA-SEQUENCE:6\n"));
+        assert_eq!(current.matches("#EXTINF:").count(), 8);
+        assert!(!current.contains("/5.ts"));
+        assert!(p.is_ready());
+
+        let mut state = p.state.lock().unwrap();
+        assert_eq!(
+            HlsPackager::retained_segment(&mut state, 5, now + Duration::from_secs(10)),
+            Some(expected)
+        );
+        let expiry = state.retired_segments.back().unwrap().expires_at;
+        assert_eq!(expiry, now + Duration::from_secs(4 + 36 + 6));
+        assert!(
+            HlsPackager::retained_segment(&mut state, 5, expiry - Duration::from_millis(1))
+                .is_some()
+        );
+        assert_eq!(state.retired_segments.back().unwrap().expires_at, expiry);
+        // Expiry is enforced by the lookup even when no new source bytes arrive.
+        assert!(HlsPackager::retained_segment(&mut state, 5, expiry).is_none());
+        assert_eq!(state.retired_bytes, 0);
+        assert!(HlsPackager::retained_segment(&mut state, 99, expiry).is_none());
+    }
+
+    #[test]
+    fn segment_grace_uses_largest_advertised_playlist_and_is_time_bounded() {
+        let p = HlsPackager::new(HlsConfig::default(), None);
+        let now = Instant::now();
+        for seq in 0..6 {
+            emit_synthetic_at(&p, seq, 6.0, now);
+        }
+        p.playlist("test", "synthetic");
+        for seq in 6..8 {
+            emit_synthetic_at(&p, seq, 6.0, now);
+        }
+        p.playlist("test", "synthetic");
+        emit_synthetic_at(&p, 8, 6.0, now);
+        assert_eq!(
+            p.state.lock().unwrap().retired_segments[0].expires_at,
+            now + Duration::from_secs(48 + 6)
+        );
+
+        let p = HlsPackager::new(HlsConfig::default(), None);
+        for seq in 0..8 {
+            emit_synthetic_at(&p, seq, 60.0, now);
+        }
+        p.playlist("test", "synthetic");
+        emit_synthetic_at(&p, 8, 60.0, now);
+        assert_eq!(
+            p.state.lock().unwrap().retired_segments[0].expires_at,
+            now + SEGMENT_GRACE_MAX_AGE
+        );
+    }
+
+    fn synthetic_advertised_segment(capacity: usize, grace: Duration) -> HlsSegment {
+        let mut bytes = Vec::with_capacity(capacity);
+        bytes.push(0x47);
+        let allocation_bytes = bytes.capacity();
+        HlsSegment {
+            bytes: Bytes::from(bytes),
+            allocation_bytes,
+            duration: 1.0,
+            discontinuity: false,
+            advertised_grace: Some(grace),
+        }
+    }
+
+    #[test]
+    fn segment_grace_caps_backing_allocations_and_segment_count() {
+        let p = pkg();
+        let now = Instant::now();
+        let grace = Duration::from_secs(30);
+        let mut state = p.state.lock().unwrap();
+        // One-byte payloads can own large Vec allocations; charge capacity, not Bytes::len().
+        let capacity = HLS_SEGMENT_GRACE_MAX_BYTES / 2 + 1;
+        for seq in 0..2 {
+            HlsPackager::retain_advertised_segment(
+                &mut state,
+                seq,
+                synthetic_advertised_segment(capacity, grace),
+                now,
+            );
+        }
+        assert_eq!(state.retired_segments.len(), 1);
+        assert_eq!(state.retired_segments[0].seq, 1);
+        assert_eq!(state.retired_bytes, capacity);
+        HlsPackager::retain_advertised_segment(
+            &mut state,
+            2,
+            synthetic_advertised_segment(HLS_SEGMENT_GRACE_MAX_BYTES + 1, grace),
+            now,
+        );
+        assert_eq!(
+            state.retired_segments.len(),
+            1,
+            "oversize entry cannot bypass the cap"
+        );
+        HlsPackager::prune_segment_grace(&mut state, now + grace);
+        for seq in 0..SEGMENT_GRACE_MAX_COUNT + 5 {
+            HlsPackager::retain_advertised_segment(
+                &mut state,
+                seq as u64,
+                synthetic_advertised_segment(1, grace),
+                now,
+            );
+        }
+        assert_eq!(state.retired_segments.len(), SEGMENT_GRACE_MAX_COUNT);
+        assert_eq!(state.retired_segments[0].seq, 5);
+        assert_eq!(state.retired_bytes, SEGMENT_GRACE_MAX_COUNT);
+    }
+
+    #[test]
+    fn segment_grace_prunes_non_monotonic_deadlines_without_refreshing_activity() {
+        let p = pkg();
+        let now = Instant::now();
+        let mut state = p.state.lock().unwrap();
+        state.media_seq = 3;
+        for (seq, seconds) in [(0, 60), (1, 10), (2, 30)] {
+            HlsPackager::retain_advertised_segment(
+                &mut state,
+                seq,
+                synthetic_advertised_segment(1, Duration::from_secs(seconds)),
+                now,
+            );
+        }
+        assert!(
+            HlsPackager::retained_segment(&mut state, 1, now + Duration::from_secs(20)).is_none()
+        );
+        assert_eq!(state.retired_segments.len(), 2);
+        assert_eq!(state.retired_bytes, 2);
+        assert_eq!(state.last_access, None);
+        drop(state);
+        assert!(p.compatibility_segment(0).is_some());
+        p.compatibility_playlist_with_segment_prefix("/ace/c/synthetic");
+        assert_eq!(p.state.lock().unwrap().last_access, None);
+        let weak = Arc::downgrade(&p);
+        drop(p);
+        assert!(
+            weak.upgrade().is_none(),
+            "grace storage must not own a packager task/pin"
+        );
+    }
+
+    fn clean_startup_batch(first: u64, last: u64) -> Bytes {
+        let mut bytes = [pat(PMT_PID), pmt(PMT_PID, VIDEO_PID)].concat();
+        for index in first..=last {
+            bytes.extend(video_access_packet(VIDEO_PID, index * 540_000));
+        }
+        Bytes::from(bytes)
+    }
+
+    #[test]
+    fn startup_marker_before_enough_segments_still_waits_for_segment_count() {
+        let p = HlsPackager::new(HlsConfig::default(), None);
+        p.state.lock().unwrap().startup_complete = false;
+        p.feed_source(&clean_startup_batch(0, 2), true);
+        assert!(!p.is_ready());
+        p.feed_source(&clean_startup_batch(3, 6), true);
+        assert!(p.is_ready());
+    }
+    #[test]
+    fn hard_ceiling_shortens_long_gop_without_dropping_media() {
+        let p = clean_pkg(5);
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        let media: Vec<_> = (0..7)
+            .map(|i| pcr_packet(VIDEO_PID, i * 9_000, i == 0, false, i as u8))
+            .collect();
+        for packet in &media {
+            p.feed(packet);
+        }
+        let st = p.state.lock().unwrap();
+        assert_eq!(st.segments.len(), 2);
+        assert!(st
+            .segments
+            .iter()
+            .all(|seg| seg.bytes.len() == 5 * TS_PACKET));
+        assert!(st
+            .segments
+            .iter()
+            .all(|seg| (seg.duration - 0.3).abs() < 0.001));
+        assert!(st.segments.iter().all(|seg| !seg.discontinuity));
+        let retained: Vec<_> = st
+            .segments
+            .iter()
+            .flat_map(|seg| seg.bytes.chunks_exact(TS_PACKET))
+            .chain(st.cur.chunks_exact(TS_PACKET))
+            .filter(|packet| ts_pid(packet) == VIDEO_PID)
+            .map(|packet| packet.to_vec())
+            .collect();
+        assert_eq!(
+            retained, media,
+            "forced cuts preserve every video packet in order"
+        );
+        assert!(st.cur.len() <= p.max_segment_bytes);
+    }
+
+    #[test]
+    fn segment_allocations_stay_within_non_power_of_two_ceiling() {
+        for packets in [4, 5, 7, 10, 31, 64] {
+            for title in [None, Some("synthetic".to_owned())] {
+                let p = HlsPackager::new(
+                    HlsConfig {
+                        segment_packets: packets,
+                        ..HlsConfig::default()
+                    },
+                    title,
+                );
+                p.feed(&pat(PMT_PID));
+                p.feed(&pmt(PMT_PID, VIDEO_PID));
+                for i in 0..100 {
+                    p.feed(&pcr_packet(
+                        VIDEO_PID,
+                        i * 9_000,
+                        i % 7 == 0,
+                        false,
+                        i as u8,
+                    ));
+                    let st = p.state.lock().unwrap();
+                    assert!(
+                        st.cur.capacity() <= p.max_segment_bytes,
+                        "current allocation {} exceeds ceiling {}",
+                        st.cur.capacity(),
+                        p.max_segment_bytes
+                    );
+                    assert!(
+                        st.segments
+                            .iter()
+                            .all(|s| s.allocation_bytes <= p.max_segment_bytes),
+                        "published allocation exceeds segment ceiling"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ceiling_without_an_advancing_clock_discards_and_recovers_cleanly() {
+        for no_pcr in [false, true] {
+            let p = clean_pkg(5);
+            p.feed(&pat(PMT_PID));
+            p.feed(&pmt(PMT_PID, VIDEO_PID));
+            let opening = if no_pcr {
+                random_access_packet(1)
+            } else {
+                video_access_packet(VIDEO_PID, 0)
+            };
+            p.feed(&opening);
+            for i in 0..3 {
+                let packet = if no_pcr {
+                    with_pid(packets(1), VIDEO_PID)
+                } else {
+                    pcr_packet(VIDEO_PID, 0, false, false, i)
+                };
+                p.feed(&packet);
+            }
+            assert!(p.segment(0).is_none());
+            assert!(p.state.lock().unwrap().cur.is_empty());
+            p.feed(&video_access_packet(VIDEO_PID, 108_000));
+            p.feed(&video_access_packet(VIDEO_PID, 216_000));
+            assert!(p.segment(0).is_some());
+            assert!(p
+                .playlist("test", "clock-recovery")
+                .contains("#EXT-X-DISCONTINUITY"));
+        }
+    }
+
+    #[test]
+    fn ceiling_uses_latest_clean_boundary_and_replays_tail_without_loss() {
+        for title in [None, Some("Synthetic Service".to_owned())] {
+            let p = HlsPackager::new(
+                HlsConfig {
+                    segment_packets: 10,
+                    window_segments: 8,
+                    segment_duration_ms: 1_000,
+                    startup_segments: 1,
+                    ..HlsConfig::default()
+                },
+                title,
+            );
+            p.feed(&pat(PMT_PID));
+            p.feed(&pmt(PMT_PID, VIDEO_PID));
+            let media: Vec<_> = (0..20)
+                .map(|i| pcr_packet(VIDEO_PID, i * 9_000, i % 3 == 0, false, i as u8))
+                .collect();
+            for packet in &media {
+                p.feed(packet);
+                p.feed(&with_pid(packets(1), SDT_PID));
+                let st = p.state.lock().unwrap();
+                assert!(st.cur.len() <= p.max_segment_bytes);
+                assert!(st
+                    .segments
+                    .iter()
+                    .all(|seg| seg.bytes.len() <= p.max_segment_bytes));
+            }
+            assert!(p.is_ready());
+            let st = p.state.lock().unwrap();
+            assert!(st.segments.len() >= 3);
+            let retained: Vec<_> = st
+                .segments
+                .iter()
+                .flat_map(|seg| seg.bytes.chunks_exact(TS_PACKET))
+                .chain(st.cur.chunks_exact(TS_PACKET))
+                .filter(|packet| ts_pid(packet) == VIDEO_PID)
+                .map(|packet| packet.to_vec())
+                .collect();
+            assert_eq!(retained, media);
+            for seg in &st.segments {
+                let first = seg
+                    .bytes
+                    .chunks_exact(TS_PACKET)
+                    .find(|packet| ts_pid(packet) == VIDEO_PID)
+                    .unwrap();
+                assert_ne!(first[5] & 0x40, 0);
+                assert!(seg.duration < p.seg_duration && seg.duration > 0.0);
+                assert!(!seg.discontinuity);
+            }
+        }
+    }
+
+    #[test]
+    fn ceiling_prefers_latest_interior_keyframe() {
+        let p = clean_pkg(10);
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        for i in 0..9 {
+            p.feed(&pcr_packet(
+                VIDEO_PID,
+                i * 9_000,
+                i % 3 == 0,
+                false,
+                i as u8,
+            ));
+        }
+        let st = p.state.lock().unwrap();
+        assert_eq!(st.segments.len(), 1);
+        assert_eq!(st.segments[0].bytes.len(), 8 * TS_PACKET);
+        assert!((st.segments[0].duration - 0.6).abs() < 0.001);
+        assert_eq!(
+            st.cur[2 * TS_PACKET + 12],
+            6,
+            "the latest, not first keyframe starts the tail"
+        );
+    }
+
+    #[test]
+    fn ceiling_replay_uses_tables_from_the_saved_boundary() {
+        let p = clean_pkg(10);
+        let old_pat = pat(PMT_PID);
+        let old_pmt = pmt(PMT_PID, VIDEO_PID);
+        p.feed(&old_pat);
+        p.feed(&old_pmt);
+        p.feed(&video_access_packet(VIDEO_PID, 0));
+        p.feed(&video_access_packet(VIDEO_PID, 9_000));
+        let new_pat = pat(PMT_PID + 1);
+        let new_pmt = pmt(PMT_PID + 1, VIDEO_PID + 1);
+        p.feed(&new_pat);
+        p.feed(&new_pmt);
+        for i in 2..7 {
+            p.feed(&pcr_packet(VIDEO_PID, i * 9_000, false, false, i as u8));
+        }
+        let st = p.state.lock().unwrap();
+        assert_eq!(st.segments.len(), 1);
+        assert_eq!(&st.cur[..TS_PACKET], old_pat.as_slice());
+        assert_eq!(&st.cur[TS_PACKET..2 * TS_PACKET], old_pmt.as_slice());
+        assert_eq!(
+            st.access.table_prefix().unwrap(),
+            [new_pat, new_pmt].concat(),
+            "tail replay applies the later table change in order"
+        );
+    }
+
+    #[test]
+    fn ceiling_replay_rebases_selected_pcr_when_boundary_has_no_pcr() {
+        let p = clean_pkg(8);
+        let clock_pid = VIDEO_PID + 1;
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        p.feed(&random_access_packet(0));
+        p.feed(&pcr_packet(clock_pid, 0, false, false, 0));
+        p.feed(&with_pid(packets(1), VIDEO_PID));
+        p.feed(&pcr_packet(clock_pid, 18_000, false, false, 1));
+        p.feed(&random_access_packet(1));
+        p.feed(&pcr_packet(clock_pid, 27_000, false, false, 2));
+        p.feed(&pcr_packet(clock_pid, 36_000, false, false, 3));
+        p.feed(&pcr_packet(VIDEO_PID, 1, false, false, 4));
+        let st = p.state.lock().unwrap();
+        assert_eq!(st.segments.len(), 1);
+        assert_eq!(st.segments[0].duration, 0.2);
+        assert_eq!(st.clock.elapsed(), Some(Duration::from_millis(200)));
+        assert!(!st.discontinuity_pending);
+        assert_eq!(st.cur[2 * TS_PACKET + 6], 1);
+    }
+
+    #[test]
+    fn saved_ceiling_boundary_is_cleared_by_every_gap_path() {
+        for path in 0..6 {
+            let p = HlsPackager::new(
+                HlsConfig {
+                    segment_packets: 8,
+                    ..HlsConfig::default()
+                },
+                Some("Reset Fixture".to_owned()),
+            );
+            p.feed(&pat(PMT_PID));
+            p.feed(&pmt(PMT_PID, VIDEO_PID));
+            p.feed(&video_access_packet(VIDEO_PID, 0));
+            p.feed(&video_access_packet(VIDEO_PID, 9_000));
+            assert!(p.state.lock().unwrap().clean_boundary.is_some());
+            if path >= 3 {
+                for i in 2..5 {
+                    p.feed(&pcr_packet(VIDEO_PID, i * 9_000, false, false, i as u8));
+                }
+                assert_eq!(p.state.lock().unwrap().cur.len(), p.max_segment_bytes);
+            }
+            match path {
+                0 => p.discontinuity(),
+                1 => p.receiver_lag(),
+                2 | 3 => p.feed(&pcr_packet(VIDEO_PID, 1, false, false, 0)),
+                4 => p.feed(&pcr_packet(VIDEO_PID, 45_000, false, true, 0)),
+                5 => p.feed(&pcr_packet(SDT_PID, 45_000, false, true, 0)),
+                _ => unreachable!(),
+            }
+            let st = p.state.lock().unwrap();
+            assert!(st.clean_boundary.is_none(), "gap path {path}");
+            assert!(st.awaiting_access_point);
+            assert!(st.segments.is_empty());
+            assert!(st.cur.is_empty());
+        }
+    }
+
+    #[test]
+    fn default_byte_budget_can_publish_high_bitrate_hevc_before_target_time() {
+        let p = HlsPackager::new(HlsConfig::default(), None);
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt_codec(PMT_PID, VIDEO_PID, 0x24));
+        // 15,000 TS packets/sec = 22.56 Mbit/sec; the default 65,536 packet cap fills
+        // before the five-second target. Keyframes every second allow clean shorter cuts.
+        for i in 0..450_001 {
+            p.feed(&pcr_packet(
+                VIDEO_PID,
+                i * 6,
+                i % 15_000 == 0,
+                false,
+                (i % 255) as u8,
+            ));
+        }
+        assert!(
+            p.is_ready(),
+            "sustained high bitrate must not discard every segment"
+        );
+        let st = p.state.lock().unwrap();
+        assert!(st.segments.len() >= p.startup_segments);
+        assert!(st.cur.len() <= p.max_segment_bytes);
+        for segment in &st.segments {
+            assert!(segment.bytes.len() <= p.max_segment_bytes);
+            assert_eq!(segment.duration, 4.0);
+            assert_ne!(segment.bytes[2 * TS_PACKET + 5] & 0x40, 0);
+            assert!(!segment.discontinuity);
+        }
+    }
+    #[test]
+    fn first_playlist_waits_for_the_complete_catchup_batch() {
+        let p = HlsPackager::new(HlsConfig::default(), None);
+        p.state.lock().unwrap().startup_complete = false;
+        p.feed_source(&clean_startup_batch(0, 6), false);
+        assert_eq!(p.state.lock().unwrap().segments.len(), 6);
+        assert!(!p.is_ready());
+        p.feed_source(&clean_startup_batch(7, 15), true);
+        assert!(p.is_ready());
+        let playlist = p.compatibility_playlist_with_segment_prefix("/synthetic");
+        assert!(playlist.contains("#EXT-X-MEDIA-SEQUENCE:7\n"));
+        assert_eq!(playlist.matches("#EXTINF:").count(), 8);
+        p.receiver_lag();
+        assert!(p.is_ready());
+    }
+
+    #[tokio::test]
+    async fn eof_wakes_startup_waiters_and_preserves_only_complete_media() {
+        let empty = HlsPackager::new(HlsConfig::default(), None);
+        empty.finish();
+        assert_eq!(
+            empty.wait_available(Duration::from_secs(60)).await,
+            HlsStatus::Stopped
+        );
+        let ready = HlsPackager::new(HlsConfig::default(), None);
+        ready.feed(&clean_startup_batch(0, 6));
+        assert!(ready.is_ready());
+        let before = ready.state.lock().unwrap().segments.len();
+        ready.finish();
+        assert_eq!(ready.state.lock().unwrap().segments.len(), before);
+        assert!(ready.state.lock().unwrap().cur.is_empty());
+        assert!(ready
+            .compatibility_playlist_with_segment_prefix("/synthetic")
+            .ends_with("#EXT-X-ENDLIST\n"));
+        assert_eq!(
+            ready.wait_available(Duration::from_secs(60)).await,
+            HlsStatus::Ready
+        );
     }
 }

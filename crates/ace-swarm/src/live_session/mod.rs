@@ -13,6 +13,7 @@ pub use options::{
 pub struct LiveOutput {
     pub bytes: bytes::Bytes,
     pub discontinuity: bool,
+    pub startup_complete: bool,
 }
 
 /// Engine-configured store construction, including cache backend and fallback policy.
@@ -21,7 +22,9 @@ pub type StoreFactory = std::sync::Arc<dyn Fn([u8; 20]) -> crate::store::PieceSt
 use crate::discover::{DiscoveryOptions, MAX_DISCOVERY_PEERS};
 use crate::listen::SeedRegistry;
 use crate::reachability::ReachabilityMonitor;
-use crate::scheduler::{ActivePeers, PeerAssignment, Scheduler};
+#[cfg(test)]
+use crate::scheduler::PeerAssignment;
+use crate::scheduler::{ActivePeers, Scheduler};
 use crate::store::PieceStore;
 use crate::types::StreamInfo;
 #[cfg(test)]
@@ -42,6 +45,8 @@ use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddrV4};
+#[cfg(test)]
+use support::schedule_piece_assignments;
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -163,8 +168,8 @@ use pool_support::{
 };
 mod support;
 use support::{
-    advance_head_from_window, hex_preview, read_peer_window, schedule_piece_assignments,
-    should_refresh_stale_deadline, stale_upstream_budget,
+    advance_head_from_window, hex_preview, read_peer_window, should_refresh_stale_deadline,
+    stale_upstream_budget,
 };
 
 mod reconnect;
@@ -552,6 +557,7 @@ pub(super) struct Continuity {
     pub(super) scheduler: Scheduler,
     pub(super) active_peers: ActivePeers,
     pub(super) received_chunks: BTreeMap<u64, HashSet<u16>>,
+    pub(super) piece_headers: BTreeMap<u64, [u8; 8]>,
     /// None marks mixed producers; entries share the bounded reassembly accept window.
     pub(super) piece_producers: BTreeMap<u64, Option<SocketAddrV4>>,
     #[cfg(test)]
@@ -564,6 +570,8 @@ pub(super) struct Continuity {
     /// and we skip forward rather than freeze.
     pub(super) next_needed_since: Instant,
     pub(super) head: u64,
+    startup_head: u64,
+    startup_complete: bool,
     /// Only a fresh lone-window pool delays media; reconnect continuity stays authoritative.
     startup_deadline: Option<Instant>,
     /// Workers discard queued stale chunk writes after new live-head evidence.

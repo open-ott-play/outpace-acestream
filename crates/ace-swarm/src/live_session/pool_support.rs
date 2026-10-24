@@ -30,7 +30,7 @@ pub(super) async fn send_peer_command(
     continuity: &mut Continuity,
 ) -> Option<SocketAddrV4> {
     let sender = peers.get(&peer_id).map(|peer| peer.commands.clone())?;
-    if sender.send(PeerCommand::Send(msg)).await.is_err() {
+    if sender.try_send(PeerCommand::Send(msg)).is_err() {
         drop_peer_runtime(peer_id, peers, continuity)
     } else {
         None
@@ -208,39 +208,36 @@ pub(super) async fn advance_pool_requests(
     if continuity.startup_deadline.is_some() {
         return Vec::new();
     }
-    let assignments = schedule_piece_assignments(
+    let mut failed = Vec::new();
+    let request_head = continuity.request_head();
+    let assignments = continuity.active_peers.assign_if(
         &mut continuity.scheduler,
-        &mut continuity.active_peers,
         continuity.reasm.next_needed(),
-        continuity.head,
+        request_head,
+        |assignment| {
+            let Some(peer) = peers.get(&assignment.peer_id) else {
+                return false;
+            };
+            match peer.commands.try_send(PeerCommand::RequestPiece {
+                piece: assignment.piece,
+                chunks_per_piece,
+            }) {
+                Ok(()) => true,
+                // A busy worker is not a dead peer. The periodic sweep retries admission.
+                Err(mpsc::error::TrySendError::Full(_)) => false,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    failed.push(assignment.peer_id);
+                    false
+                }
+            }
+        },
     );
-    // Start (or keep) a retransmit timer for each freshly-assigned piece.
     let now = Instant::now();
-    for assignment in &assignments {
+    for assignment in assignments {
         continuity
             .requested_at
             .entry(assignment.piece)
             .or_insert(now);
-    }
-    let mut failed = Vec::new();
-    for assignment in assignments {
-        let Some(sender) = peers
-            .get(&assignment.peer_id)
-            .map(|peer| peer.commands.clone())
-        else {
-            continuity.scheduler.on_drop(assignment.piece);
-            continue;
-        };
-        if sender
-            .send(PeerCommand::RequestPiece {
-                piece: assignment.piece,
-                chunks_per_piece,
-            })
-            .await
-            .is_err()
-        {
-            failed.push(assignment.peer_id);
-        }
     }
     failed.sort_unstable();
     failed.dedup();
@@ -385,7 +382,8 @@ pub(super) async fn retransmit_stalled_requests(
         }
         lost
     } else {
-        Vec::new()
+        // A worker may have drained a previously full command queue without any new event.
+        advance_pool_requests(peers, continuity, chunks_per_piece).await
     }
 }
 

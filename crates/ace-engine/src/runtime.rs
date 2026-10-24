@@ -100,6 +100,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     }
     if let Ok(v) = std::env::var("OUTPACE_CACHE_DIR") {
         config.cache_dir = v.into();
+    } else {
+        // Derive the fallback after OUTPACE_DATA_DIR has selected the actual root.
+        config.cache_dir = config.data_dir.join("cache");
     }
     if let Ok(v) = std::env::var("OUTPACE_PREFETCH_PIECES") {
         config.prefetch_pieces = Some(v.parse()?);
@@ -1137,6 +1140,35 @@ mod tests {
         }
     }
 
+    struct CacheEnvRestore([Option<std::ffi::OsString>; 3]);
+
+    impl CacheEnvRestore {
+        const NAMES: [&'static str; 3] = [
+            "OUTPACE_DATA_DIR",
+            "OUTPACE_CACHE_DIR",
+            "OUTPACE_CACHE_TYPE",
+        ];
+
+        fn new() -> Self {
+            let old = Self::NAMES.map(std::env::var_os);
+            for name in Self::NAMES {
+                std::env::remove_var(name);
+            }
+            Self(old)
+        }
+    }
+
+    impl Drop for CacheEnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in Self::NAMES.into_iter().zip(self.0.iter()) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
     #[test]
     fn ace_compat_environment_prefers_canonical_and_strictly_parses_selected_value() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -1866,6 +1898,7 @@ mod tests {
     #[test]
     fn parses_cache_type_and_dir() {
         let _g = ENV_LOCK.lock().unwrap();
+        let _restore = CacheEnvRestore::new();
         std::env::set_var("OUTPACE_CACHE_TYPE", "disk");
         std::env::set_var("OUTPACE_CACHE_DIR", "/tmp/outpace-cache-test");
         let c = config_from_env().unwrap();
@@ -1874,8 +1907,43 @@ mod tests {
             c.cache_dir,
             std::path::PathBuf::from("/tmp/outpace-cache-test")
         );
-        std::env::remove_var("OUTPACE_CACHE_TYPE");
-        std::env::remove_var("OUTPACE_CACHE_DIR");
+    }
+
+    #[test]
+    fn cache_directory_defaults_follow_selected_data_directory() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _restore = CacheEnvRestore::new();
+        let defaults = Config::default();
+        let config = config_from_env().unwrap();
+        assert_eq!(config.data_dir, defaults.data_dir);
+        assert_eq!(config.cache_dir, defaults.cache_dir);
+
+        let data = std::env::temp_dir().join("outpace-relocated-data");
+        std::env::set_var("OUTPACE_DATA_DIR", &data);
+        for cache_type in ["memory", "disk"] {
+            std::env::set_var("OUTPACE_CACHE_TYPE", cache_type);
+            let config = config_from_env().unwrap();
+            assert_eq!(config.data_dir, data);
+            assert_eq!(config.cache_dir, data.join("cache"), "{cache_type}");
+        }
+    }
+
+    #[test]
+    fn cache_directory_explicit_override_including_empty_is_preserved() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _restore = CacheEnvRestore::new();
+        let data = std::env::temp_dir().join("outpace-relocated-data");
+        let custom = std::env::temp_dir().join("outpace-explicit-cache");
+        std::env::set_var("OUTPACE_DATA_DIR", &data);
+        for cache_type in ["memory", "disk"] {
+            std::env::set_var("OUTPACE_CACHE_TYPE", cache_type);
+            for cache in [&custom, &std::path::PathBuf::new()] {
+                std::env::set_var("OUTPACE_CACHE_DIR", cache);
+                let config = config_from_env().unwrap();
+                assert_eq!(config.data_dir, data);
+                assert_eq!(config.cache_dir, *cache, "{cache_type}");
+            }
+        }
     }
 
     #[test]

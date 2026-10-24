@@ -1,0 +1,29 @@
+name: RC fuzz assessment
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Explicit source release-candidate assessment
+        type: choice
+        options: [rc]
+        default: rc
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rc-fuzz-assessment
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    if: >-
+      github.event.repository.private == false && github.event_name == 'workflow_dispatch' && inputs.channel == 'rc' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    permissions:
+      contents: read
+    uses: victron-venus/venus-os-ci-toolkit/.github/workflows/fuzz.yml@287699b4030f6177d5042ccceb604feb19ee1ce4
+    with:
+      toolkit-ref: 287699b4030f6177d5042ccceb604feb19ee1ce4
+      evidence-mode: candidate

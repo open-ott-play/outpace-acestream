@@ -1,0 +1,2 @@
+# Fail on newly introduced high/critical vulnerable dependencies.
+fail-on-severity: high

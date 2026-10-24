@@ -4,6 +4,11 @@
 # Scratch / build
 /target/
 *.log
+/.fuzz-build/
+/.fuzz-tools/
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/coverage/
 
 # Phase-0 reverse-engineering working artifacts (raw/derived, not committed)
 /re/

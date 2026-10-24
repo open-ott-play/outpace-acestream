@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "language": "rust",
+  "setup": [
+    ["python3", "fuzz/build.py"]
+  ],
+  "targets": [
+    {
+      "name": "metadata", "engine": "libfuzzer",
+      "command": [".fuzz-build/bin/metadata", "-max_len=16384"],
+      "seconds": 60, "corpus": "fuzz/corpus/metadata"
+    },
+    {
+      "name": "peer-frames", "engine": "libfuzzer",
+      "command": [".fuzz-build/bin/peer_frames", "-max_len=16384"],
+      "seconds": 60, "corpus": "fuzz/corpus/peer_frames"
+    },
+    {
+      "name": "peer-extensions", "engine": "libfuzzer",
+      "command": [".fuzz-build/bin/peer_extensions", "-max_len=16384"],
+      "seconds": 60, "corpus": "fuzz/corpus/peer_extensions"
+    },
+    {
+      "name": "media-resync", "engine": "libfuzzer",
+      "command": [".fuzz-build/bin/media_resync", "-max_len=16384"],
+      "seconds": 60, "corpus": "fuzz/corpus/media_resync"
+    }
+  ]
+}

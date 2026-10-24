@@ -17,23 +17,91 @@
       "datasourceTemplate": "github-releases",
       "versioningTemplate": "semver",
       "extractVersionTemplate": "^(?<version>\\d+\\.\\d+\\.\\d+)$"
+    },
+    {
+      "customType": "jsonata",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/[^/]+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "jobs.*[$type(uses) = \"string\" and $contains(uses, /^victron-venus\\/venus-os-ci-toolkit\\/\\.github\\/workflows\\/[^@]+@[a-f0-9]{40}$/) and $type(with.\"toolkit-ref\") = \"string\" and $contains(with.\"toolkit-ref\", /^[a-f0-9]{40}$/)].{\"currentDigest\": with.\"toolkit-ref\"}"
+      ],
+      "currentValueTemplate": "main",
+      "depNameTemplate": "victron-venus/venus-os-ci-toolkit",
+      "packageNameTemplate": "https://github.com/victron-venus/venus-os-ci-toolkit",
+      "datasourceTemplate": "git-refs",
+      "fileFormat": "yaml"
     }
   ],
   "packageRules": [
     {
-      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "digest"
+      ],
       "automerge": true
     },
     {
-      "matchManagers": ["cargo"],
-      "matchUpdateTypes": ["minor", "patch", "pin"],
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin"
+      ],
       "groupName": "cargo dependencies",
       "groupSlug": "cargo"
     },
     {
-      "matchUpdateTypes": ["major"],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "automerge": false
+    },
+    {
+      "description": "Review action and reusable-workflow upgrades together, including immutable digest changes.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "GitHub Actions and reusable workflows",
+      "groupSlug": "ci-workflows",
+      "groupSingleUpdates": true,
+      "separateMajorMinor": false,
+      "separateMinorPatch": false,
+      "separateMultipleMajor": false,
+      "pinDigests": true,
+      "automerge": false
+    },
+    {
+      "description": "Runner and action input migrations remain explicit project changes.",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchDepTypes": [
+        "github-runner",
+        "uses-with"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "Update the shared runner checkout pin together with its reusable workflow reference.",
+      "matchManagers": [
+        "custom.jsonata"
+      ],
+      "groupName": "GitHub Actions and reusable workflows",
+      "groupSlug": "ci-workflows",
+      "groupSingleUpdates": true,
+      "separateMajorMinor": false,
+      "separateMinorPatch": false,
+      "separateMultipleMajor": false,
       "automerge": false
     }
   ],
-  "platformAutomerge": true
+  "platformAutomerge": true,
+  "prConcurrentLimit": 3,
+  "prHourlyLimit": 2,
+  "rebaseWhen": "behind-base-branch"
 }

@@ -1,0 +1,24 @@
+name: Security analysis
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  security:
+    if: github.event.repository.private == false
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    uses: victron-venus/venus-os-ci-toolkit/.github/workflows/security-scan.yml@287699b4030f6177d5042ccceb604feb19ee1ce4
+    with:
+      languages: rust,python,actions

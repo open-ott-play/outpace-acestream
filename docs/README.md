@@ -39,6 +39,10 @@ sections before replacing an existing service.
 
 ## Develop and distribute
 
+- [RC fuzz assessment](fuzzing.md): bounded targets, synthetic corpora and source-bound evidence.
+- [CI and dependency maintenance](ci-cd.md): required checks, shared security analysis and Renovate.
+- [Release acceptance](releasing.md): immutable releases, corresponding source and publication checks.
+
 - [Development](development.md): source builds, meaningful validation and safe
   diagnostic reports.
 - [Licensing and matching source](licensing.md): AGPL-3.0-or-later attribution,

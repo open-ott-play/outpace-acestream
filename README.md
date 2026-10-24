@@ -1,5 +1,7 @@
 # Outpace AceStream
 
+[![RC fuzz assessment](https://github.com/open-ott-play/outpace-acestream/actions/workflows/fuzz-candidate.yml/badge.svg)](https://github.com/open-ott-play/outpace-acestream/actions/workflows/fuzz-candidate.yml)
+
 ![Outpace AceStream — a Rust engine for public AceStream media](docs/assets/outpace-hero.svg)
 
 **A native Rust engine that turns public, unencrypted AceStream sources into
@@ -22,6 +24,10 @@ Reading this file from a downloaded binary package? Open the
 [online handbook](https://github.com/open-ott-play/outpace-acestream/blob/main/docs/README.md)
 for working navigation and diagrams. The matching source archives contain the
 documentation for the build they accompany.
+
+Source-candidate fuzzing checks four production parser boundaries on explicit RC
+requests. See the [targets, evidence and limits](docs/fuzzing.md); a passing source
+assessment does not qualify a product release.
 
 ## Start here
 

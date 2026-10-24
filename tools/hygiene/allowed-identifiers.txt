@@ -49,3 +49,18 @@ f746d294bbe937dda3df6205e340700d81334f9f  signature/checksum of synthetic catalo
 5ae9458a4ec44c5318f37ddc7569c1d4ae8a69e7  upstream dependency Git revision used for jni-0.22.4 license provenance
 64d77b7a5f119d7b55b4e2c169a4668067ff59e6  upstream dependency Git revision used for jni-sys-macros-0.4.1 license provenance
 252e25161a91af476cbea620e29d277592d27ec7  upstream dependency Git revision used for rustls-platform-verifier-android-0.2.0 license provenance
+
+# --- Immutable GitHub Actions revisions (verified upstream version refs) ---
+ecabd13d1c56bd1345c230e542e9144811ad706f  GitHub Actions commit for actions-rust-lang/setup-rust-toolchain@v2
+11d5960a326750d5838078e36cf38b85af677262  GitHub Actions commit for actions/checkout@v4
+3d3c42e5aac5ba805825da76410c181273ba90b1  GitHub Actions commit for actions/checkout@v7
+9000827ccba6bdab643e8b6fd33ac0654aef8333  GitHub Actions commit for actions/download-artifact@v8
+cf430e030ddbb5b0abf93d22962f4752f3646cd9  GitHub Actions commit for actions/upload-artifact@v7
+c3c9e263c25d99ce0380d002d59b67737d91b0dc  GitHub Actions commit for docker/build-push-action@v7
+81c6f93d4bc991e510b342a00b419b3bb4efc5c6  GitHub Actions commit for docker/login-action@v4
+f87e5991a6d7451dcb8d9637bfbc97413f497069  GitHub Actions commit for docker/setup-buildx-action@v4
+99012661954931238ded8c8b007157a8430204e1  GitHub Actions commit for docker/setup-qemu-action@v4
+efb35369e0ad2afab669f228072c1b0d510eae64  GitHub Actions commit for softprops/action-gh-release@v3
+12b7ad4acfa95a1476779d6c06699b96ec1691f8  GitHub Actions commit for taiki-e/setup-cross-toolchain-action@v1
+
+287699b4030f6177d5042ccceb604feb19ee1ce4 # venus-os-ci-toolkit reviewed candidate assessment and shared security workflows (PR 257)

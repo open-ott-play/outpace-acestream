@@ -168,8 +168,7 @@ use pool_support::{
 };
 mod support;
 use support::{
-    advance_head_from_window, hex_preview, read_peer_window, should_refresh_stale_deadline,
-    stale_upstream_budget,
+    hex_preview, read_peer_window, should_refresh_stale_deadline, stale_upstream_budget,
 };
 
 mod reconnect;

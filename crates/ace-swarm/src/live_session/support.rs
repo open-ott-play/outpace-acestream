@@ -1,12 +1,5 @@
 use super::*;
 
-/// If `payload` carries a live-window (`myinfo`) update whose head is beyond `head`, return
-/// the new head; otherwise `None`. The single place window recognition feeds the loop.
-pub(super) fn advance_head_from_window(payload: &[u8], head: u64) -> Option<u64> {
-    let w = LiveWindow::from_myinfo_payload(payload)?;
-    (w.max_piece > head && w.max_piece <= u32::MAX as u64).then_some(w.max_piece)
-}
-
 pub(super) fn stale_upstream_budget(
     last_progress: Instant,
     now: Instant,

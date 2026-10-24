@@ -236,16 +236,6 @@ fn acestream_have_payload_decodes_to_the_head_piece() {
 }
 
 #[test]
-fn advance_head_only_when_window_moves_forward() {
-    // A myinfo update past the head advances it; one at/behind the head is ignored.
-    let ahead = b"d9:max_piecei210ee";
-    let behind = b"d9:max_piecei150ee";
-    assert_eq!(advance_head_from_window(ahead, 200), Some(210));
-    assert_eq!(advance_head_from_window(behind, 200), None);
-    assert_eq!(advance_head_from_window(b"not-a-window", 200), None);
-}
-
-#[test]
 fn prefetch_start_honors_configured_depth() {
     // window 100..=200, prefetch 32 -> start 168 (not 200 - 8)
     assert_eq!(prefetch_start(100, 200, 32), 168);

@@ -23,6 +23,53 @@ pub(super) fn update_runtime_window(
     }
 }
 
+/// One peer's window can advance while a different peer already advertised a newer
+/// global head. Keep its request coverage and activity independent of the global head.
+pub(super) fn observe_runtime_have(
+    peers: &mut BTreeMap<u64, PeerRuntime>,
+    continuity: &mut Continuity,
+    peer_id: u64,
+    piece: u64,
+) -> bool {
+    let advanced = piece > continuity.head
+        || peers
+            .get(&peer_id)
+            .is_some_and(|peer| piece > peer.max_piece);
+    continuity.head = continuity.head.max(piece);
+    update_runtime_window(peers, continuity, peer_id, piece);
+    advanced
+}
+
+/// The trailing live pointer evicts old request coverage. A delayed update cannot
+/// move the minimum backwards and make the scheduler retry already-evicted pieces.
+pub(super) fn observe_runtime_eviction(
+    peers: &mut BTreeMap<u64, PeerRuntime>,
+    continuity: &mut Continuity,
+    peer_id: u64,
+    first_piece: u64,
+) {
+    if let Some(peer) = peers.get_mut(&peer_id) {
+        peer.min_piece = peer.min_piece.max(first_piece);
+        peer.max_piece = peer.max_piece.max(peer.min_piece);
+        continuity.update_peer_window(peer_id, peer.min_piece, peer.max_piece);
+    }
+}
+
+pub(super) fn observe_runtime_window_payload(
+    peers: &mut BTreeMap<u64, PeerRuntime>,
+    continuity: &mut Continuity,
+    peer_id: u64,
+    payload: &[u8],
+) -> Option<bool> {
+    let window = LiveWindow::from_myinfo_payload(payload)?;
+    if window.max_piece > u64::from(u32::MAX) {
+        return None;
+    }
+    let advanced = observe_runtime_have(peers, continuity, peer_id, window.max_piece);
+    observe_runtime_eviction(peers, continuity, peer_id, window.min_piece);
+    Some(advanced)
+}
+
 pub(super) async fn send_peer_command(
     peer_id: u64,
     msg: PeerMessage,

@@ -554,3 +554,109 @@ fn peer_distance_ordering_handles_minimum_signed_distance() {
     assert!(prefer_window(&preferred, &other));
     assert!(!prefer_window(&other, &preferred));
 }
+
+fn runtime_peer(min_piece: u64, max_piece: u64) -> PeerRuntime {
+    let (commands, _receiver) = mpsc::channel(1);
+    PeerRuntime {
+        addr: test_addr(),
+        min_piece,
+        max_piece,
+        unchoked_peer: false,
+        produced_output: false,
+        seen_ids: HashSet::new(),
+        commands,
+        worker: tokio::spawn(std::future::pending()),
+    }
+}
+
+#[tokio::test]
+async fn catching_up_peer_have_can_serve_without_advancing_global_head() {
+    let (mut c, _) = Continuity::fresh(&info(), 100, 200, 8, default_live_recovery());
+    c.register_active_peer(1, test_addr(), win(100, 150));
+    c.set_peer_unchoked(1, true);
+    let mut peers = BTreeMap::from([(1, runtime_peer(100, 150))]);
+    assert!(!c.active_peers.any_unchoked_covers(c.reasm.next_needed()));
+
+    assert!(observe_runtime_have(&mut peers, &mut c, 1, 195));
+    assert!(!observe_runtime_have(&mut peers, &mut c, 1, 190));
+    assert_eq!(c.head, 200);
+    let requests = schedule_piece_assignments(
+        &mut c.scheduler,
+        &mut c.active_peers,
+        c.reasm.next_needed(),
+        c.head,
+    );
+    assert_eq!(
+        requests.first(),
+        Some(&PeerAssignment {
+            peer_id: 1,
+            piece: 192
+        })
+    );
+    shutdown_peer_runtimes(&mut peers);
+}
+
+#[tokio::test]
+async fn live_eviction_pointer_releases_a_stranded_cursor() {
+    let (mut c, _) = Continuity::fresh(&info(), 100, 110, 8, default_live_recovery());
+    c.register_active_peer(1, test_addr(), win(100, 110));
+    c.set_peer_unchoked(1, true);
+    let mut peers = BTreeMap::from([(1, runtime_peer(100, 110))]);
+    let now = c.next_needed_since + default_live_recovery().request_timeout();
+    assert_eq!(c.skip_evicted_gap(now), None);
+
+    observe_runtime_eviction(&mut peers, &mut c, 1, 105);
+    observe_runtime_eviction(&mut peers, &mut c, 1, 101);
+    assert_eq!(c.skip_evicted_gap(now), Some(105));
+    assert_eq!(c.reasm.next_needed(), 105);
+    shutdown_peer_runtimes(&mut peers);
+}
+
+#[tokio::test]
+async fn full_peer_window_updates_availability_below_global_head() {
+    let (mut c, _) = Continuity::fresh(&info(), 100, 200, 8, default_live_recovery());
+    c.register_active_peer(1, test_addr(), win(100, 150));
+    c.set_peer_unchoked(1, true);
+    let mut peers = BTreeMap::from([(1, runtime_peer(100, 150))]);
+    assert_eq!(
+        observe_runtime_window_payload(
+            &mut peers,
+            &mut c,
+            1,
+            b"d9:max_piecei195e9:min_piecei180ee",
+        ),
+        Some(true),
+    );
+    assert!(c.active_peers.any_unchoked_covers(192));
+    assert!(!c.active_peers.any_unchoked_covers(170));
+    assert_eq!(c.head, 200);
+    assert_eq!(
+        observe_runtime_window_payload(
+            &mut peers,
+            &mut c,
+            1,
+            b"d9:max_piecei170e9:min_piecei100ee"
+        ),
+        Some(false),
+    );
+    assert_eq!((peers[&1].min_piece, peers[&1].max_piece), (180, 195));
+    assert_eq!(
+        observe_runtime_window_payload(
+            &mut peers,
+            &mut c,
+            1,
+            b"d2:mid9:max_piecei210e9:min_piecei185eee"
+        ),
+        Some(true),
+    );
+    assert_eq!(c.head, 210);
+    for invalid in [b"not-a-window".as_slice(), b"d9:max_piecei4294967296ee"] {
+        assert_eq!(
+            observe_runtime_window_payload(&mut peers, &mut c, 1, invalid),
+            None
+        );
+    }
+    assert_eq!(c.head, 210);
+    assert_eq!((peers[&1].min_piece, peers[&1].max_piece), (185, 210));
+    shutdown_peer_runtimes(&mut peers);
+}

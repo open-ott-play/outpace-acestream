@@ -33,7 +33,7 @@ Use `#[tokio::test]` for async behavior and regular unit tests for pure parsing 
 
 ## Commit & Pull Request Guidelines
 
-Keep the root checkout on `main`; do feature work in separate worktrees that track topic branches, for example `git worktree add ../outpace-fix-dht -b fix/dht-correlation main`. Use conventional branch prefixes such as `feat/`, `fix/`, `docs/`, `test/`, or `chore/`, and commit subjects such as `fix(ace-swarm): correlate dht responses`. Keep PR titles brief and concise. PR descriptions should summarize behavior, list commands run, call out network, Docker, release, or env-var impact, and include logs or CLI/API examples. Release tags are `vX.Y.Z`; update crate versions before tagging.
+Keep the root checkout on `main`; do feature work in separate worktrees that track topic branches, for example `git worktree add ../outpace-fix-dht -b fix/dht-correlation main`. Use conventional branch prefixes such as `feat/`, `fix/`, `docs/`, `test/`, or `chore/`, and commit subjects such as `fix(ace-swarm): correlate dht responses`. Keep PR titles brief and concise. PR descriptions should summarize behavior, list commands run, call out network, Docker, release, or env-var impact, and include logs or CLI/API examples. Release tags are `vX.Y.Z` for stable releases and `vX.Y.Z-beta.N` for beta prereleases; update crate versions before tagging. Betas must not replace the stable release or container `latest` channel.
 
 ### Agent Branch Requirements
 

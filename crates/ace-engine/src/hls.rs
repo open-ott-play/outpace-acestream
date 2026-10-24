@@ -13,6 +13,8 @@
 //! the static segment geometry and playlist for VOD.
 
 use crate::config::{HlsConfig, HLS_SEGMENT_GRACE_MAX_BYTES};
+use crate::history::{HistoryBudget, HistoryStore, HlsHistoryConfig};
+pub use crate::history::{HlsHistoryError, HlsHistorySnapshot, HlsHistoryStatus};
 use crate::session::{StreamEvent, StreamSession};
 use ace_media::audio::LiveAudioSelection;
 use ace_media::mpegts::{
@@ -90,6 +92,7 @@ struct HlsState {
     media_seq: u64,
     discontinuity_sequence: u64,
     segments: VecDeque<HlsSegment>,
+    history: HistoryStore,
     retired_segments: VecDeque<RetiredHlsSegment>,
     retired_bytes: usize,
     cur: Vec<u8>,
@@ -106,6 +109,8 @@ struct HlsState {
     last_access: Option<Instant>,
     access: VideoAccessPointState,
     awaiting_access_point: bool,
+    /// A forced byte-ceiling continuation may start mid-GOP and cannot be a seek point.
+    independent_start: bool,
     /// Set when `access` carries a title, so upstream SDT-PID packets must be dropped from
     /// segment bodies to avoid duplicating (or conflicting with) our synthesized SDT.
     filter_sdt: bool,
@@ -171,6 +176,7 @@ impl HlsPackager {
                 media_seq: 0,
                 discontinuity_sequence: 0,
                 segments: VecDeque::new(),
+                history: HistoryStore::new(HlsHistoryConfig::default(), HistoryBudget::new(0)),
                 retired_segments: VecDeque::new(),
                 retired_bytes: 0,
                 cur: Vec::new(),
@@ -184,6 +190,7 @@ impl HlsPackager {
                 last_access: None,
                 access,
                 awaiting_access_point: true,
+                independent_start: false,
                 filter_sdt,
             }),
             ready: tokio::sync::Notify::new(),
@@ -211,6 +218,54 @@ impl HlsPackager {
             st.deadline = Some(tokio::time::Instant::now() + media.startup_timeout);
         }
         media
+    }
+
+    pub(crate) fn create_with_history(
+        session: &StreamSession,
+        config: HlsConfig,
+        strict: bool,
+        history: HlsHistoryConfig,
+        budget: HistoryBudget,
+    ) -> Arc<Self> {
+        let media = Self::create(session, config, strict);
+        media.state.lock().unwrap().history = HistoryStore::new(history, budget);
+        media
+    }
+
+    pub fn history_status(&self) -> HlsHistoryStatus {
+        self.state.lock().unwrap().history.status(Instant::now())
+    }
+
+    pub fn prepare_history(&self, back: Duration) -> Result<HlsHistorySnapshot, HlsHistoryError> {
+        self.state
+            .lock()
+            .unwrap()
+            .history
+            .prepare(back, Instant::now())
+    }
+
+    pub fn history_playlist(
+        &self,
+        view: &HlsHistorySnapshot,
+        prefix: &str,
+    ) -> Result<String, HlsHistoryError> {
+        self.state
+            .lock()
+            .unwrap()
+            .history
+            .playlist(view, prefix, Instant::now())
+    }
+
+    pub fn history_segment(
+        &self,
+        view: &HlsHistorySnapshot,
+        seq: u64,
+    ) -> Result<Bytes, HlsHistoryError> {
+        self.state
+            .lock()
+            .unwrap()
+            .history
+            .segment(view, seq, Instant::now())
     }
 
     /// Fence old output and reset only incomplete media. Completed sequences remain readable.
@@ -392,6 +447,7 @@ impl HlsPackager {
         st.audio.reset();
         st.input.clear();
         st.awaiting_access_point = true;
+        st.independent_start = false;
     }
 
     /// Append contiguous TS bytes, emitting PCR-timed, preferably random-access-aligned segments.
@@ -497,6 +553,7 @@ impl HlsPackager {
                     st.clean_boundary = None;
                     st.discontinuity_pending = true;
                     st.awaiting_access_point = true;
+                    st.independent_start = false;
                     continue;
                 }
             }
@@ -545,6 +602,7 @@ impl HlsPackager {
                 st.cur.extend_from_slice(&trailing);
                 st.scanned_packets = prefix.len() / TS_PACKET;
                 st.awaiting_access_point = false;
+                st.independent_start = true;
                 st.generation_opening = false;
                 continue;
             }
@@ -558,6 +616,7 @@ impl HlsPackager {
                 st.discontinuity_pending = true;
                 st.deduplicate_source_marker = false;
                 st.awaiting_access_point = true;
+                st.independent_start = false;
                 st.clean_boundary = None;
                 continue;
             }
@@ -566,6 +625,7 @@ impl HlsPackager {
             if packet_offset > 0 && target_reached && is_access_point {
                 let duration = elapsed.unwrap_or(self.seg_duration);
                 self.emit(st, packet_offset, duration);
+                st.independent_start = true;
                 let prefix = st
                     .access
                     .table_prefix()
@@ -635,6 +695,7 @@ impl HlsPackager {
         if !is_access_point {
             if let Some(boundary) = st.clean_boundary.take() {
                 self.emit(st, boundary.offset, boundary.duration);
+                st.independent_start = true;
                 st.access = boundary.access;
                 let prefix = st
                     .access
@@ -672,7 +733,7 @@ impl HlsPackager {
                 .access
                 .table_prefix()
                 .expect("an accumulated run past the ceiling has cached PAT/PMT state");
-            self.seed_clean_run(st, &prefix, packet, timing);
+            self.seed_clean_run(st, &prefix, packet, timing, is_access_point);
             st.boundary_timing = boundary_timing;
             st.clock.reset();
             if let Some(boundary) = boundary_timing {
@@ -687,7 +748,7 @@ impl HlsPackager {
                 .access
                 .table_prefix()
                 .expect("an observed video access point has PAT/PMT state");
-            self.seed_clean_run(st, &prefix, packet, timing);
+            self.seed_clean_run(st, &prefix, packet, timing, true);
         }
     }
 
@@ -711,6 +772,7 @@ impl HlsPackager {
         prefix: &[u8],
         packet: &[u8; TS_PACKET],
         timing: TsTiming,
+        independent: bool,
     ) {
         debug_assert!(prefix.len() + TS_PACKET <= self.max_segment_bytes);
         st.cur.clear();
@@ -723,6 +785,7 @@ impl HlsPackager {
         st.clean_boundary = None;
         Self::observe_clock(st, timing);
         st.awaiting_access_point = false;
+        st.independent_start = independent;
     }
 
     fn discard_incomplete_run(&self, st: &mut HlsState) {
@@ -734,6 +797,7 @@ impl HlsPackager {
         st.discontinuity_pending = true;
         st.deduplicate_source_marker = false;
         st.awaiting_access_point = true;
+        st.independent_start = false;
     }
 
     fn observe_clock(st: &mut HlsState, mut timing: TsTiming) -> ClockObservation {
@@ -771,8 +835,19 @@ impl HlsPackager {
         st.audio.emitted(&mut seg);
         let discontinuity = std::mem::take(&mut st.discontinuity_pending);
         let allocation_bytes = seg.capacity();
+        let bytes = Bytes::from(seg);
+        let seq = st.media_seq + st.segments.len() as u64;
+        st.history.push(
+            seq,
+            bytes.clone(),
+            allocation_bytes,
+            duration,
+            discontinuity,
+            st.independent_start,
+            now,
+        );
         st.segments.push_back(HlsSegment {
-            bytes: Bytes::from(seg),
+            bytes,
             allocation_bytes,
             advertised_grace: None,
             duration,
@@ -3387,6 +3462,41 @@ mod tests {
             "forced cuts preserve every video packet in order"
         );
         assert!(st.cur.len() <= p.max_segment_bytes);
+    }
+
+    #[test]
+    fn history_seek_never_starts_at_a_forced_mid_gop_continuation() {
+        let p = clean_pkg(5);
+        p.state.lock().unwrap().history = HistoryStore::new(
+            HlsHistoryConfig {
+                max_seconds: 60,
+                max_bytes: 4096,
+                global_max_bytes: 4096,
+            },
+            HistoryBudget::new(4096),
+        );
+        p.feed(&pat(PMT_PID));
+        p.feed(&pmt(PMT_PID, VIDEO_PID));
+        for i in 0..7 {
+            p.feed(&pcr_packet(VIDEO_PID, i * 9_000, i == 0, false, i as u8));
+        }
+        let view = p.prepare_history(Duration::from_millis(100)).unwrap();
+        assert_eq!(
+            view.first_seq, 0,
+            "a seek near the head rewinds to a decodable entry"
+        );
+        assert_eq!(view.last_seq, 1);
+        assert_eq!(p.history_segment(&view, 0).unwrap(), p.segment(0).unwrap());
+        // Lose the only independently decodable entry under the byte cap. The retained
+        // continuation must now be unavailable for seeking, even though live playback works.
+        for i in 7..25 {
+            p.feed(&pcr_packet(VIDEO_PID, i * 9_000, false, false, i as u8));
+        }
+        assert!(p.history_status().first_seq.unwrap() > 0);
+        assert_eq!(
+            p.prepare_history(Duration::from_millis(100)),
+            Err(HlsHistoryError::Unavailable)
+        );
     }
 
     #[test]

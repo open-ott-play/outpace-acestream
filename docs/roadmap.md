@@ -35,19 +35,20 @@ requests from measured delivery reliability. Preserve signature validation,
 bounded queues, and cancellation when optimizing. HTTP success or received byte
 counts alone do not establish successful playback.
 
-## Peer-network timeshift: not implemented yet
+## Timeshift beta and remaining peer integration
 
-The next proof is a fresh Rust acquisition of older media that peers still
-advertise. Use a separate bounded historical follower first, select peers that
-cover the requested interval, and verify decoded media timestamps against a
-live baseline. A larger seed cache, a changed status position, or an older
-request number is not evidence of an archive.
+The 0.9.0 beta implements bounded local HLS replay and an independent exact-range
+peer-history reader. A bounded field experiment decoded older peer media twelve
+seconds before its comparison range, with more than 200 progressing frames in
+each sample. This establishes feasibility on that sampled source, not a general
+archive depth. See [the beta contract and qualification](timeshift.md).
 
-After that proof, introduce independent playback sessions:
+Local replay already has independent viewer generations, prepare/commit semantics,
+URL fencing and explicit return to live. To connect the peer reader to playback:
 
-1. Retain immutable accepted pieces with explicit memory and time-index budgets.
-2. Give each viewer a cursor, mode, cancellation owner, and command generation.
-3. Prepare a seek while current playback continues; commit only after usable
+1. Index accepted media PCR/PTS with explicit memory budgets and source epochs.
+2. Find decoder-safe random-access boundaries and complete codec/table bootstrap.
+3. Prepare peer-backed media while current playback continues; commit only after usable
    historical media is ready. Failure leaves existing playback intact.
 4. Fence old queued data, peer replies, and segment URLs at the generation change.
 5. Pace historical delivery and support an explicit return to live. Recovery in

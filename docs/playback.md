@@ -257,6 +257,6 @@ other viewers.
 
 Live HLS exposes a bounded sliding window of recently packaged media. Single-file
 VOD serves an independently described file and can honor byte ranges. Neither
-turns a live source into yesterday's programming. Peer-network timeshift, an
-archive-capability contract for players, and durable DVR are
+turns a live source into yesterday's programming. The 0.9.0 beta adds [finite retained-HLS replay](timeshift.md) and an experimental
+peer-history reader. Continuous peer timeshift, UTC programme selection and durable DVR are
 [planned work](roadmap.md), not features of v0.8.1.

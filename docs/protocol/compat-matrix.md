@@ -216,7 +216,11 @@ native consumers of the same source. Sharing is by resolved manager source key;
 clients must not assume all different selector spellings coalesce. Ordinary idle
 cleanup applies when no owner remains.
 
-HLS serves the shared native packager's retained live window, not an archive.
+Ordinary HLS serves the shared native packager's retained live window. The 0.9.0
+beta adds opt-in, per-viewer finite replay through explicit Outpace
+`timeshift_status`, `timeshift_seek` and `timeshift_live` extensions. These do not
+claim official control-API parity, UTC seek or a persistent archive; see
+[the beta contract](../timeshift.md).
 Segments leaving that window return 404; tokens do not preserve old segments.
 Playlist/segment reads do not count as native activity or start replacement work.
 

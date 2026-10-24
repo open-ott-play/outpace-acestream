@@ -107,6 +107,16 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_HLS_AUDIO_NORMALIZE` - optional live-HLS audio conversion, default `false`.
   Accepts `true`, `false`, `1`, or `0`. Selected supported AC3/MP2/MP3 audio becomes
   AAC-LC stereo; video is copied. This is not general video transcoding.
+- `OUTPACE_HISTORY_SECONDS` - 0.9.0 beta retained-HLS replay duration, default `0`
+  (disabled), maximum `3600`. Only active HLS sources collect history; it is not
+  persistent or UTC-indexed. Retention also obeys the byte and segment-count limits.
+- `OUTPACE_HISTORY_BYTES` - retained history backing-allocation budget per HLS
+  source, default `134217728` (128 MiB). Must be at least 188 bytes and within
+  the platform's safe in-memory pool limit.
+- `OUTPACE_HISTORY_TOTAL_BYTES` - shared retained-history budget across all HLS
+  sources in one manager, default `268435456` (256 MiB). Must cover the per-source
+  budget and remain within the platform limit. This is not a total RSS cap.
+  See [timeshift](timeshift.md) for controls, expiry and memory accounting.
 - `OUTPACE_FFMPEG_PATH` - direct FFmpeg executable used when audio normalization is
   enabled, default `ffmpeg`. It must support the required codecs and startup probe.
   The published base container does not include FFmpeg. See

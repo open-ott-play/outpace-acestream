@@ -277,6 +277,8 @@ pub struct StreamManager {
     vod_resolve_locks: StdMutex<HashMap<StreamKey, Weak<Mutex<()>>>>,
     buffer: usize,
     hls: HlsConfig,
+    history: crate::history::HlsHistoryConfig,
+    history_budget: crate::history::HistoryBudget,
     normalizer: Option<crate::hls_audio::PreparedNormalizer>,
     grace: Duration,
     cleanup: CleanupTracker,
@@ -307,6 +309,25 @@ impl StreamManager {
         hls: HlsConfig,
         normalizer: Option<crate::hls_audio::PreparedNormalizer>,
     ) -> Arc<StreamManager> {
+        Self::with_normalizer_and_history(registry, buffer, hls, normalizer, Default::default())
+    }
+
+    pub fn with_history_config(
+        registry: ProviderRegistry,
+        buffer: usize,
+        hls: HlsConfig,
+        history: crate::history::HlsHistoryConfig,
+    ) -> Arc<StreamManager> {
+        Self::with_normalizer_and_history(registry, buffer, hls, None, history)
+    }
+
+    pub fn with_normalizer_and_history(
+        registry: ProviderRegistry,
+        buffer: usize,
+        hls: HlsConfig,
+        normalizer: Option<crate::hls_audio::PreparedNormalizer>,
+        history: crate::history::HlsHistoryConfig,
+    ) -> Arc<StreamManager> {
         Arc::new(StreamManager {
             registry,
             sessions: Mutex::new(HashMap::new()),
@@ -318,6 +339,8 @@ impl StreamManager {
             vod_resolve_locks: StdMutex::new(HashMap::new()),
             buffer,
             hls,
+            history,
+            history_budget: crate::history::HistoryBudget::new(history.global_max_bytes),
             normalizer,
             grace: Duration::from_secs(30),
             cleanup: CleanupTracker::default(),
@@ -609,7 +632,13 @@ impl StreamManager {
             packagers
                 .entry(key)
                 .or_insert_with(|| {
-                    let media = HlsPackager::create(&session, self.hls, self.normalizer.is_some());
+                    let media = HlsPackager::create_with_history(
+                        &session,
+                        self.hls,
+                        self.normalizer.is_some(),
+                        self.history,
+                        self.history_budget.clone(),
+                    );
                     let control = crate::hls_audio::spawn_worker(
                         &session,
                         media.clone(),

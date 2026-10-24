@@ -42,6 +42,7 @@ sections before replacing an existing service.
 - [RC fuzz assessment](fuzzing.md): bounded targets, synthetic corpora and source-bound evidence.
 - [CI and dependency maintenance](ci-cd.md): required checks, shared security analysis and Renovate.
 - [Release acceptance](releasing.md): immutable releases, corresponding source and publication checks.
+- [Timeshift beta](timeshift.md): retained-media replay, per-viewer controls, peer-history experiment and limits.
 
 - [Development](development.md): source builds, meaningful validation and safe
   diagnostic reports.

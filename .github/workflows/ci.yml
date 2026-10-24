@@ -132,3 +132,6 @@ jobs:
         env:
           OUTPACE_TEST_HLS_AUDIO_FFMPEG: "1"
         run: cargo test -p ace-engine --test hls_audio_ffmpeg --locked -- --nocapture
+
+      - name: Retained replay with decoded media and independent viewers
+        run: cargo test -p ace-engine --test media_history --locked generated_media_rewinds_decodes_and_returns_live_without_moving_another_viewer -- --ignored --exact --nocapture

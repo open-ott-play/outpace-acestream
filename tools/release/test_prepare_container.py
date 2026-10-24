@@ -18,14 +18,14 @@ REVISION = "0123456789abcdef0123456789abcdef01234567"
 
 
 class PrepareTests(unittest.TestCase):
-    def fixture(self, root, member_type=tarfile.REGTYPE, zip_separator="/"):
+    def fixture(self, root, member_type=tarfile.REGTYPE, zip_separator="/", version="0.3.0"):
         for target, extension in prepare.TARGETS.items():
-            archive = root / f"outpace-0.3.0-{target}.{extension}"
-            prefix = f"outpace-0.3.0-{target}/"
+            archive = root / f"outpace-{version}-{target}.{extension}"
+            prefix = f"outpace-{version}-{target}/"
             source = b"source archive fixture"
             values = {
                 "corresponding-source.tar.gz": source,
-                "source.json": json.dumps({"version": "0.3.0", "license": "AGPL-3.0-or-later", "project": "Outpace AceStream", "repository": "https://github.com/open-ott-play/outpace-acestream", "target": target, "base_revision": REVISION, "tree_state": "clean", "complete_source_url": f"https://github.com/open-ott-play/outpace-acestream/releases/download/v0.3.0/outpace-source-0.3.0-{target}-{REVISION}.tar.gz", "source_sha256": hashlib.sha256(source).hexdigest()}).encode(),
+                "source.json": json.dumps({"version": version, "license": "AGPL-3.0-or-later", "project": "Outpace AceStream", "repository": "https://github.com/open-ott-play/outpace-acestream", "target": target, "base_revision": REVISION, "tree_state": "clean", "complete_source_url": f"https://github.com/open-ott-play/outpace-acestream/releases/download/v{version}/outpace-source-{version}-{target}-{REVISION}.tar.gz", "source_sha256": hashlib.sha256(source).hexdigest()}).encode(),
                 "LICENSE": b"license", "NOTICE": b"notice", "AUTHORS.md": b"authors", "THIRD_PARTY_NOTICES.txt": b"third party notices",
             }
             if extension == "tar.gz":
@@ -46,7 +46,7 @@ class PrepareTests(unittest.TestCase):
                         member.create_system = 0
                         member.external_attr = 0x20  # DOS archive bit, no Unix filetype.
                         target_zip.writestr(member, data)
-            with tarfile.open(root / f"outpace-source-0.3.0-{target}-{REVISION}.tar.gz", "w:gz") as complete:
+            with tarfile.open(root / f"outpace-source-{version}-{target}-{REVISION}.tar.gz", "w:gz") as complete:
                 for name, data in {"engine-source.tar.gz": source, "source.json": values["source.json"], "THIRD_PARTY_NOTICES.txt": values["THIRD_PARTY_NOTICES.txt"], "vendor/demo/lib.rs": b"// fixture"}.items():
                     member = tarfile.TarInfo("outpace-acestream-complete/" + name)
                     member.size = len(data)
@@ -66,6 +66,42 @@ class PrepareTests(unittest.TestCase):
             prepare.prepare("v0.3.0", root, root / "context", REVISION)
             self.assertEqual(sorted(str(p.relative_to(root / "context")) for p in (root / "context").rglob("outpace")),
                              ["amd64/outpace", "arm-v7/outpace", "arm64/outpace"])
+
+    def test_beta_uses_the_same_complete_source_and_binary_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root, version="0.9.0-beta.1")
+            prepare.prepare("v0.9.0-beta.1", root, root / "context", REVISION)
+            self.assertEqual((root / "context" / "arm64" / "outpace").read_bytes(), b"bin")
+
+    def test_beta_still_rejects_missing_complete_source_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root, version="0.9.0-beta.1")
+            next(root.glob("outpace-source-*.tar.gz")).unlink()
+            self.checksums(root)
+            with self.assertRaisesRegex(ValueError, "all seven"):
+                prepare.prepare("v0.9.0-beta.1", root, root / "context", REVISION)
+            self.assertFalse((root / "context").exists())
+
+    def test_beta_rejects_stable_source_identity_even_with_valid_outer_checksums(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root, version="0.9.0-beta.1")
+            path = next(root.glob("*.zip"))
+            with zipfile.ZipFile(path) as archive:
+                entries = [(member, archive.read(member)) for member in archive.infolist()]
+            with zipfile.ZipFile(path, "w") as archive:
+                for member, data in entries:
+                    if member.filename.endswith("/source.json"):
+                        info = json.loads(data)
+                        info["version"] = "0.9.0"
+                        data = json.dumps(info).encode()
+                    archive.writestr(member, data)
+            self.checksums(root)
+            with self.assertRaisesRegex(ValueError, "identity"):
+                prepare.prepare("v0.9.0-beta.1", root, root / "context", REVISION)
+            self.assertFalse((root / "context").exists())
 
     def test_corrupt_archive_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

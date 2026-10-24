@@ -5,11 +5,12 @@ from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 from complete_source import prepare, dependencies
 
 
 class CompleteSourceTests(unittest.TestCase):
-    def fixture(self, root):
+    def fixture(self, root, author=None):
         checksum = 'a' * 64
         lock = f'[[package]]\nname="demo"\nversion="1.0.0"\nsource="registry+https://github.com/rust-lang/crates.io-index"\nchecksum="{checksum}"\n'.encode()
         package = root / 'package'
@@ -24,6 +25,8 @@ class CompleteSourceTests(unittest.TestCase):
         crate = vendor / 'demo-1.0.0'
         crate.mkdir(parents=True)
         files = {'Cargo.toml': b'[package]\nname="demo"\nversion="1.0.0"\nlicense="MIT"', 'lib.rs': b'// source', 'LICENSE-MIT': b'Original license notice'}
+        if author:
+            files['Cargo.toml'] += ('\nauthors=["' + author + '"]\n').encode('utf-8')
         for name, data in files.items():
             (crate / name).write_bytes(data)
         (crate / '.cargo-checksum.json').write_text(json.dumps({'package': checksum, 'files': {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}}))
@@ -44,6 +47,21 @@ class CompleteSourceTests(unittest.TestCase):
             first = output.read_bytes()
             prepare(package, vendor, output)
             self.assertEqual(first, output.read_bytes())
+
+    def test_utf8_authorship_is_preserved_on_a_legacy_locale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, vendor, lock = self.fixture(Path(tmp), author='René Example')
+            expected, _ = dependencies(vendor, lock)
+            read_text = Path.read_text
+
+            def legacy_default(path, *args, **kwargs):
+                kwargs.setdefault('encoding', 'cp1252')
+                return read_text(path, *args, **kwargs)
+
+            with patch.object(Path, 'read_text', legacy_default):
+                actual, _ = dependencies(vendor, lock)
+            self.assertIn('Authors: René Example'.encode('utf-8'), actual)
+            self.assertEqual(actual, expected)
 
     def test_changed_or_extra_dependency_file_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:

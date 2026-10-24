@@ -34,6 +34,7 @@ ced69f36873ffbef9806f29321dbf9c68d4e52bf  git commit SHA referenced in a note
 73da4c4f1b9a20586ffc87502ab6a3c177c21634  git commit SHA referenced in a note (ValdikSS/AceProxy)
 
 # --- Build metadata ---
+a087b20d7f474fe4961ccd5c135160bf15f4a9ba  pinned organization metadata-only PR approval workflow revision
 # jemalloc's git-describe hash inside a Cargo.lock version string. Cargo.lock is
 # excluded from the scan, but list it so the value is documented as non-identifier.
 e13ca993e8ccb9ba9847cc330696e02839f328f7  jemalloc git-describe hash (tikv-jemalloc-sys version)

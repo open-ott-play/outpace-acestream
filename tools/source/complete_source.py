@@ -61,7 +61,7 @@ def dependencies(vendor, lock):
         checksum_path = root / '.cargo-checksum.json'
         if checksum_path.is_symlink():
             raise ValueError('Dependency checksum metadata must be a regular file')
-        checksum = json.loads(checksum_path.read_text())
+        checksum = json.loads(checksum_path.read_text(encoding='utf-8'))
         if set(checksum) - {'package', 'files', '$comment'}:
             raise ValueError('Unexpected dependency checksum metadata')
         if '$comment' in checksum and checksum['$comment'] != 'This file only protects against accidental modifications. It is not a security mechanism and does not protect against malicious changes.':
@@ -83,7 +83,7 @@ def dependencies(vendor, lock):
             path = root / safe_relative(relative)
             if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
                 raise ValueError(f'Changed dependency source: {name}/{relative}')
-        info = tomllib.loads((root / 'Cargo.toml').read_text())['package']
+        info = tomllib.loads((root / 'Cargo.toml').read_text(encoding='utf-8'))['package']
         legal = []
         explicit = info.get('license-file')
         for relative in sorted(files):
@@ -115,7 +115,7 @@ def add_bytes(archive, name, data, mode=0o644):
 
 def prepare(package, vendor, output):
     engine = package / 'corresponding-source.tar.gz'
-    info = json.loads((package / 'source.json').read_text())
+    info = json.loads((package / 'source.json').read_text(encoding='utf-8'))
     if hashlib.sha256(engine.read_bytes()).hexdigest() != info['source_sha256']:
         raise ValueError('Embedded workspace source checksum mismatch')
     lock = source_lock(engine)

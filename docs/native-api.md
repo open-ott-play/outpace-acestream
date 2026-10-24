@@ -26,7 +26,7 @@ CLI inputs retain their existing meanings.
 | Command | Behavior |
 | --- | --- |
 | `outpace serve` | Runs the native HTTP API, RTMP ingest, and enabled peer services. With no command, outpace defaults to `serve`. |
-| `outpace play <input>` | Writes live MPEG-TS bytes to stdout. Diagnostics go to stderr, so redirection and piping are safe. Accepts `acestream://`, `acestream:?`, `magnet:`, and HTTP(S) transport-file inputs; infohash and magnet inputs fail closed (no verified descriptor in a one-shot process). |
+| `outpace play <input>` | Writes live MPEG-TS bytes to stdout. Diagnostics go to stderr, so redirection and piping are safe. Accepts `acestream://`, `acestream:?`, `magnet:`, and HTTP(S) transport-file inputs. Infohash and magnet inputs require a verified local or catalog-resolved descriptor and fail closed if it cannot be obtained. |
 | `outpace play --vod <input>` | Downloads a single-file VOD, verifies every piece, and writes the file to stdout. |
 | `outpace broadcast <name>` | Creates or resumes a broadcast, prints HTTP/RTMP ingest and playback metadata to stderr, and runs the server. |
 

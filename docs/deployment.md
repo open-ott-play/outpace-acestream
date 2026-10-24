@@ -250,7 +250,7 @@ environment-only deployments remain supported. A versioned config-file schema an
 flag surface are intentionally deferred until the configuration model is stable enough to avoid
 making internal scheduler details a permanent public contract.
 
-The complete environment-variable reference remains in the root [`README`](../README.md#configuration).
+The complete environment-variable reference is in [configuration](configuration.md).
 Keep credentials out of `.env`; none of the current daemon settings require secrets.
 
 ### Ace HTTP compatibility

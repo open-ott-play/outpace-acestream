@@ -6,6 +6,7 @@ import json
 import zipfile
 from pathlib import Path
 import re
+import stat
 import tarfile
 
 TARGETS = {
@@ -61,8 +62,14 @@ def prepare(tag: str, assets: Path, output: Path, revision: str) -> None:
         if extension == "zip":
             with zipfile.ZipFile(path) as archive:
                 for name in required:
-                    matches = [item for item in archive.infolist() if item.filename == prefix + name]
-                    if len(matches) != 1 or matches[0].is_dir() or matches[0].file_size > 64 * 1024 * 1024:
+                    # PowerShell Compress-Archive uses backslashes on Windows.
+                    # Read exact normalized members without extracting paths;
+                    # slash/backslash aliases must still count as duplicates.
+                    matches = [item for item in archive.infolist() if item.filename.replace("\\", "/") == prefix + name]
+                    if (len(matches) != 1 or matches[0].is_dir()
+                            or matches[0].external_attr & 0x10
+                            or stat.S_IFMT(matches[0].external_attr >> 16) not in (0, stat.S_IFREG)
+                            or matches[0].file_size > 64 * 1024 * 1024):
                         raise ValueError(f"Missing or oversized release source member: {name}")
                     values[name] = archive.read(matches[0])
         else:

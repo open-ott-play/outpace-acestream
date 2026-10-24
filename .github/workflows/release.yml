@@ -133,7 +133,7 @@ jobs:
           python3 tools/source/complete_source.py "$package_dir" "dist/outpace-source-${version}-${target}-${revision}.tar.gz"
 
           if [[ "${{ matrix.archive }}" == "zip" ]]; then
-            powershell -NoProfile -Command "Compress-Archive -Path '${package_dir}' -DestinationPath 'dist/${BIN_NAME}-${version}-${target}.zip' -Force"
+            python3 -m zipfile -c "dist/${BIN_NAME}-${version}-${target}.zip" "$package_dir"
           else
             tar -C dist -czf "dist/${BIN_NAME}-${version}-${target}.tar.gz" "${BIN_NAME}-${version}-${target}"
           fi

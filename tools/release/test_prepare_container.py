@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import stat
 import zipfile
 from pathlib import Path
 import tarfile
@@ -17,7 +18,7 @@ REVISION = "0123456789abcdef0123456789abcdef01234567"
 
 
 class PrepareTests(unittest.TestCase):
-    def fixture(self, root, member_type=tarfile.REGTYPE):
+    def fixture(self, root, member_type=tarfile.REGTYPE, zip_separator="/"):
         for target, extension in prepare.TARGETS.items():
             archive = root / f"outpace-0.3.0-{target}.{extension}"
             prefix = f"outpace-0.3.0-{target}/"
@@ -41,7 +42,10 @@ class PrepareTests(unittest.TestCase):
             else:
                 with zipfile.ZipFile(archive, 'w') as target_zip:
                     for name, data in values.items():
-                        target_zip.writestr(prefix + name, data)
+                        member = zipfile.ZipInfo((prefix + name).replace("/", zip_separator))
+                        member.create_system = 0
+                        member.external_attr = 0x20  # DOS archive bit, no Unix filetype.
+                        target_zip.writestr(member, data)
             with tarfile.open(root / f"outpace-source-0.3.0-{target}-{REVISION}.tar.gz", "w:gz") as complete:
                 for name, data in {"engine-source.tar.gz": source, "source.json": values["source.json"], "THIRD_PARTY_NOTICES.txt": values["THIRD_PARTY_NOTICES.txt"], "vendor/demo/lib.rs": b"// fixture"}.items():
                     member = tarfile.TarInfo("outpace-acestream-complete/" + name)
@@ -70,6 +74,43 @@ class PrepareTests(unittest.TestCase):
             next(root.glob("*.zip")).write_bytes(b"corrupt")
             with self.assertRaises(ValueError):
                 prepare.prepare("v0.3.0", root, root / "context", REVISION)
+
+    def test_windows_backslash_members_are_verified_without_extraction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root, zip_separator="\\")
+            prepare.prepare("v0.3.0", root, root / "context", REVISION)
+            self.assertEqual((root / "context" / "amd64" / "outpace").read_bytes(), b"bin")
+
+    def test_slash_backslash_alias_is_a_duplicate_not_an_alternate_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            path = next(root.glob("*.zip"))
+            with zipfile.ZipFile(path, "a") as archive:
+                first = archive.infolist()[0]
+                archive.writestr(first.filename.replace("/", "\\"), archive.read(first))
+            self.checksums(root)
+            with self.assertRaisesRegex(ValueError, "release source member"):
+                prepare.prepare("v0.3.0", root, root / "context", REVISION)
+            self.assertFalse((root / "context").exists())
+
+    def test_zip_source_members_cannot_be_symlinks_or_dos_directories(self):
+        for attributes in [(stat.S_IFLNK | 0o777) << 16, 0x10]:
+            with self.subTest(attributes=attributes), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self.fixture(root)
+                path = next(root.glob("*.zip"))
+                with zipfile.ZipFile(path) as archive:
+                    entries = [(member, archive.read(member)) for member in archive.infolist()]
+                entries[0][0].external_attr = attributes
+                with zipfile.ZipFile(path, "w") as archive:
+                    for member, data in entries:
+                        archive.writestr(member, data)
+                self.checksums(root)
+                with self.assertRaisesRegex(ValueError, "release source member"):
+                    prepare.prepare("v0.3.0", root, root / "context", REVISION)
+                self.assertFalse((root / "context").exists())
 
     def test_missing_target_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

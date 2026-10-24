@@ -1,672 +1,159 @@
 # Outpace AceStream
 
-Outpace AceStream is an independently maintained development of
-[Outpace](https://github.com/jamezrin/outpace), a Rust implementation of the public Acestream P2P live
-streaming path. It joins Acestream swarms, pulls MPEG-TS media, and exposes the
-result through a native daemon API, HLS, and CLI commands that work with players
-such as VLC and downstream tools such as Jellyfin or dispatcharr.
+![Outpace AceStream — a Rust engine for public AceStream media](docs/assets/outpace-hero.svg)
 
-The project does not use closed-source engine blobs at runtime. Reverse-engineering
-fixtures, protocol captures, and reference binaries are kept under git-ignored
-`re/` and `references/` directories when present on a development machine.
+**A native Rust engine that turns public, unencrypted AceStream sources into
+MPEG-TS and HLS for your player.** Run it on Windows, Linux or macOS, in Docker,
+or in a Kubernetes or k3s cluster. It works directly with HTTP-capable players
+and through middleware such as hls-proxy.
 
-## License, source and independent development
+Outpace AceStream independently develops [Outpace](https://github.com/jamezrin/outpace),
+preserving its history, attribution and **AGPL-3.0-or-later** license. It does not
+require an original closed-source engine at runtime and is not an official Ace
+Stream product. The executable remains `outpace`; configuration uses `OUTPACE_*`.
 
-This repository is `open-ott-play/outpace-acestream`. It preserves Outpace's Git
-history and **AGPL-3.0-or-later** license; creating an independent repository does
-not change those obligations. See [LICENSE](LICENSE), [NOTICE](NOTICE) and
-[AUTHORS.md](AUTHORS.md). The command is still `outpace`, crates keep their existing
-names, and `OUTPACE_*` environment variables remain compatible. This is an engine
-for AceStream sources, with HTTP/HLS output for players such as hls-proxy; it is
-not itself a player and is not an official Ace Stream product.
+[Download v0.8.1](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.8.1)
+· [Documentation](docs/README.md)
+· [HTTP API](docs/native-api.md)
+· [Troubleshooting](docs/troubleshooting.md)
+· [Roadmap](docs/roadmap.md)
 
-Every build embeds a workspace-source archive containing the actual tracked
-source bytes, Cargo.lock, build scripts, tests, documentation and notices. The
-running daemon offers it prominently at `/` and `/source`; `/source.tar.gz` serves
-the archive and `/source.json` reports its SHA-256, base Git revision and whether
-the tree was modified. An HTTP `Link` header advertises the offer on API responses.
-The same archive is available offline with `outpace source > source.tar.gz`.
-No runtime source checkout or writable filesystem is required for that archive.
+Reading this file from a downloaded binary package? Open the
+[online handbook](https://github.com/open-ott-play/outpace-acestream/blob/main/docs/README.md)
+for working navigation and diagrams. The matching source archives contain the
+documentation for the build they accompany.
 
-Official releases additionally offer a **complete source asset** containing that
-exact workspace archive, all Cargo.lock registry sources from `cargo vendor`,
-original third-party notices, and offline rebuild instructions. Each platform's
-asset name includes its version, target and full Git revision. Release binaries
-link directly to it from `/source` and record the URL in `/source.json`. Container
-publication verifies the source and binary packages refer to the same clean
-revision, target and workspace digest before publishing an image. The vendored
-sources stay outside the executable.
+## Start here
 
-A local or modified build does not claim that a published release asset matches
-it. Before distributing such a build or exposing it to other users, generate and
-host its matching complete bundle. `tools/release/package_source.py` takes the
-`--message-format=json-render-diagnostics` output of the build and copies its
-workspace archive and metadata to a package directory; then run
-`python3 tools/source/complete_source.py PACKAGE COMPLETE.tar.gz`. This verifies
-the build's lockfile and every vendored file before packaging. The resulting
-`THIRD_PARTY_NOTICES.txt` belongs with the binary; make the complete bundle's URL
-available alongside the service source offer. Do not set `OUTPACE_RELEASE_BUILD`
-for private or modified builds: that flag is reserved for the stable release
-workflow and refuses a modified tracked tree.
+| Your environment or task | Guide |
+| --- | --- |
+| Windows x64 or ARM64 | [Binary download, verification and PowerShell setup](docs/installation.md#windows-install-and-run-with-powershell) |
+| Linux x64, ARM64 or ARMv7 | [Binary installation and systemd](docs/installation.md#linux-run-and-install-a-systemd-service) |
+| macOS Apple Silicon or Intel | [Native installation and LaunchAgent](docs/installation.md#macos-run-and-install-a-launchagent) |
+| Docker or Docker Compose | [Containers, storage, ports and upgrades](docs/containers.md) |
+| Kubernetes or k3s | [Cluster deployment and example manifests](docs/kubernetes.md) |
+| VLC, hls-proxy or another player | [Playback routes and integration](docs/playback.md) |
+| Tuning and operations | [Configuration](docs/configuration.md) · [Troubleshooting](docs/troubleshooting.md) |
+| Development and source distribution | [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Licensing](docs/licensing.md) |
 
-Keep these endpoints reachable when putting a modified engine behind a proxy,
-and provide the source link to users of an integrated player. A separately
-modified surrounding program may have additional obligations; these mechanisms
-address this engine, not a blanket legal assessment of every deployment.
+The guides pin **v0.8.1** where reproducibility matters. The documentation on
+`main` also describes subsequent source changes and marks relevant differences.
+In particular, set **both `OUTPACE_DATA_DIR` and `OUTPACE_CACHE_DIR`** when moving
+v0.8.1 state to a service directory or volume. Its default-cache derivation was
+fixed after that release. Windows currently supports in-memory peer hints, not
+the Unix durable peer-hint backend; follow the Windows-specific recipe.
 
-### Building and reproducing source
+## What it does
 
-Build with the Rust toolchain pinned in `rust-toolchain.toml` and
-`cargo build --locked --release -p ace-engine --bin outpace`. Add new source files
-to Git before building; unindexed files in compilation directories are rejected.
-Tracked modifications are included and identified as modified. Ignored operator
-state, credentials, the private identifier registry and Git metadata are never
-part of the archive. Do not stage secrets: packaging deliberately publishes the
-tracked project, subject to checks against reserved private paths and unsafe links.
+| Capability | Current behavior |
+| --- | --- |
+| Live acquisition | Resolves descriptors, discovers peers, verifies and reassembles supported public AceStream media. |
+| Playback output | Direct MPEG-TS and bounded live HLS, with shared source sessions for multiple consumers. |
+| Ace HTTP compatibility | An explicit subset, enabled with `OUTPACE_ACE_COMPAT=1`; see the [compatibility contract](docs/deployment-compatibility.md). |
+| Single-file VOD | Verified file pieces, HTTP byte ranges and native VOD HLS. Requires a VOD descriptor. |
+| Broadcast origination | Signed broadcasts from raw HTTP MPEG-TS, RTMP or managed HTTP(S) MPEG-TS input. |
+| Audio conversion | Optional FFmpeg-based conversion of selected supported live-HLS audio to AAC stereo. Video is copied. |
+| Historical playback | Peer timeshift and durable DVR are planned. A live HLS window is not a channel archive. |
 
-For a complete release asset, follow its `REBUILD.md`; dependencies can be resolved
-without contacting a registry. To rebuild the smaller embedded workspace archive,
-extract it, enter `outpace-acestream`,
-and run the same Cargo command. The included `SOURCE-MANIFEST.json` supplies a
-hashed inventory when Git is absent. Cargo fetches the exact dependency versions
-and checksums in Cargo.lock from their public registries; native system build
-requirements are documented by the Dockerfiles and CI workflows. The archive
-identifies source inputs; it is not a claim of bit-for-bit binary reproducibility
-across different compilers, linkers, flags and hosts. GitHub's automatically generated
-repository ZIP has no build inventory: use a Git clone or the packaged source
-archives above.
+Channel discovery, playlist curation, EPG and the television interface belong to
+the player or proxy. Codec support still depends on that player. Premium or
+encrypted sources and full closed-engine API parity are outside the supported
+scope.
 
-For a container built from source, first prepare an isolated context containing
-only indexed project files (Python 3 is required for this preparation step):
+## First run
 
-```bash
-python3 tools/source/prepare_context.py /tmp/outpace-source-context
-docker build -t outpace-acestream:local /tmp/outpace-source-context
+[Install and verify the package for your platform](docs/installation.md), then
+start the daemon using that guide's environment settings. With the binary on
+`PATH`, the command is:
+
+```sh
+outpace serve
 ```
 
-The script refuses to overwrite an existing directory. CI uses the same process.
-Binary release archives include the embedded workspace archive, license and
-third-party notices; the complete source asset is published alongside each one. Published runtime images carry the exact release binary with its embedded
-source and identify the release revision through OCI labels.
+In another terminal, check the HTTP listener and the exact build:
 
-## Status
+```sh
+curl --fail --show-error http://127.0.0.1:6878/healthz
+curl --fail --show-error http://127.0.0.1:6878/source.json
+```
 
-See the [development roadmap](docs/roadmap.md) for the integration baseline,
-measured optimization work, and the planned peer-timeshift and optional DVR
-stages. Historical playback is not implemented by this release.
+In PowerShell, use `Invoke-RestMethod` for these URLs. A successful health check
+means the process answers HTTP; it does not prove that a source has peers or
+that your player can decode its media.
 
-The live byte path is built and proven against real public swarms:
+Open a native HLS URL in the player, replacing the synthetic ID with a current
+content ID you are authorized to use:
 
-- protocol recovery and interop vectors are in place;
-- the `ace-wire`, `ace-tracker`, `ace-peer`, `ace-swarm`, `ace-media`, and
-  `ace-engine` crates are in the workspace;
-- the daemon can discover peers, connect, download live media, and serve it over
-  the native API;
-- reciprocal upload, inbound seeding plumbing, signed broadcast origination,
-  HTTP raw ingest, managed HTTP(S) MPEG-TS sources, RTMP ingest, content-id metadata serving, and the
-  CLI are implemented;
-- live-network tests remain ignored by default because they need the public swarm
-  and a suitable network.
+```text
+http://127.0.0.1:6878/streams/ace/cid:0123456789abcdef0123456789abcdef01234567.m3u8
+```
 
-The single production Rust live entrypoint is
-`ace_swarm::live_session::follow_live(LiveSessionInputs)`. It emits authenticated
-media as `LiveOutput { bytes, discontinuity }` and reconnects until the consumer
-drops. Pre-1.0 Rust compatibility break (#193): `driver::download_from_peer`,
-`driver::DownloadParams`, `live::LiveSession`, `live::LiveConfig`, and
-`LiveSession::run` have been removed; Rust callers must migrate to `follow_live`.
+The example ID is deliberately nonfunctional. Content IDs and infohashes are
+different selectors: use `cid:` for a content ID and `ih:` for an infohash. A
+cold infohash still needs a verified descriptor before media can start. See
+[playback](docs/playback.md) for CLI, direct TS, compatibility and VOD routes.
 
-Run the normal local gate with:
+For a remote player, `127.0.0.1` refers to that player's own machine. Configure
+access through a trusted proxy or a deliberately exposed service, and use an
+address reachable by whoever fetches both the playlist and its segments. The
+engine API has control and ingest operations as well as playback: it is not a
+public authenticated streaming gateway.
 
-```bash
+## How it fits together
+
+![Descriptor resolution and peer discovery feed a bounded Rust engine; MPEG-TS or HLS reaches a player directly or through an optional proxy.](docs/assets/architecture.svg)
+
+The live follower acquires and authenticates media, the session manager shares
+that work, and the HTTP layer exposes playback. Limits cover individual queues,
+piece stores and HLS windows; they are not a promise of fixed total process
+memory for an unlimited number of sources. Start with defaults and measure the
+actual bottleneck before increasing buffers.
+
+Native defaults are HTTP **`127.0.0.1:6878`**, RTMP ingest
+**`127.0.0.1:1935`**, and inbound peer TCP **`0.0.0.0:8621`**. Seeding and inbound
+peer participation are enabled; automatic router port mapping is disabled.
+DHT and UDP trackers need outbound UDP with return traffic, not a published UDP
+8621 listener. Container and cluster guides explain their different network
+boundaries.
+
+Read the [architecture guide](docs/architecture.md) for code ownership, source
+resolution, session lifetime, persistent identity and disposable media storage.
+
+## Build, test and contribute
+
+From a Git checkout, use the toolchain pinned in `rust-toolchain.toml`:
+
+```sh
+cargo build --locked --release -p ace-engine --bin outpace
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-CI runs these same three commands on every pull request and on every push to `main`
-(`.github/workflows/ci.yml`, reported as the `Rust lint` and `Rust test` checks). The
-ignored live-network tests never run in CI.
-
-## Quick Start
-
-Run the daemon:
-
-```bash
-cargo run -p ace-engine --bin outpace -- serve
-```
-
-With no subcommand, `outpace` defaults to `serve`.
-
-For native live playback, use `/streams/ace/cid:<content-id>` (or a bare content
-id), adding `.m3u8` for HLS. Both forms share status and DELETE session keys.
-Infohash playback uses `/streams/ace/ih:<infohash>` and resolves a verified descriptor
-through the catalog when needed. **Migration:** bare hex ids on native live routes now mean content ids,
-matching compat `id=`; update older infohash URLs to include `ih:`. See the
-[native API](docs/native-api.md) for selector and session details.
-
-Play a known Acestream link to stdout:
-
-```bash
-cargo run -p ace-engine --bin outpace -- play acestream://<content-id> > live.ts
-```
-
-`play` accepts four mutually exclusive selectors, applied in precedence order
-`content_id` > `infohash` > `url` > `magnet`:
-
-- `acestream://<content_id>` or `acestream:?content_id=<40-hex>`;
-- `acestream:?infohash=<40-hex>` - resolves the live descriptor through the signed catalog;
-- a transport-file URL - either passed bare (`play https://host/x.acelive?a=1&b=2`,
-  which handles a URL carrying its own `&`-joined query) or as
-  `acestream:?url=<https://…>` (in the `acestream:?` form the URL's own query must
-  be percent-encoded, e.g. `%26` for `&`). The descriptor is fetched over http/https
-  with SSRF protection (private, loopback, and link-local hosts are blocked), a 1 MiB
-  size cap, disabled redirects, and a request timeout; unsafe, oversized, or
-  non-transport responses fail closed;
-- `magnet:?xt=urn:btih:<40-hex-or-32-base32>` - a BitTorrent v1 magnet, reduced to
-  its infohash (v2 `urn:btmh:` magnets are rejected), then resolved through the signed catalog.
-
-The `/ace/getstream` compatibility route accepts the same selectors plus legacy
-`id=<40-hex>`, which is an alias for `content_id` (not `infohash`). Its precedence is
-`content_id` > `infohash` > `id` > `url` > `magnet`. A `url=` selector uses a self-contained
-playback id, so playback works after a daemon restart without any server-side alias table.
-
-### Content-id resolution
-
-Live and VOD content-id inputs use the catalog by default. A catalog failure returns an
-error rather than automatically querying BEP-9 metadata peers. The daemon can also resolve
-its own broadcasts through its trusted local broadcast registry without a catalog lookup.
-
-`OUTPACE_BEP9_CONTENT_ID_FALLBACK=1` explicitly enables the raw transport-hash convention
-used by outpace broadcasts, after catalog failure. This applies to both `serve` and standalone
-`play` (including `--vod`). Peer metadata is accepted only when the SHA-1 of the complete
-wrapped transport bytes equals the requested identifier. This check does not establish the
-binding of a public catalog content id; that derivation remains unresolved. See
-[the content-id policy](docs/protocol/notes/63-bep9-content-id-policy.md).
-
-### Infohash inputs
-
-Catalog replies require the engine-compatible response signature, matching request nonce and
-transport checksum. The response key is embedded in clients, so this does not provide
-server-only authentication over plain HTTP; see [the protocol evidence and trust limits](docs/protocol/notes/62-catalog-response-authentication.md).
-
-A bare infohash identifies a swarm but carries no piece geometry or source key. For
-native `ih:`, compat `infohash=`/`magnet=`, and CLI infohash/magnet inputs, outpace
-first checks its own broadcasts and verified descriptor index, then queries the
-signed catalog directly by infohash. Catalog response authentication, request
-nonce and checksum checks precede decoding, and the descriptor's computed swarm
-infohash must match the requested value before discovery or indexing.
-
-The verified descriptor supplies geometry, pubkey and trackers. Successful lookups
-populate the bounded in-process index; failures are suppressed for five seconds
-in a separate cache capped at 128 entries. A verified local descriptor takes
-precedence over a cached failure. Unavailable or mismatched descriptors fail
-closed without guessing geometry or falling back to BEP-9. Native playback returns
-`422` with a reason; compat JSON URL creation permits cold inputs, with resolution
-errors reported when playback is opened. CLI playback exits with an error.
-
-A BEP-9 content-id result or caller-supplied transport URL does not populate the
-catalog-provenance index. Transport-URL streams reopen by their `turl-` id.
-
-### Live HLS audio
-
-Live HLS uses its existing native selection by default: the first ADTS AAC
-track wins; without ADTS AAC, audio passes through unchanged. Direct/raw TS and
-VOD retain their existing behavior.
-
-Set `OUTPACE_HLS_AUDIO_NORMALIZE=true` (default `false`; accepts `true`/`false`
-or `1`/`0`) to convert selected AC3 or MPEG Layer II/III audio into AAC-LC stereo,
-48 kHz, 128 kbit/s. `OUTPACE_FFMPEG_PATH` selects a direct FFmpeg executable
-(default `ffmpeg`, resolved through PATH); it must be nonempty when enabled.
-These are the only normalization options. Disabled mode never looks up or probes
-FFmpeg. Native ADTS AAC and video-only streams start no conversion process.
-
-Enabled mode requires unencrypted 188-byte TS, one program, one MPEG-2/H.264/HEVC
-video stream, valid PCR and current CRC-valid single-packet PAT/PMT sections.
-Audio-only, multiple video/programs, fragmented PSI, unidentified private streams
-and unsupported selected codecs fail closed. MPEG PMT types do not identify a
-layer: bounded elementary-stream frame checks admit Layers II/III and reject
-Layer I, malformed, free-format or unaligned MPEG framing. LATM, EAC3 and DTS
-cannot be selected. The first ADTS AAC wins, otherwise the first recognized
-MPEG audio or AC3 wins; this does not search for a different track after rejection.
-Enabled strictness can reject inputs that disabled mode historically passes through.
-
-Conversion copies video without encoding it; player compatibility (including
-Safari) is not guaranteed. Stereo conversion can discard surround channels and
-lossy re-encoding reduces quality. At most four conversion children run globally;
-this is a process bound, not an RSS/CPU capacity promise. Recovery retains completed
-segments but playlists wait for fresh-generation readiness. A process, codec,
-resource or output failure is terminal for that session: HTTP 503 with
-`Retry-After: 1` does not restart a failed worker. Stop/idle teardown and a fresh
-session are required. Authorization and expiry still take precedence.
-
-Operators supply and maintain FFmpeg with MPEG-TS mux/demux, native AAC encoding,
-MP2/MP3/AC3 decoding and pipe support. Startup checks capabilities and performs a
-bounded AC3 conversion before opening listeners. Enabled containers need an
-operator-built image containing this binary; the base Docker/compose setup does
-not install it. Wrappers launching descendants are unsupported. Embedders must
-await manager shutdown before destroying the runtime so children and pumps are
-reaped; Drop only signals cancellation.
-
-Synthetic codec acceptance is optional locally: run
-`OUTPACE_TEST_HLS_AUDIO_FFMPEG=1 cargo test -p ace-engine --test hls_audio_ffmpeg -- --nocapture`.
-Without opt-in it prints an explicit skip. Opt-in requires FFmpeg/ffprobe,
-synthetic video/sine inputs and AC3/MP2/MP3/AAC encoders; a missing prerequisite
-fails the suite. The designated CI job always opts in. No public media is used.
-
-### VOD (single-file)
-
-For a **VOD** transport (a descriptor carrying a `pieces` SHA1 list), add `--vod` to
-download and verify the file to stdout instead of following a live stream:
-
-```bash
-cargo run -p ace-engine --bin outpace -- play --vod acestream://<content-id> > movie.mp4
-```
-
-Each piece is SHA1-checked against the transport's `pieces` before any bytes are written.
-The daemon serves the same content over `GET /vod/<network>/<id>` with a `Content-Length`,
-advertises `Accept-Ranges: bytes`, and honors single `Range` requests (`206 Partial Content`)
-so players can seek — each served range is still SHA1-verified against the covering pieces.
-Multi-file VOD is intentionally unsupported and fails with a clear error; VOD HLS is a tracked
-follow-up.
-
-Start a named broadcast:
-
-```bash
-cargo run -p ace-engine --bin outpace -- broadcast my-channel
-```
-
-The broadcast command prints:
-
-- a raw MPEG-TS HTTP ingest URL;
-- an RTMP ingest URL at `rtmp://<host>:<rtmp-port>/live/<name>`;
-- an `acestream://<content_id>` link using the raw wrapped transport-file hash.
-
-The originating daemon resolves that link through its trusted local broadcast registry.
-A different receiving daemon or standalone `outpace play` needs
-`OUTPACE_BEP9_CONTENT_ID_FALLBACK=1` to resolve it through BEP-9 `ut_metadata`; the default
-catalog policy does not automatically resolve these raw-hash links. Alternatively, pass the
-broadcast transport URL (`http://<host>:<http-port>/broadcast/<name>`) to `outpace play`
-or use the `url=` selector. The receiver's transport-URL access policy still applies.
-
-Set one immutable profile for every producer path (raw PUT, RTMP, managed pull and CLI):
-
-```bash
-OUTPACE_BROADCAST_OPTIONS='{"synthetic-origin":{"title":"Synthetic broadcast","bitrate_bytes_per_sec":500000,"piece_length":131072,"quality":"HD","categories":[]}}' \
-  cargo run -p ace-engine --bin outpace -- broadcast synthetic-origin
-```
-
-An unused profile creates nothing. Fresh omissions retain the legacy defaults; resumed
-identities retain raw transport/key bytes and match only explicit fields. Changing an
-explicit option can fail with `broadcast_options_conflict`; use a new name or explicitly
-DELETE/recreate, losing identity/cursor continuity. Each default/profile/stored piece must fit
-one full wire piece in the store budget, including disk and unused profiles. See the
-[complete profile schema and startup/resume rules](docs/native-api.md#broadcast-startup-profiles).
-
-Attach an engine-owned HTTP(S) MPEG-TS source with `PUT /broadcast/<name>/source`, or
-set startup declarations in `OUTPACE_BROADCAST_SOURCES`:
-
-```bash
-OUTPACE_BROADCAST_SOURCES='{"demo-source":{"url":"https://source.invalid/live.ts"}}' \
-  cargo run -p ace-engine --bin outpace -- serve
-```
-
-The URL above is synthetic; replace it with an authorized public, unencrypted MPEG-TS origin.
-Acceptance reserves the signing identity and schedules a worker; check
-`GET /broadcast/demo-source/source` for upstream health. A worker reconnects on finite EOF
-and discards incomplete tails. It keeps exclusive production through backoff and failure;
-DELETE the `/source` attachment before replacing it. Detach retains identity and cached data;
-DELETE the broadcast itself to remove identity. API attachments last for this process only.
-Current environment declarations reattach on restart, including declarations detached or
-deleted during the previous process. Remove a declaration to keep it absent after restart.
-
-Source URLs/query tokens stay out of status, logs and persisted broadcast records. Protect
-the deployment environment and avoid dumping configuration. Default source policy denies
-private/loopback addresses; only exact `OUTPACE_ALLOW_NON_GLOBAL_BROADCAST_SOURCE=1` adds
-the documented LAN subset. This switch is independent of transport/tracker opt-ins and
-never admits link-local metadata endpoints. Sources ignore proxies and reject redirects.
-See [source API/configuration](docs/native-api.md#managed-http-mpeg-ts-sources) and
-[storage, restart and deployment guidance](docs/deployment.md#managed-source-declarations).
-
-## Installation
-
-Release artifacts are created from `vX.Y.Z` git tags and published on GitHub
-Releases. Binary archives are named `outpace-<version>-<target>.<ext>`, where
-`<version>` is the tag without its leading `v`.
-
-Available targets:
-
-- `x86_64-unknown-linux-musl`
-- `aarch64-unknown-linux-musl`
-- `armv7-unknown-linux-musleabihf`
-- `x86_64-apple-darwin`
-- `aarch64-apple-darwin`
-- `x86_64-pc-windows-msvc`
-- `aarch64-pc-windows-msvc`
-
-Install a prebuilt Unix binary:
-
-```bash
-version=0.8.1
-target=x86_64-unknown-linux-musl
-artifact="outpace-${version}-${target}.tar.gz"
-curl -LO "https://github.com/open-ott-play/outpace-acestream/releases/download/v${version}/${artifact}"
-curl -LO "https://github.com/open-ott-play/outpace-acestream/releases/download/v${version}/SHA256SUMS"
-awk -v artifact="$artifact" '$2 == artifact { print }' SHA256SUMS | shasum -a 256 --check
-tar -xzf "$artifact"
-sudo install -m 0755 "outpace-${version}-${target}/outpace" /usr/local/bin/outpace
-```
-
-Windows releases use `.zip` archives with the same naming scheme.
-
-Run the published container image:
-
-```bash
-docker run --rm \
-  -p 6878:6878 \
-  -p 1935:1935 \
-  -p 8621:8621/tcp \
-  -v outpace-data:/var/lib/outpace \
-  ghcr.io/open-ott-play/outpace-acestream:0.8.1
-```
-
-The container defaults to `outpace serve`. It sets `OUTPACE_BIND=0.0.0.0:6878`,
-`OUTPACE_RTMP_BIND=0.0.0.0:1935`, and `OUTPACE_DATA_DIR=/var/lib/outpace`.
-Inbound peer serving currently listens on TCP 8621; DHT and tracker UDP traffic use outbound
-sockets and does not require publishing UDP 8621.
-The image manifest includes `linux/amd64`, `linux/arm64`, and `linux/arm/v7`. See
-[`docs/linux-portability.md`](docs/linux-portability.md) for ARMv7 resource guidance and the
-manual aarch64 16 KiB-page qualification procedure.
-
-For a checked-in production Compose deployment, safe exposure defaults, leecher/disk/broadcast
-examples, DNS overrides, and upgrade guidance, see
-[`docs/deployment.md`](docs/deployment.md).
-
-## Cutting a Release
-
-The release version is the Cargo package version: the workspace crates inherit a
-single `version` from `[workspace.package]` in the root `Cargo.toml`, and that is
-the version `outpace --version` reports. The git tag is only a validated trigger.
-
-First bump the shared version, then tag it with a leading `v`:
-
-```bash
-# edit [workspace.package] version in Cargo.toml, e.g. to 0.2.0, then:
-git tag v0.2.0
-git push origin v0.2.0
-```
-
-Pushing the tag runs `.github/workflows/release.yml`. It reads the version from
-`cargo metadata` and fails the release before building anything if the tag does
-not match `v<cargo_version>`, so artifact names and Docker tags always agree with
-the Cargo version. The workflow:
-
-- builds Linux binaries for amd64, arm64, and ARMv7, plus macOS and Windows binaries for amd64
-  and arm64;
-- uploads `tar.gz` archives for Unix targets and `zip` archives for Windows;
-- packages complete, checksum-verified registry sources and notices for each target;
-- generates one `SHA256SUMS` file for all archives;
-- creates a GitHub Release with generated release notes;
-- publishes `ghcr.io/open-ott-play/outpace-acestream:<version>` and `ghcr.io/open-ott-play/outpace-acestream:latest`.
-
-Automatic edge image publication is disabled. Supported images come from the
-stable release workflow after the complete source assets have been published and
-verified. Pin production to an accepted release digest.
-
-## Runtime Surfaces
-
-The primary integration contract is the native CLI and HTTP API. See the
-route table, response shapes, and VLC/Jellyfin/dispatcharr examples in
-[`docs/native-api.md`](docs/native-api.md).
-
-Legacy Acestream-compatible routes (`/ace/*`, `/server/api`, and
-`/webui/api/service`) provide a supported subset, disabled by default. Enable them
-when needed with `OUTPACE_ACE_COMPAT=1` on the serving daemon, or explicitly disable
-them with `OUTPACE_ACE_COMPAT=0`. Restart the daemon to apply a change; for Compose,
-recreate the service with `docker compose up -d --wait`.
-The canonical [Acestream HTTP support contract](docs/protocol/compat-matrix.md)
-covers direct VLC and JSON-session examples, supported routes/selectors, errors,
-lease ownership, live HLS and intentional gaps. The
-[pinned client inventory](docs/protocol/ace-client-inventory.md) supplies supporting
-client evidence; it does not claim full engine or application parity.
-
-## Configuration
-
-Environment variables parsed by the daemon include:
-
-- `OUTPACE_BEP9_CONTENT_ID_FALLBACK` - raw transport-hash BEP-9 fallback for content-id
-  resolution after catalog failure, default off. Set to `1` on the receiving daemon or
-  standalone `play` process for outpace broadcast Ace links from another daemon. Applies to
-  live and VOD; peer results do not populate the catalog-provenance infohash index.
-- `OUTPACE_BIND` - HTTP bind address, default `127.0.0.1:6878`.
-- `OUTPACE_RTMP_BIND` - RTMP ingest bind address, default `127.0.0.1:1935`.
-- `OUTPACE_BROADCAST_OPTIONS` - strict named startup profile JSON, default `{}`; at most
-  64 names and 262144 UTF-8 bytes. Optional title, bitrate in bytes/second, piece length,
-  quality and ordered categories; invalid values fail with `invalid_broadcast_options`.
-  Defaults: path name, `8375`, `65536`, `auto`, `["other"]`. No hot reload or profile-only mint.
-  See [bounds and immutable resume](docs/native-api.md#broadcast-startup-profiles).
-- `OUTPACE_BROADCAST_SOURCES` - startup source JSON map, default `{}`; at most 64 names,
-  256 KiB UTF-8, URLs up to 8,192 bytes. Duplicate/unknown fields fail startup. Source timing
-  defaults: connect 5s, read 15s, reconnect initial 1s, maximum 30s; see the native API limits.
-- `OUTPACE_ALLOW_NON_GLOBAL_BROADCAST_SOURCE` - independent operator-only source address
-  opt-in; only exact `1` enables it, default off. It cannot be set in an API request.
-- `OUTPACE_DATA_DIR` - persistent identity/cache root, default platform data dir
-  plus `outpace`.
-- `OUTPACE_PEER_LISTEN` - inbound peer listener bind, default `0.0.0.0:8621`.
-- `OUTPACE_SEED_STORE_BYTES` - byte budget for retained piece data (sizes both cache backends),
-  default `134217728` (128 MiB). A hard safety cap; on a live stream
-  `OUTPACE_SEED_RETENTION_SECS` is the primary limiter.
-- `OUTPACE_SEED_RETENTION_SECS` - age bound (seconds) for a live reseed store, default `45`:
-  retain roughly this much recent downloaded data for reseeding instead of filling
-  `OUTPACE_SEED_STORE_BYTES`, so RAM tracks bitrate rather than always growing to the byte cap.
-  `0` disables the age bound (byte-only, the pre-0.2 behavior). VOD stores are always byte-only.
-- `OUTPACE_CACHE_TYPE` - where the seed store keeps piece data: `memory` (default) or `disk`.
-  `disk` trades RAM for capacity, mirroring Acestream's disk-cache option.
-- `OUTPACE_CACHE_DIR` - root dir for persistent warm-peer hints in both cache modes and
-  disk-mode piece files (one subdir per served stream; see below). Defaults to
-  `<OUTPACE_DATA_DIR>/cache` after selecting the data directory; an explicit cache path
-  takes precedence. In disk mode, startup wipes this directory only when it is empty or
-  already contains a regular `.outpace-cache` sentinel
-  file (written automatically on first successful disk-cache start). A symlink is not accepted
-  as a sentinel. An unmarked non-empty path is refused rather than deleted.
-- `OUTPACE_PREFETCH_PIECES` - optional exact number of pieces behind the live edge to start at.
-  When unset, outpace derives the depth from the startup target and advertised bitrate, falling
-  back to `32` pieces when the bitrate is unavailable.
-- `OUTPACE_SESSION_BUFFER` - per-client fan-out channel depth, default `256`;
-  must be at least `1`.
-- `OUTPACE_PREBUFFER_MS` - target server-resident live startup queue duration, default `30000`.
-  The server intentionally waits before sending the first media so clients begin with more
-  tolerance for swarm jitter. `0` disables startup prebuffering and preserves the previous
-  immediate-release behavior.
-- `OUTPACE_PREBUFFER_BYTES` - hard byte ceiling for the startup queue, default `134217728`
-  (128 MiB). Reaching it releases the available media early instead of exceeding the reservoir
-  budget. Queue metadata and the rest of the daemon add memory overhead beyond this payload cap.
-- `OUTPACE_PREBUFFER_TIMEOUT_MS` - deadline after the first clean media byte for reaching the
-  target duration, default `15000`. On expiry, outpace degrades gracefully by releasing the
-  available queue; it does not turn a short advertised live window into a playback failure.
-- `OUTPACE_REQUEST_TIMEOUT_MS` - per-piece request timeout before re-requesting or skipping an
-  evicted gap, default `1500`; must be lower than `OUTPACE_STALE_UPSTREAM_TIMEOUT_MS`. A live
-  player drains in realtime, so raising this leaves a stuck piece to be healed by the much slower
-  `OUTPACE_STALE_UPSTREAM_TIMEOUT_MS` pool teardown instead — a visible playback gap.
-- `OUTPACE_STALE_UPSTREAM_TIMEOUT_MS` - whole-upstream no-progress timeout before reconnecting,
-  default `12000`.
-- `OUTPACE_REQUEST_CHECK_INTERVAL_MS` - request timeout sweep interval, default `1000`; must be
-  lower than or equal to `OUTPACE_REQUEST_TIMEOUT_MS`.
-- `OUTPACE_MAX_ACTIVE_UPSTREAMS` - active upstream peer cap for one live follower, default `4`;
-  max `256`.
-- `OUTPACE_MAX_PARALLEL_CONNECT` - peer connect race batch size, default `12`; max `1024`.
-- `OUTPACE_MAX_PIECE_ADVANCE` - max pieces scheduled in one forward step, default `256`;
-  max `16384`.
-- `OUTPACE_MAX_REASM_PIECES_AHEAD` - max pieces accepted ahead of the emit cursor, default `512`;
-  must be at least `OUTPACE_MAX_PIECE_ADVANCE`, max `65536`.
-- `OUTPACE_HLS_SEGMENT_PACKETS` - hard MPEG-TS packet ceiling per HLS segment and packet-count
-  fallback for streams without usable PCR, default `65536` (about 12.3 MB). This is a
-  memory-safety bound, not the primary cut mechanism: segments normally cut on a keyframe once
-  the target duration elapses, so the ceiling must comfortably hold one target-duration segment
-  of a peaky high-bitrate stream (a 2160p HEVC GOP can burst well past its average).
-- `OUTPACE_HLS_WINDOW_SEGMENTS` - retained HLS live window size, default `8`.
-- `OUTPACE_HLS_SEGMENT_DURATION_MS` - requested PCR-timed HLS segment duration, default `5000`.
-- `OUTPACE_HLS_STARTUP_SEGMENTS` - completed segments retained before a new HLS playlist request
-  becomes ready, default `6`. `0` is accepted as a compatibility setting and behaves as `1`.
-- `OUTPACE_HLS_STARTUP_TIMEOUT_MS` - maximum HLS playlist startup wait, default `45000`; must be
-  at least `OUTPACE_HLS_SEGMENT_DURATION_MS`. If the startup segment count is not reached, the
-  request returns a retryable HTTP `503` at the deadline.
-- `OUTPACE_MAX_UNCHOKED` - stable desired unchokes per exact served key, default `8` (U).
-  For I interested peers, the coordinator selects `min(I, U + 1)` desired states in
-  interest-entry order, with one rotating tail peer on nominal 10-second ticks. `0` still
-  selects one optimistic peer. Watch updates and pending writes make this a desired selection,
-  not an instantaneous wire-visible bound. Metadata replies bypass Interested/Unchoke.
-- `OUTPACE_SEED_TTL_SECS` - idle-TTL (seconds, default 300; 0 disables) after which an *ownerless*
-  seed-registry entry (one with no live producer lease) is force-evicted by the reaper. A backstop
-  only — normal teardown rides the lease drop, and entries held by a live producer or a broadcast
-  are never reaped. This TTL limits registry lifetime, not connection lifetime.
-- `OUTPACE_MAX_INBOUND` - retained inbound connection limit, default `64` (G); `0` acts as `1`.
-  Unidentified/incomplete handshakes consume this capacity too. Excess accepted sockets close
-  immediately without queuing behind retained connections.
-- `OUTPACE_MAX_INBOUND_PER_STREAM` - admitted connections per canonical stream, default `16`
-  (N), serialized in Config as `max_inbound_per_stream`. Broadcast media and metadata aliases
-  share this allowance, including idle, uninterested, choked and metadata-only connections.
-  At defaults the 17th combined admission closes before a handshake response. `0` restores
-  global-only admission and preserves U; positive N greater than G is valid and redundant for
-  occupancy. Empty, negative, malformed, overflow and non-Unicode environment values fail
-  startup; absence retains 16. Changes require restart/recreation. For rollback set
-  `OUTPACE_MAX_INBOUND_PER_STREAM=0`; Compose requires an explicit service environment override,
-  shown in [deployment.md](docs/deployment.md), rather than `.env` interpolation alone.
-- `OUTPACE_ENABLE_SEEDING` - reciprocal upload gate over outbound leech connections
-  (answering peers' chunk requests). Self-announce is gated on `OUTPACE_ENABLE_INBOUND`.
-  Outbound reciprocal serving is outside the inbound admission/coordinator budgets.
-- `OUTPACE_ENABLE_INBOUND` (default: on) - inbound peer serving (S2) gate. On by default,
-  intentionally matching the Acestream engine's out-of-the-box behavior: a full P2P participant
-  that binds its peer port (`OUTPACE_PEER_LISTEN`), accepts inbound peers, seeds, and
-  self-announces to trackers + DHT. Only the HTTP API (`OUTPACE_BIND`) stays on localhost by
-  default; the exposed surface is the peer port, as with Acestream. Set
-  `OUTPACE_ENABLE_INBOUND=0` for a pure-leecher deployment (no inbound listener, no seeder
-  self-announce).
-- `OUTPACE_ENABLE_PORT_MAPPING` - best-effort UPnP/NAT-PMP mapping for the inbound TCP peer
-  listener, default off. Use only when the process owns the host/LAN-facing network address;
-  normal bridge-mode containers should use a manual router-to-Docker-host TCP forward.
-- `OUTPACE_PORT_MAP_BACKEND` - `auto`, `upnp`, `natpmp`, or `none`; default `auto`.
-- `OUTPACE_PORT_MAP_EXTERNAL_PORT` - optional external TCP port requested from the gateway.
-- `OUTPACE_ACE_COMPAT` - enables the supported Ace HTTP subset, default off. Accepts
-  exactly `1`, `true`, `0`, or `false`. A present value takes precedence over the legacy
-  alias, including `0`/`false`; an empty, malformed, or non-Unicode selected value fails
-  startup. Set `0` to explicitly disable compatibility routes.
-- `OUTPACE_EXPERIMENTAL_ACE_COMPAT` - deprecated fallback, parsed only when
-  `OUTPACE_ACE_COMPAT` is unset, with the same strict boolean rules. Rename it to
-  `OUTPACE_ACE_COMPAT` when migrating; an unused invalid alias is ignored.
-- `OUTPACE_ACE_PEERS` - comma-separated bootstrap peer list for the live path.
-- `OUTPACE_TRACKERS` - comma-separated `scheme://…` (typically `udp://host:port/announce`)
-  tracker URLs minted into fresh broadcast descriptors for every producer path. Self-announce
-  uses that stored list for both keys on resume; process changes affect future identities only,
-  and empty stored lists remain empty.
-  When set (non-empty after trimming) it fully replaces the built-in public default
-  (`udp://t1.torrentstream.org:2710/announce`); unset leaves that default in place. Entries with
-  no `scheme://` prefix (or longer than 256 bytes) are dropped with a warning, and the list is
-  clamped to 64 entries. Note outpace only **self-announces** to lowercase `udp://` trackers;
-  entries with any other scheme are kept in the minted descriptor for other clients but warned
-  about, since outpace itself never announces there. Use this to point a broadcast at a
-  private/local tracker (announcing to a private-address tracker also requires the non-global
-  tracker allowance, tracked separately).
-- `OUTPACE_TRACKER_ALLOW_NON_GLOBAL` - set to `1` to allow announcing to trackers that resolve
-  to non-globally-routable addresses (private/LAN/loopback/link-local/multicast). Default deny;
-  the SSRF guard on tracker destinations stays closed for normal use. Opt in only for controlled
-  self-hosted or offline/test swarms on a trusted network. Scoped to tracker traffic.
-- `OUTPACE_ALLOW_NON_GLOBAL_TRANSPORT` - set to `1` to allow fetching a transport descriptor
-  file from a private/LAN/loopback host. Default deny; this relaxes the SSRF guard on the
-  transport-file fetch **specifically** (not peer or tracker traffic), and even when enabled it
-  still blocks link-local (e.g. the `169.254.169.254` cloud-metadata endpoint), unspecified,
-  multicast, broadcast, and documentation ranges. Opt in only for controlled self-hosted / LAN
-  swarms. If that transport file also points at a private *tracker*, announcing to it
-  additionally needs `OUTPACE_TRACKER_ALLOW_NON_GLOBAL`.
-
-These two `*_ALLOW_NON_GLOBAL*` knobs enable on the exact string `1` only (unlike the general
-boolean gates below, `true` does **not** enable them).
-
-Boolean gates accept exactly `1`, `true`, `0`, or `false`; other values are configuration errors
-rather than silently disabling a feature.
-
-Inbound admission grants no bandwidth/equal-share or class reservation guarantee; metadata-only
-clients can fill a stream's allowance. DELETE removes registry/producer ownership, while existing
-connections retain data and coordinator Arcs; their old coordinators stop receiving registry
-rotations. Aborting only the listener leaves detached handlers running. The serve loop's 250 ms
-polling can cancel reads and their inner timeouts, so those per-operation timeouts do not establish
-a whole-session idle deadline. See [shared seeding](docs/protocol/shared-seeding.md) for the
-admission, coordination and lifetime boundaries.
-
-The disk cache is **ephemeral**: a dedicated cache directory is cleared when a store is created and
-never reloaded across restarts (live piece data goes stale), which also avoids serving
-evicted-stale pieces. Disk I/O is currently synchronous. The first disk-cache start writes a
-`.outpace-cache` sentinel so later wipes can distinguish a dedicated cache from an accidental
-operator path. An existing non-empty cache without that regular sentinel file fails startup
-instead of being deleted; use an empty directory or create the file only after verifying that
-all existing contents may be deleted.
-
-Disk mode never silently converts `OUTPACE_SEED_STORE_BYTES` into an equal per-stream RAM
-allocation. An invalid/unwritable cache root fails daemon startup. If a new per-stream directory
-cannot be created later (for example after a permission change), outpace logs an escalating
-`disk store creation failure #N` error and keeps playback running with **zero piece retention** for
-that stream: no memory cache fallback is allocated, and reciprocal/inbound seeding has no retained
-pieces to serve. This favors the operator's RAM bound over transient seeding capacity.
-
-In disk mode each served stream keeps its pieces under
-`<OUTPACE_CACHE_DIR>/<infohash_hex>-<generation>` (a process-unique suffix per store instance).
-The directory is removed automatically when the stream is torn down (leech consumer disconnects,
-broadcast `DELETE`, or process exit), and a dedicated cache root is wiped on startup only if it
-is empty or contains `.outpace-cache`, so no per-stream directories accumulate.
-
-## Project Docs
-
-Start with these durable docs instead of a session resume file:
-
-- `docs/superpowers/specs/2026-06-28-acestream-engine-reimplementation-design.md`
-  - original architecture and scope.
-- `docs/protocol/wire-protocol.md` - consolidated peer-wire protocol notes.
-- `docs/protocol/transport-file.md` - transport container and infohash math.
-- `docs/protocol/notes/` - chronological reverse-engineering and live validation
-  notes.
-- [`docs/testing/interop-swarm.md`](docs/testing/interop-swarm.md) - the `swarmtest`
-  engine<->outpace interop harness (on-demand, local-only; needs docker + the
-  proprietary engine, so it is NOT run in CI).
-- [`docs/deployment-lxc-warp.md`](docs/deployment-lxc-warp.md) - LXC guest behind Cloudflare
-  WARP, `edge` auto-deploy, and the inbound-peer workaround (scripts in `tools/deploy/lxc/`).
-- `docs/superpowers/plans/` and `docs/superpowers/specs/` - implementation plans
-  and design specs retained as historical project records.
-
-The issue tracker is the canonical backlog:
-
-- #1 live robustness validation;
-- #2 PEX advertised-window peer ranking;
-- #3 broadcast persistence and ingest-resume continuity;
-- #4 inbound seeding lifecycle and policy;
-- #5 disk-backed piece cache;
-- #6 native CLI/API polish;
-- #7 SRT ingest;
-- #8 removal of the old resume workflow.
-
-## Operational Notes
-
-- Cloudflare WARP breaks P2P swarm testing by interfering with UDP/inbound paths.
-  Keep it off for live swarm validation. The Spain network itself has worked once
-  WARP is disabled.
-- A known-good live content id for smoke tests is `cid1` in the gitignored
-  `acestream-ids.txt` registry (see AGENTS.md); resolve it to the current
-  infohash when needed because live infohashes rotate.
-- `status=prebuf, peers=0` forever usually means a dead live channel. The old promo
-  transport id `685e...6067` is dead and should not be used as proof.
-- The official closed engine sandbox, when present, is started with:
-
-```bash
-docker compose -f re/sandbox/docker-compose.yml up -d acestream
-```
-
-It exposes the engine HTTP API on `127.0.0.1:6878` and is intended for controlled
-capture/interop work, not for runtime use by outpace.
-
-## Scope Boundaries
-
-outpace targets public, unencrypted Acestream swarms. Premium/encrypted content,
-Android/player apps, and a full clone of the closed engine HTTP API are out of
-scope unless a specific issue narrows that work.
-
-## License
-
-outpace is licensed under `AGPL-3.0-or-later`. See `LICENSE`.
+Tests are offline by default; real swarm tests require an explicit, bounded
+operator run. See [development](docs/development.md),
+[repository maintenance](docs/repository-maintenance.md), and
+[AGENTS.md](AGENTS.md) before contributing. Keep real content IDs, infohashes,
+channel names, private captures and credentials out of commits and issue reports.
+
+Binary packages cover seven platform targets; the public container covers
+Linux amd64, arm64 and arm/v7. Build availability is not a claim that every OS
+version, device, source or decoder was tested. The installation guide states
+platform prerequisites and limitations.
+
+## License, acknowledgements and matching source
+
+Thanks to the original [Outpace project](https://github.com/jamezrin/outpace) and
+its contributors. See [AUTHORS.md](AUTHORS.md), [NOTICE](NOTICE) and
+[LICENSE](LICENSE) for attribution and the retained AGPL-3.0-or-later terms.
+
+Every build embeds its workspace source. The running service exposes `/source`,
+`/source.json` and `/source.tar.gz`; `outpace source` also exports it offline.
+Published releases pair each binary with a complete source archive containing
+locked dependency sources, notices and rebuild instructions. Containers preserve
+that binary/source pairing. A modified build needs its own matching source
+offer; linking to an unrelated release is insufficient.
+
+Keep source access reachable through integrations and reverse proxies. Read
+[licensing and source distribution](docs/licensing.md) for the packaging workflow,
+modified builds and the limits of reproducibility claims.

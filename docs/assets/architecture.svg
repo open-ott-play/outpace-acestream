@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="820" viewBox="0 0 1120 820" role="img" aria-labelledby="title desc">
+  <title id="title">Outpace AceStream live media architecture</title>
+  <desc id="desc">Catalog descriptors and peer discovery feed the Outpace Rust process. It validates descriptors, schedules peer requests, reassembles media and serves native MPEG-TS or HLS to a player, optionally through hls-proxy. Accepted complete pieces can be reseeded. The sliding live HLS window is not a historical archive.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#132c43"/><stop offset="1" stop-color="#091320"/></linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#6ad9ed"/><stop offset="1" stop-color="#89e5b0"/></linearGradient>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M1 1L8 5L1 9" fill="none" stroke="#6ad9ed" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></marker>
+  </defs>
+  <rect x="1" y="1" width="1118" height="818" rx="24" fill="url(#background)" stroke="#304860"/>
+  <path d="M25 2H1095" stroke="url(#accent)" stroke-width="3"/>
+  <g font-family="Arial, Helvetica, sans-serif">
+<text x="44" y="49" fill="#6ad9ed" font-size="14" font-weight="700">SYSTEM MAP</text>
+<text x="44" y="95" fill="#f0f6ff" font-size="34" font-weight="700">From public peers to your player</text>
+<text x="44" y="130" fill="#b4c5d8" font-size="19" font-weight="400">The engine owns acquisition and delivery. Your player owns presentation.</text>
+<rect x="40" y="170" width="238" height="485" rx="16" fill="#13253b" stroke="#304860"/>
+<text x="61" y="205" fill="#6ad9ed" font-size="13" font-weight="700">PUBLIC NETWORK</text>
+<text x="61" y="252" fill="#f0f6ff" font-size="20" font-weight="700">Catalog + transport</text>
+<text x="61" y="282" fill="#b4c5d8" font-size="18" font-weight="400">Descriptor, geometry,</text>
+<text x="61" y="309" fill="#b4c5d8" font-size="18" font-weight="400">trackers and source key</text>
+<path d="M61 325H257" stroke="#304860"/>
+<text x="61" y="367" fill="#f0f6ff" font-size="20" font-weight="700">Peer discovery</text>
+<text x="61" y="397" fill="#b4c5d8" font-size="18" font-weight="400">UDP / HTTP(S) trackers</text>
+<text x="61" y="424" fill="#b4c5d8" font-size="18" font-weight="400">DHT peer lookup</text>
+<path d="M61 440H257" stroke="#304860"/>
+<text x="61" y="482" fill="#f0f6ff" font-size="20" font-weight="700">Public live peers</text>
+<text x="61" y="512" fill="#b4c5d8" font-size="18" font-weight="400">Media pieces in</text>
+<text x="61" y="539" fill="#b4c5d8" font-size="18" font-weight="400">Verified pieces out</text>
+<text x="61" y="617" fill="#b4c5d8" font-size="14" font-weight="400">Public, unencrypted sources</text>
+<rect x="324" y="170" width="466" height="485" rx="16" fill="#102b3b" stroke="#477086"/>
+<text x="346" y="205" fill="#89e5b0" font-size="13" font-weight="700">OUTPACE RUST PROCESS</text>
+<rect x="342" y="229" width="430" height="80" rx="11" fill="#182e47" stroke="#355267"/>
+<text x="358" y="258" fill="#89e5b0" font-size="14" font-weight="700">01</text>
+<text x="393" y="259" fill="#f0f6ff" font-size="20" font-weight="700">Resolve and validate</text>
+<text x="393" y="286" fill="#b4c5d8" font-size="16" font-weight="400">Keep identifiers and descriptors consistent.</text>
+<rect x="342" y="329" width="430" height="80" rx="11" fill="#182e47" stroke="#355267"/>
+<text x="358" y="358" fill="#89e5b0" font-size="14" font-weight="700">02</text>
+<text x="393" y="359" fill="#f0f6ff" font-size="20" font-weight="700">Schedule peer requests</text>
+<text x="393" y="386" fill="#b4c5d8" font-size="16" font-weight="400">Bound work, retries and per-peer windows.</text>
+<rect x="342" y="429" width="430" height="80" rx="11" fill="#182e47" stroke="#355267"/>
+<text x="358" y="458" fill="#89e5b0" font-size="14" font-weight="700">03</text>
+<text x="393" y="459" fill="#f0f6ff" font-size="20" font-weight="700">Reassemble accepted media</text>
+<text x="393" y="486" fill="#b4c5d8" font-size="16" font-weight="400">Track byte coverage and continuity.</text>
+<rect x="342" y="529" width="430" height="80" rx="11" fill="#182e47" stroke="#355267"/>
+<text x="358" y="558" fill="#89e5b0" font-size="14" font-weight="700">04</text>
+<text x="393" y="559" fill="#f0f6ff" font-size="20" font-weight="700">Serve MPEG-TS or live HLS</text>
+<text x="393" y="586" fill="#b4c5d8" font-size="16" font-weight="400">Apply readiness and retention limits.</text>
+<path d="M557 311V325" fill="none" stroke="#6ad9ed" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M557 411V425" fill="none" stroke="#6ad9ed" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M557 511V525" fill="none" stroke="#6ad9ed" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M278 269H340" fill="none" stroke="#6ad9ed" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M278 385H304V369H340" fill="none" stroke="#6ad9ed" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M278 499H300V469H340" fill="none" stroke="#6ad9ed" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M342 488H313V553H280" fill="none" stroke="#6ad9ed" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)" stroke-dasharray="5 6"/>
+<rect x="836" y="170" width="244" height="485" rx="16" fill="#13253b" stroke="#304860"/>
+<text x="858" y="205" fill="#6ad9ed" font-size="13" font-weight="700">YOUR INTEGRATION</text>
+<text x="858" y="252" fill="#f0f6ff" font-size="20" font-weight="700">Native HTTP API</text>
+<text x="858" y="282" fill="#b4c5d8" font-size="18" font-weight="400">TS stream or HLS</text>
+<text x="858" y="309" fill="#b4c5d8" font-size="18" font-weight="400">Status + source offer</text>
+<path d="M958 326V359" fill="none" stroke="#6ad9ed" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="854" y="375" width="208" height="84" rx="12" fill="#193448" stroke="#3c6079"/>
+<text x="958" y="405" fill="#f0f6ff" font-size="21" font-weight="700" text-anchor="middle">hls-proxy</text>
+<text x="958" y="436" fill="#b4c5d8" font-size="15" font-weight="400" text-anchor="middle">Optional external layer</text>
+<path d="M958 471V511" fill="none" stroke="#6ad9ed" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="858" y="551" fill="#f0f6ff" font-size="20" font-weight="700">Player or application</text>
+<text x="858" y="582" fill="#b4c5d8" font-size="17" font-weight="400">VLC · TV · web client</text>
+<text x="858" y="609" fill="#b4c5d8" font-size="17" font-weight="400">Codec support still matters</text>
+<path d="M790 569H812V277H834" fill="none" stroke="#6ad9ed" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="40" y="694" width="1040" height="88" rx="16" fill="#172e39" stroke="#46605d"/>
+<text x="61" y="730" fill="#89e5b0" font-size="14" font-weight="700">LIVE DELIVERY, WITH EXPLICIT LIMITS</text>
+<text x="61" y="760" fill="#f0f6ff" font-size="18" font-weight="400">A sliding HLS window serves the current stream. Historical seeking and durable DVR are planned.</text>
+</g></svg>

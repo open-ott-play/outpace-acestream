@@ -7,15 +7,20 @@ pub const ARCHIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/correspondi
 pub const METADATA: &str = include_str!(concat!(env!("OUT_DIR"), "/source.json"));
 const LICENSE: &str = include_str!("../../../LICENSE");
 
-pub async fn landing() -> Html<&'static str> {
+pub async fn landing() -> Html<String> {
+    let metadata: serde_json::Value = serde_json::from_str(METADATA).expect("build metadata");
+    let complete = match metadata["complete_source_url"].as_str() {
+        Some(url) => format!("<h2>Complete corresponding source</h2><p><a href=\"{url}\">Download the complete source for this release</a>, including all locked Rust dependencies, their original notices, and offline rebuild instructions.</p>"),
+        None => "<h2>Local build</h2><p>This local build embeds its workspace source. Rust registry dependency sources are separate; Cargo.lock fixes their versions and checksums. Before redistributing this build or exposing a modified service to others, use tools/source/complete_source.py to publish a matching complete source bundle with those dependencies.</p>".into(),
+    };
     Html(concat!(
         "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">",
         "<meta name=\"viewport\" content=\"width=device-width\"><title>Outpace AceStream — source</title>",
         "<main><h1>Outpace AceStream</h1><p>Version ", env!("CARGO_PKG_VERSION"),
         "; independent development of the Outpace Rust AceStream engine.</p>",
-        "<h2>Get the source for this running build</h2>",
+        "__COMPLETE_SOURCE__<h2>Workspace source for this running build</h2>",
         "<p>This program is free software under the <a href=\"/license\">GNU Affero General Public License, version 3 or later</a>.</p>",
-        "<p><a href=\"/source.tar.gz\" download>Download the corresponding source (tar.gz)</a> free of charge. ",
+        "<p><a href=\"/source.tar.gz\" download>Download the embedded workspace source (tar.gz)</a> free of charge. ",
         "The archive is embedded in this executable at build time and includes source, Cargo.lock, build scripts, license and notices.</p>",
         "<p><a href=\"/source.json\">Build identity and source SHA-256</a>. The Git revision identifies the base; ",
         "the source checksum identifies the actual packaged tree, including tracked modifications.</p>",
@@ -23,7 +28,7 @@ pub async fn landing() -> Html<&'static str> {
         "<a href=\"https://github.com/jamezrin/outpace\">Original Outpace project</a></p>",
         "<p>Copyright belongs to the Outpace contributors and subsequent Outpace AceStream contributors. ",
         "Provided without warranty; see the license for details.</p></main></html>"
-    ))
+    ).replace("__COMPLETE_SOURCE__", &complete))
 }
 
 pub async fn archive() -> Response {

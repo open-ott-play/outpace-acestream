@@ -31,8 +31,9 @@ def prepare(tag: str, assets: Path, output: Path, revision: str) -> None:
         raise ValueError("Expected a stable release tag vX.Y.Z")
     version = tag[1:]
     expected = {f"outpace-{version}-{target}.{ext}" for target, ext in TARGETS.items()}
+    expected |= {f"outpace-source-{version}-{target}-{revision}.tar.gz" for target in TARGETS}
     if {p.name for p in assets.iterdir()} != expected | {"SHA256SUMS"}:
-        raise ValueError("Release must contain exactly all seven expected archives and SHA256SUMS")
+        raise ValueError("Release must contain exactly all seven binary and seven source archives and SHA256SUMS")
     checksums = {}
     for line in (assets / "SHA256SUMS").read_text().splitlines():
         match = re.fullmatch(r"([0-9a-f]{64})  (outpace-[^/\\\s]+)", line)
@@ -40,7 +41,7 @@ def prepare(tag: str, assets: Path, output: Path, revision: str) -> None:
             raise ValueError("Invalid or duplicate checksum entry")
         checksums[match[2]] = match[1]
     if set(checksums) != expected:
-        raise ValueError("Checksums must cover exactly all seven expected archives")
+        raise ValueError("Checksums must cover exactly all seven binary and seven source archives")
     for name, digest in checksums.items():
         archive = assets / name
         if archive.is_symlink() or not archive.is_file():
@@ -55,7 +56,7 @@ def prepare(tag: str, assets: Path, output: Path, revision: str) -> None:
     for target, extension in TARGETS.items():
         path = assets / f"outpace-{version}-{target}.{extension}"
         prefix = f"outpace-{version}-{target}/"
-        required = ["corresponding-source.tar.gz", "source.json", "LICENSE", "NOTICE", "AUTHORS.md"]
+        required = ["corresponding-source.tar.gz", "source.json", "LICENSE", "NOTICE", "AUTHORS.md", "THIRD_PARTY_NOTICES.txt"]
         values = {}
         if extension == "zip":
             with zipfile.ZipFile(path) as archive:
@@ -79,7 +80,18 @@ def prepare(tag: str, assets: Path, output: Path, revision: str) -> None:
                 or info.get("tree_state") != "clean"
                 or hashlib.sha256(values["corresponding-source.tar.gz"]).hexdigest() != info.get("source_sha256")):
             raise ValueError("Release source identity or checksum mismatch")
-        for name in ["LICENSE", "NOTICE", "AUTHORS.md"]:
+        complete_name = f"outpace-source-{version}-{target}-{revision}.tar.gz"
+        complete_url = f"https://github.com/open-ott-play/outpace-acestream/releases/download/{tag}/{complete_name}"
+        if info.get("complete_source_url") != complete_url:
+            raise ValueError("Release binary does not offer its exact complete source asset")
+        with tarfile.open(assets / complete_name, "r:gz") as complete:
+            for filename, expected_bytes in [("source.json", values["source.json"]), ("engine-source.tar.gz", values["corresponding-source.tar.gz"]), ("THIRD_PARTY_NOTICES.txt", values["THIRD_PARTY_NOTICES.txt"])]:
+                matches = [entry for entry in complete.getmembers() if entry.name == "outpace-acestream-complete/" + filename]
+                if len(matches) != 1 or not matches[0].isfile() or complete.extractfile(matches[0]).read() != expected_bytes:
+                    raise ValueError("Complete source asset does not match binary package")
+            if not any(entry.name.startswith("outpace-acestream-complete/vendor/") for entry in complete.getmembers()):
+                raise ValueError("Complete source asset lacks registry dependencies")
+        for name in ["LICENSE", "NOTICE", "AUTHORS.md", "THIRD_PARTY_NOTICES.txt"]:
             if name in notices and notices[name] != values[name]:
                 raise ValueError("Legal notices differ across release targets")
             notices[name] = values[name]

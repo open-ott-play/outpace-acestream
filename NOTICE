@@ -19,15 +19,21 @@ an embedded corresponding-source offer, and downstream reliability work. Git
 history records individual modifications and their dates. Runtime command names
 and OUTPACE_* configuration variables are retained for compatibility.
 
-Each distributed engine binary embeds its own source archive. Run
+Each distributed engine binary embeds its own workspace source archive. Run
     outpace source > source.tar.gz
 or download /source.tar.gz from its HTTP server. /source and /source.json provide
 license/source links and build identity. A Git base revision alone does not
 identify a modified build; use the archive's SHA-256 and SOURCE-MANIFEST.json.
 
+Official release binaries also link to a complete source asset identified by
+version, target and Git revision. It contains the exact embedded workspace
+archive, every locked Rust registry dependency, original third-party notices,
+and offline rebuild instructions. THIRD_PARTY_NOTICES.txt accompanies the binary
+and the published runtime image. Local modified builds require their own matching
+complete source bundle; they do not advertise an unrelated release asset.
+
 Third-party dependencies retain their respective licenses. Cargo.lock records
-exact Rust dependency versions and registry checksums; dependency sources and
-license notices are supplied by their upstream packages. An optional separately
+exact Rust dependency versions and registry checksums. An optional separately
 installed FFmpeg has its own build-dependent licensing terms.
 
 This program is distributed WITHOUT ANY WARRANTY, including the implied

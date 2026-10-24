@@ -106,6 +106,8 @@ jobs:
         run: cargo test --locked -p ace-engine --lib --target "${{ matrix.target }}" executable_resolution_tests
 
       - name: Build release binary
+        env:
+          OUTPACE_RELEASE_BUILD: "1"
         shell: bash
         run: |
           cargo build --locked --release -p ace-engine --bin "$BIN_NAME" --target "${{ matrix.target }}" --message-format=json-render-diagnostics > cargo-build.json
@@ -127,6 +129,8 @@ jobs:
           cp "$binary" "$package_dir/"
           cp LICENSE NOTICE AUTHORS.md README.md "$package_dir/"
           python3 tools/release/package_source.py cargo-build.json "$package_dir"
+          revision="$(git rev-parse HEAD)"
+          python3 tools/source/complete_source.py "$package_dir" "dist/outpace-source-${version}-${target}-${revision}.tar.gz"
 
           if [[ "${{ matrix.archive }}" == "zip" ]]; then
             powershell -NoProfile -Command "Compress-Archive -Path '${package_dir}' -DestinationPath 'dist/${BIN_NAME}-${version}-${target}.zip' -Force"
@@ -138,7 +142,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
-          path: dist/${{ env.BIN_NAME }}-${{ needs.release-metadata.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
+          path: |
+            dist/${{ env.BIN_NAME }}-${{ needs.release-metadata.outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
+            dist/outpace-source-${{ needs.release-metadata.outputs.version }}-${{ matrix.target }}-*.tar.gz
           if-no-files-found: error
           compression-level: 0
 

@@ -2,3 +2,4 @@
 LICENSE text eol=lf
 NOTICE text eol=lf
 AUTHORS.md text eol=lf
+tools/source/licenses/*.txt text eol=lf

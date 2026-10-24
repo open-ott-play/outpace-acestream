@@ -32,6 +32,19 @@ fn main() {
         .output()
         .expect("cannot identify Rust compiler");
     assert!(compiler.status.success(), "cannot identify Rust compiler");
+    println!("cargo:rerun-if-env-changed=OUTPACE_RELEASE_BUILD");
+    let release_build = std::env::var("OUTPACE_RELEASE_BUILD").as_deref() == Ok("1");
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap();
+    let target = std::env::var("TARGET").unwrap();
+    let complete_source_url = if release_build {
+        assert_eq!(
+            bundle.tree_state, "clean",
+            "release source must come from a clean tracked tree"
+        );
+        Some(format!("https://github.com/open-ott-play/outpace-acestream/releases/download/v{version}/outpace-source-{version}-{target}-{}.tar.gz", bundle.revision))
+    } else {
+        None
+    };
     let metadata = serde_json::json!({
         "project": "Outpace AceStream",
         "repository": "https://github.com/open-ott-play/outpace-acestream",
@@ -43,6 +56,7 @@ fn main() {
         "profile": std::env::var("PROFILE").unwrap(),
         "rustc": String::from_utf8(compiler.stdout).unwrap().trim(),
         "source_url": "/source.tar.gz",
+        "complete_source_url": complete_source_url,
         "license": "AGPL-3.0-or-later",
     });
     std::fs::write(output.join("corresponding-source.tar.gz"), bundle.bytes).unwrap();

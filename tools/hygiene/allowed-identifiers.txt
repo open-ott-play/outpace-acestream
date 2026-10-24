@@ -42,3 +42,9 @@ e13ca993e8ccb9ba9847cc330696e02839f328f7  jemalloc git-describe hash (tikv-jemal
 fbda7c3c07e9526fbbf26b3c383c81de798c7ff0  signature/checksum of synthetic catalog fixture response.xml
 6f6c6a3de5d65944cf8328f0ae2059a200d99192  signature/checksum of synthetic catalog fixture response.xml
 f746d294bbe937dda3df6205e340700d81334f9f  signature/checksum of synthetic catalog fixture substituted.xml
+
+# Upstream dependency revisions for supplemental license provenance
+296cc168bb0805fe64b9378d0cc76a833e903ce0  upstream dependency Git revision used for crab_nat-0.8.1 license provenance
+5ae9458a4ec44c5318f37ddc7569c1d4ae8a69e7  upstream dependency Git revision used for jni-0.22.4 license provenance
+64d77b7a5f119d7b55b4e2c169a4668067ff59e6  upstream dependency Git revision used for jni-sys-macros-0.4.1 license provenance
+252e25161a91af476cbea620e29d277592d27ec7  upstream dependency Git revision used for rustls-platform-verifier-android-0.2.0 license provenance

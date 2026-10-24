@@ -48,10 +48,10 @@ Copy [`compose.yml`](../tools/deploy/lxc/compose.yml) to `/opt/outpace/compose.y
 `/opt/outpace/.env`:
 
 ```dotenv
-OUTPACE_IMAGE=ghcr.io/open-ott-play/outpace-acestream:edge
+OUTPACE_IMAGE=ghcr.io/open-ott-play/outpace-acestream:0.8.1
 ```
 
-Use a pinned release tag instead of `edge` if you do not want to follow `main`. The file uses
+Use an accepted immutable release digest in production. The file uses
 `network_mode: host`, so the listeners bind the guest's own addresses and WARP applies to the
 daemon directly. The router, not Docker, publishes the peer port.
 
@@ -68,12 +68,12 @@ For boolean validation and legacy precedence, see the
 the announced port, and the router's **external** port must therefore be identical; remapping
 only one side advertises an endpoint nobody can reach.
 
-## Follow `main` automatically
+## Poll an explicitly selected release
 
-Every push to `main` publishes `ghcr.io/open-ott-play/outpace-acestream:edge` (see
-[`edge.yml`](../.github/workflows/edge.yml)). A guest cannot receive a GitHub webhook unless it
-is publicly reachable, and a push webhook fires before the image exists, so the guest polls the
-registry instead. Install the pair from `tools/deploy/lxc/`:
+Automatic edge images are disabled in this derivative. The helper can poll the
+image selected by `OUTPACE_IMAGE`; update that value deliberately after accepting
+a new stable release. A pinned digest stays unchanged until that configuration is
+updated. Install the pair from `tools/deploy/lxc/`:
 
 ```bash
 install -m 755 outpace-deploy /usr/local/sbin/outpace-deploy

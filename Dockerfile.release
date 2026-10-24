@@ -22,7 +22,7 @@ RUN apt-get update \
     && chown outpace:outpace /var/lib/outpace \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=binary /outpace /usr/local/bin/outpace
-COPY LICENSE NOTICE AUTHORS.md /usr/share/doc/outpace/
+COPY LICENSE NOTICE AUTHORS.md THIRD_PARTY_NOTICES.txt /usr/share/doc/outpace/
 ENV OUTPACE_BIND=0.0.0.0:6878 \
     OUTPACE_RTMP_BIND=0.0.0.0:1935 \
     OUTPACE_DATA_DIR=/var/lib/outpace

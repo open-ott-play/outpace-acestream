@@ -20,13 +20,34 @@ names, and `OUTPACE_*` environment variables remain compatible. This is an engin
 for AceStream sources, with HTTP/HLS output for players such as hls-proxy; it is
 not itself a player and is not an official Ace Stream product.
 
-Every build embeds a corresponding-source archive containing the actual tracked
+Every build embeds a workspace-source archive containing the actual tracked
 source bytes, Cargo.lock, build scripts, tests, documentation and notices. The
 running daemon offers it prominently at `/` and `/source`; `/source.tar.gz` serves
 the archive and `/source.json` reports its SHA-256, base Git revision and whether
 the tree was modified. An HTTP `Link` header advertises the offer on API responses.
 The same archive is available offline with `outpace source > source.tar.gz`.
-No runtime source checkout, network lookup or writable filesystem is required.
+No runtime source checkout or writable filesystem is required for that archive.
+
+Official releases additionally offer a **complete source asset** containing that
+exact workspace archive, all Cargo.lock registry sources from `cargo vendor`,
+original third-party notices, and offline rebuild instructions. Each platform's
+asset name includes its version, target and full Git revision. Release binaries
+link directly to it from `/source` and record the URL in `/source.json`. Container
+publication verifies the source and binary packages refer to the same clean
+revision, target and workspace digest before publishing an image. The vendored
+sources stay outside the executable.
+
+A local or modified build does not claim that a published release asset matches
+it. Before distributing such a build or exposing it to other users, generate and
+host its matching complete bundle. `tools/release/package_source.py` takes the
+`--message-format=json-render-diagnostics` output of the build and copies its
+workspace archive and metadata to a package directory; then run
+`python3 tools/source/complete_source.py PACKAGE COMPLETE.tar.gz`. This verifies
+the build's lockfile and every vendored file before packaging. The resulting
+`THIRD_PARTY_NOTICES.txt` belongs with the binary; make the complete bundle's URL
+available alongside the service source offer. Do not set `OUTPACE_RELEASE_BUILD`
+for private or modified builds: that flag is reserved for the stable release
+workflow and refuses a modified tracked tree.
 
 Keep these endpoints reachable when putting a modified engine behind a proxy,
 and provide the source link to users of an integrated player. A separately
@@ -43,13 +64,17 @@ state, credentials, the private identifier registry and Git metadata are never
 part of the archive. Do not stage secrets: packaging deliberately publishes the
 tracked project, subject to checks against reserved private paths and unsafe links.
 
-To rebuild a downloaded source archive, extract it, enter `outpace-acestream`,
+For a complete release asset, follow its `REBUILD.md`; dependencies can be resolved
+without contacting a registry. To rebuild the smaller embedded workspace archive,
+extract it, enter `outpace-acestream`,
 and run the same Cargo command. The included `SOURCE-MANIFEST.json` supplies a
 hashed inventory when Git is absent. Cargo fetches the exact dependency versions
 and checksums in Cargo.lock from their public registries; native system build
 requirements are documented by the Dockerfiles and CI workflows. The archive
 identifies source inputs; it is not a claim of bit-for-bit binary reproducibility
-across different compilers, linkers, flags and hosts.
+across different compilers, linkers, flags and hosts. GitHub's automatically generated
+repository ZIP has no build inventory: use a Git clone or the packaged source
+archives above.
 
 For a container built from source, first prepare an isolated context containing
 only indexed project files (Python 3 is required for this preparation step):
@@ -60,8 +85,8 @@ docker build -t outpace-acestream:local /tmp/outpace-source-context
 ```
 
 The script refuses to overwrite an existing directory. CI uses the same process.
-Release archives include this source archive as well as the binary, license and
-notices. Published runtime images carry the exact release binary with its embedded
+Binary release archives include the embedded workspace archive, license and
+third-party notices; the complete source asset is published alongside each one. Published runtime images carry the exact release binary with its embedded
 source and identify the release revision through OCI labels.
 
 ## Status
@@ -74,7 +99,7 @@ The live byte path is built and proven against real public swarms:
 - the daemon can discover peers, connect, download live media, and serve it over
   the native API;
 - reciprocal upload, inbound seeding plumbing, signed broadcast origination,
-  HTTP raw ingest, managed HTTP(S) MPEG-TS sources, RTMP ingest, content-id metadata serving, and the three-command
+  HTTP raw ingest, managed HTTP(S) MPEG-TS sources, RTMP ingest, content-id metadata serving, and the
   CLI are implemented;
 - live-network tests remain ignored by default because they need the public swarm
   and a suitable network.
@@ -374,14 +399,14 @@ the Cargo version. The workflow:
 - builds Linux binaries for amd64, arm64, and ARMv7, plus macOS and Windows binaries for amd64
   and arm64;
 - uploads `tar.gz` archives for Unix targets and `zip` archives for Windows;
+- packages complete, checksum-verified registry sources and notices for each target;
 - generates one `SHA256SUMS` file for all archives;
 - creates a GitHub Release with generated release notes;
 - publishes `ghcr.io/open-ott-play/outpace-acestream:<version>` and `ghcr.io/open-ott-play/outpace-acestream:latest`.
 
-Pushes to `main` run `.github/workflows/edge.yml`, which publishes
-`ghcr.io/open-ott-play/outpace-acestream:edge` and `ghcr.io/open-ott-play/outpace-acestream:sha-<commit>` for
-`linux/amd64` only. `edge` moves with `main`. Keep production pinned to a
-release tag.
+Automatic edge image publication is disabled. Supported images come from the
+stable release workflow after the complete source assets have been published and
+verified. Pin production to an accepted release digest.
 
 ## Runtime Surfaces
 

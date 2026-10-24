@@ -24,8 +24,8 @@ class PrepareTests(unittest.TestCase):
             source = b"source archive fixture"
             values = {
                 "corresponding-source.tar.gz": source,
-                "source.json": json.dumps({"version": "0.3.0", "license": "AGPL-3.0-or-later", "project": "Outpace AceStream", "repository": "https://github.com/open-ott-play/outpace-acestream", "target": target, "base_revision": REVISION, "tree_state": "clean", "source_sha256": hashlib.sha256(source).hexdigest()}).encode(),
-                "LICENSE": b"license", "NOTICE": b"notice", "AUTHORS.md": b"authors",
+                "source.json": json.dumps({"version": "0.3.0", "license": "AGPL-3.0-or-later", "project": "Outpace AceStream", "repository": "https://github.com/open-ott-play/outpace-acestream", "target": target, "base_revision": REVISION, "tree_state": "clean", "complete_source_url": f"https://github.com/open-ott-play/outpace-acestream/releases/download/v0.3.0/outpace-source-0.3.0-{target}-{REVISION}.tar.gz", "source_sha256": hashlib.sha256(source).hexdigest()}).encode(),
+                "LICENSE": b"license", "NOTICE": b"notice", "AUTHORS.md": b"authors", "THIRD_PARTY_NOTICES.txt": b"third party notices",
             }
             if extension == "tar.gz":
                 with tarfile.open(archive, "w:gz") as tar:
@@ -42,6 +42,11 @@ class PrepareTests(unittest.TestCase):
                 with zipfile.ZipFile(archive, 'w') as target_zip:
                     for name, data in values.items():
                         target_zip.writestr(prefix + name, data)
+            with tarfile.open(root / f"outpace-source-0.3.0-{target}-{REVISION}.tar.gz", "w:gz") as complete:
+                for name, data in {"engine-source.tar.gz": source, "source.json": values["source.json"], "THIRD_PARTY_NOTICES.txt": values["THIRD_PARTY_NOTICES.txt"], "vendor/demo/lib.rs": b"// fixture"}.items():
+                    member = tarfile.TarInfo("outpace-acestream-complete/" + name)
+                    member.size = len(data)
+                    complete.addfile(member, io.BytesIO(data))
         self.checksums(root)
 
     def checksums(self, root):
@@ -117,7 +122,7 @@ class PrepareTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.fixture(root)
-            with self.assertRaisesRegex(ValueError, "source identity"):
+            with self.assertRaises(ValueError):
                 prepare.prepare("v0.3.0", root, root / "context", "0" * 40)
 
     def test_invalid_tag_rejected(self):

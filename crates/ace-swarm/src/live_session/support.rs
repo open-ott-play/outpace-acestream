@@ -38,12 +38,19 @@ pub(super) fn hex_preview(bytes: &[u8]) -> String {
 
 /// Read messages until the peer's extended handshake arrives; return its live `mi` window and
 /// the `yourip` public address it echoed to us (issue #22 — the swarm telling us how it sees us
-/// on this outbound connection; `None` when the peer sent no usable `yourip`).
+/// on this outbound connection; `None` when the peer sent no usable `yourip`). Preserve the
+/// latest choke state as well: an early Unchoke remains valid after the window arrives.
 pub(super) async fn read_peer_window(
     session: &mut PeerSession<TcpStream>,
-) -> Option<(WireLivePosition, Option<IpAddr>)> {
+) -> Option<(WireLivePosition, Option<IpAddr>, bool)> {
+    let mut unchoked = false;
     for _ in 0..32 {
         let msg = session.read_message().await.ok()?;
+        match &msg {
+            PeerMessage::Unchoke => unchoked = true,
+            PeerMessage::Choke => unchoked = false,
+            _ => {}
+        }
         if let PeerMessage::Extended { ext_id: 0, payload } = msg {
             let eh = ExtendedHandshake::parse(&payload).ok()?;
             let yourip = eh.yourip();
@@ -62,6 +69,7 @@ pub(super) async fn read_peer_window(
                     distance_from_source: get(b"distance_from_source"),
                 },
                 yourip,
+                unchoked,
             ));
         }
     }

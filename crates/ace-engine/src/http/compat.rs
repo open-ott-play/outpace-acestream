@@ -64,11 +64,21 @@ pub(super) async fn ace_getstream(
         playback_id: playback_id.clone(),
         token: token.clone(),
     };
-    let Some((session_key, expires_at, cancel)) = s.ace_sessions.playback(&playback_id, &token)
+    let Some((session_key, expires_at, mut cancel)) = s.ace_sessions.playback(&playback_id, &token)
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match s.manager.get_or_start(&network, &session_key).await {
+    // Stopping or expiring this viewer also cancels its pending acquisition, including
+    // time spent waiting for another same-source open. Other viewers retain their own work.
+    let opened = tokio::select! {
+        biased;
+        _ = cancel.changed() => return StatusCode::NOT_FOUND.into_response(),
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(expires_at)) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        opened = s.manager.get_or_start(&network, &session_key) => opened,
+    };
+    match opened {
         Ok(session) => {
             if !s
                 .ace_sessions
@@ -394,19 +404,30 @@ pub(super) async fn ace_playback(
     let Some(network) = ace_network(&s) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some((session_key, expires_at, cancel)) = s.ace_sessions.playback(&id, &token) else {
+    let Some((session_key, expires_at, mut cancel)) = s.ace_sessions.playback(&id, &token) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let opened = match s.ace_sessions.bound_session(&id, &token) {
-        Err(()) => return StatusCode::NOT_FOUND.into_response(),
-        Ok(Some(bound)) => {
-            let current = s.manager.get(&network, &session_key).await;
-            if !current.is_some_and(|current| Arc::ptr_eq(&current, &bound)) {
-                return StatusCode::NOT_FOUND.into_response();
+    let acquire = async {
+        match s.ace_sessions.bound_session(&id, &token) {
+            Err(()) => Err(ProviderError::NotFound),
+            Ok(Some(bound)) => {
+                let current = s.manager.get(&network, &session_key).await;
+                if current.is_some_and(|current| Arc::ptr_eq(&current, &bound)) {
+                    Ok(bound)
+                } else {
+                    Err(ProviderError::NotFound)
+                }
             }
-            Ok(bound)
+            Ok(None) => s.manager.get_or_start(&network, &session_key).await,
         }
-        Ok(None) => s.manager.get_or_start(&network, &session_key).await,
+    };
+    let opened = tokio::select! {
+        biased;
+        _ = cancel.changed() => return StatusCode::NOT_FOUND.into_response(),
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(expires_at)) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        opened = acquire => opened,
     };
     match opened {
         Ok(session) => {

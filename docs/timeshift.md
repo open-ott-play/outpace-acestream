@@ -93,6 +93,13 @@ All Ace compatibility responses, including errors and control results, carry
 `Cache-Control: no-store`. Preserve this policy in a proxy: caching a temporary
 404 or 503 can hide subsequent recovery or return stale playback state.
 
+Starting with beta.4, completed HLS segments release spare assembly-buffer
+capacity of at least 256 KiB before their storage is shared by live playback,
+history and the advertised-segment grace window. Smaller spare capacity stays
+accounted for. This improves retention within the same byte limit without
+changing media bytes, sequence numbers, expiry rules or the configured limits.
+Actual retained duration still depends on bitrate and access-point boundaries.
+
 A paused or slow viewer can fall outside retention. Show an explicit message
 and offer a new seek or return to live. Increasing the limit cannot recover
 media already pruned or media from before acquisition began. Retaining more

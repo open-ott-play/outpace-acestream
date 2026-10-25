@@ -57,6 +57,148 @@ fn v4(addr: std::net::SocketAddr) -> SocketAddrV4 {
         _ => unreachable!(),
     }
 }
+
+async fn connected_peer_choke_order(
+    before_window: Vec<PeerMessage>,
+    initially_unchoked: bool,
+    unchoke_after_interest: bool,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = v4(listener.local_addr().unwrap());
+    let auth = ace_wire::live_auth::LiveSourceAuth::generate();
+    let payload = packet_piece(0x66);
+    let mut signed = payload.clone();
+    signed.extend(auth.sign(&payload));
+    let (mut info, mut seed) = fixture(1);
+    info.piece_length = signed.len() as u64;
+    info.chunk_length = signed.len() as u64;
+    info.sig_len = auth.signature_len();
+    info.source_pubkey = auth.pubkey_der();
+    seed.prefetch_pieces = 0;
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut session = PeerSession::new(stream);
+        session.accept_handshake([0; 20], |_| true).await.unwrap();
+        for message in before_window {
+            session.send(&message).await.unwrap();
+        }
+        session
+            .send_extended_handshake(&OutgoingExtendedHandshake {
+                ace_metadata_version: 1,
+                ut_metadata_id: 2,
+                mi: Some(window(7, 7)),
+                node: NodeFields::default(),
+                peer_ip: None,
+                metadata_size: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            session.read_message().await.unwrap(),
+            PeerMessage::Extended { ext_id: 0, .. }
+        ));
+        assert_eq!(
+            session.read_message().await.unwrap(),
+            PeerMessage::Interested
+        );
+        if unchoke_after_interest {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), session.read_message())
+                    .await
+                    .is_err(),
+                "a peer that is still choked must receive no requests"
+            );
+            session.send(&PeerMessage::Unchoke).await.unwrap();
+        }
+        assert_eq!(session.read_message().await.unwrap(), chunk_request(7, 0));
+        session
+            .send(&build_piece(0, 7, 0, [0; 8], &signed))
+            .await
+            .unwrap();
+        while session.read_message().await.is_ok() {}
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let PeerConnectAttempt::Connected(upstream, _) = connect_upstream(addr, [0; 20]).await
+        else {
+            panic!("synthetic upstream must connect")
+        };
+        assert_eq!(upstream.unchoked, initially_unchoked);
+        let (tx, mut rx) = mpsc::channel(4);
+        tasks.spawn(async move {
+            let store = Arc::new(tokio::sync::Mutex::new(PieceStore::new(
+                info.piece_length,
+                info.chunk_length,
+                4096,
+            )));
+            // An existing cursor removes the unrelated first-window corroboration delay,
+            // so the still-choked assertion exercises an immediately eligible scheduler.
+            let mut continuity = Some(Continuity::fresh(&info, 7, 7, 0, seed.live_recovery).0);
+            follow_peer_pool(
+                vec![upstream],
+                &info,
+                &Identity::generate(),
+                1,
+                &tx,
+                &Arc::new(AtomicU64::new(0)),
+                &Arc::new(AtomicU64::new(0)),
+                &Arc::new(AtomicU32::new(0)),
+                &seed,
+                &store,
+                &mut continuity,
+                vec![],
+                vec![addr],
+                completed_discovery(|_| Box::pin(async { vec![] })),
+                &mut SessionCandidates::default(),
+                &Arc::new(AtomicU32::new(0)),
+                None,
+            )
+            .await;
+        });
+        let output = rx
+            .recv()
+            .await
+            .expect("choke ordering must permit live media");
+        // The TS synchronizer retains the final packet for its next-sync check.
+        assert_eq!(output.bytes.as_ref(), &payload[..564]);
+        drop(rx);
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+    })
+    .await
+    .expect("choke ordering must not delay output until an upstream timeout");
+}
+
+#[tokio::test]
+async fn live_peer_preserves_unchoke_before_window() {
+    connected_peer_choke_order(vec![PeerMessage::Unchoke], true, false).await;
+}
+
+#[tokio::test]
+async fn live_peer_preserves_latest_choke_before_window() {
+    connected_peer_choke_order(vec![PeerMessage::Unchoke, PeerMessage::Choke], false, true).await;
+}
+
+#[tokio::test]
+async fn live_peer_preserves_latest_unchoke_before_window() {
+    connected_peer_choke_order(
+        vec![
+            PeerMessage::Unchoke,
+            PeerMessage::Choke,
+            PeerMessage::Unchoke,
+        ],
+        true,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn live_peer_waits_for_normal_unchoke_after_window() {
+    connected_peer_choke_order(vec![], false, true).await;
+}
+
 async fn stale_then_source(max_active: usize, matching_window: bool) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let source_addr = v4(listener.local_addr().unwrap());
@@ -146,6 +288,7 @@ async fn stale_then_source(max_active: usize, matching_window: bool) {
                 session: PeerSession::new(client),
                 addr: relay_addr,
                 window: window(7, 8),
+                unchoked: false,
                 yourip: None,
             }],
             &info,
@@ -385,6 +528,7 @@ async fn single_peer_with_hint_or_head(
                 session: PeerSession::new(client),
                 addr,
                 window: window(7, 8),
+                unchoked: false,
                 yourip: None,
             }],
             &info,
@@ -562,6 +706,7 @@ async fn failed_candidate_writes_preserve_the_only_provisional_peer() {
             session: PeerSession::new(client),
             addr,
             window: window(7, 8),
+            unchoked: false,
             yourip: None,
         },
         7,
@@ -595,6 +740,7 @@ async fn failed_candidate_writes_preserve_the_only_provisional_peer() {
             session: PeerSession::new(client),
             addr: bad_addr,
             window: window(7, 8),
+            unchoked: false,
             yourip: None,
         },
         7,

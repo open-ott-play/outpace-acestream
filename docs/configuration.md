@@ -63,9 +63,10 @@ Environment variables parsed by the daemon include:
   The server intentionally waits before sending the first media so clients begin with more
   tolerance for swarm jitter. `0` disables startup prebuffering and preserves the previous
   immediate-release behavior.
-- `OUTPACE_PREBUFFER_BYTES` - hard byte ceiling for the startup queue, default `134217728`
-  (128 MiB). Reaching it releases the available media early instead of exceeding the reservoir
-  budget. Queue metadata and the rest of the daemon add memory overhead beyond this payload cap.
+- `OUTPACE_PREBUFFER_BYTES` - byte threshold for releasing the startup queue, default
+  `134217728` (128 MiB). The input chunk crossing this threshold is retained intact before
+  release, so queued payload can exceed the threshold by at most one input chunk. Queue
+  metadata, backing-allocation capacity and the rest of the daemon add memory overhead.
 - `OUTPACE_PREBUFFER_TIMEOUT_MS` - deadline after the first clean media byte for reaching the
   target duration, default `15000`. On expiry, outpace degrades gracefully by releasing the
   available queue; it does not turn a short advertised live window into a playback failure.

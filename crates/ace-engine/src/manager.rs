@@ -1532,7 +1532,8 @@ mod tests {
     async fn wait_finished(session: &StreamSession) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while !session.is_finished() {
-                tokio::task::yield_now().await;
+                // A timer also advances paused test clocks if the source never finishes.
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await

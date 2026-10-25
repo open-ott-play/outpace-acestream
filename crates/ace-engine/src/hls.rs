@@ -3269,7 +3269,7 @@ mod tests {
                 startup_segments: 1,
                 ..HlsConfig::default()
             };
-            let a = HlsPackager::new(config.clone(), None);
+            let a = HlsPackager::new(config, None);
             let b = HlsPackager::new(config, None);
             let history_config = HlsHistoryConfig {
                 max_seconds: 60,

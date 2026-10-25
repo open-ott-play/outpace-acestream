@@ -15,7 +15,7 @@ require an original closed-source engine at runtime and is not an official Ace
 Stream product. The executable remains `outpace`; configuration uses `OUTPACE_*`.
 
 [Download v0.8.1](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.8.1)
-· [Download v0.9.0-beta.2](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.0-beta.2)
+· [Download v0.9.0-beta.3](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.0-beta.3)
 · [Timeshift beta](docs/timeshift.md)
 · [Documentation](docs/README.md)
 · [HTTP API](docs/native-api.md)

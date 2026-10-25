@@ -188,7 +188,7 @@ pub async fn inspect_history_windows(
             )
             .await
             {
-                Ok(Ok((_session, window))) => windows.push(window),
+                Ok(Ok((_session, window, _unchoked))) => windows.push(window),
                 Ok(Err(HistoryFailure::ReceiveLimit)) => return Err(HistoryError::ReceiveLimit),
                 _ => {}
             }
@@ -261,7 +261,8 @@ async fn fetch_inner(
     for peer in candidates(peers, limits.max_peers) {
         attempted += 1;
         let connection = timeout(limits.connect_timeout, async {
-            let (mut session, mut window) = connect_window(info, peer, &mut budget).await?;
+            let (mut session, mut window, unchoked) =
+                connect_window(info, peer, &mut budget).await?;
             if next < u64::from(window.min_piece) || next > u64::from(window.max_piece) {
                 return Err(HistoryFailure::NotAdvertised);
             }
@@ -273,6 +274,11 @@ async fn fetch_inner(
                 .send(&PeerMessage::Interested)
                 .await
                 .map_err(|_| HistoryFailure::PeerIo)?;
+            // Choking is connection state, not a response to Interested. A peer
+            // that already unchoked us need not repeat it after its window.
+            if unchoked {
+                return Ok((session, window));
+            }
             for _ in 0..64 {
                 match read(&mut session, &mut budget).await? {
                     PeerMessage::Unchoke => return Ok((session, window)),
@@ -367,7 +373,7 @@ async fn connect_window(
     info: &StreamInfo,
     peer: SocketAddrV4,
     budget: &mut ReadBudget,
-) -> Result<(HistorySession, HistoryPeerWindow), HistoryFailure> {
+) -> Result<(HistorySession, HistoryPeerWindow, bool), HistoryFailure> {
     if budget.exhausted() {
         return Err(HistoryFailure::ReceiveLimit);
     }
@@ -382,9 +388,15 @@ async fn connect_window(
         .perform_handshake(info.infohash, random_peer_id())
         .await
         .map_err(|_| budget.failure(HistoryFailure::Handshake))?;
+    let mut unchoked = false;
     for _ in 0..32 {
-        if let PeerMessage::Extended { ext_id: 0, payload } = read(&mut session, budget).await? {
-            return Ok((session, parse_window(&payload, peer)?));
+        match read(&mut session, budget).await? {
+            PeerMessage::Unchoke => unchoked = true,
+            PeerMessage::Choke => unchoked = false,
+            PeerMessage::Extended { ext_id: 0, payload } => {
+                return Ok((session, parse_window(&payload, peer)?, unchoked));
+            }
+            _ => {}
         }
     }
     Err(HistoryFailure::InvalidWindow)

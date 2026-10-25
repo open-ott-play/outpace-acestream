@@ -27,6 +27,43 @@ LINUX = {
 }
 
 
+def read_executable(archive, prefix: str, *, windows: bool, retain: bool):
+    """Validate every target's executable, retaining only Linux container bytes."""
+    name = prefix + ("outpace.exe" if windows else "outpace")
+    if windows:
+        matches = [item for item in archive.infolist() if item.filename.replace("\\", "/") == name]
+        if (len(matches) != 1 or matches[0].is_dir()
+                or matches[0].external_attr & 0x10
+                or stat.S_IFMT(matches[0].external_attr >> 16) not in (0, stat.S_IFREG)):
+            raise ValueError(f"Expected exactly one regular executable: {name}")
+        member = matches[0]
+        size = member.file_size
+        source = archive.open(member)
+    else:
+        matches = [item for item in archive.getmembers() if item.name == name]
+        if len(matches) != 1 or not matches[0].isfile() or not matches[0].mode & 0o111:
+            raise ValueError(f"Expected exactly one regular executable: {name}")
+        member = matches[0]
+        size = member.size
+        source = archive.extractfile(member)
+    with source:
+        if size == 0:
+            raise ValueError(f"Empty executable: {name}")
+        if retain:
+            data = source.read()
+            actual_size = len(data)
+        else:
+            # Reading also verifies ZIP CRC/truncation without retaining binaries
+            # that will not be copied into the Linux image context.
+            actual_size = 0
+            while chunk := source.read(1024 * 1024):
+                actual_size += len(chunk)
+            data = None
+        if actual_size != size:
+            raise ValueError(f"Truncated executable: {name}")
+        return data
+
+
 def prepare(tag: str, assets: Path, output: Path, revision: str) -> None:
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise ValueError("Expected the resolved Git release commit")
@@ -55,6 +92,7 @@ def prepare(tag: str, assets: Path, output: Path, revision: str) -> None:
     # Every platform must ship its exact source and legal notices. Read selected
     # regular members only; never extract user-controlled archive paths.
     notices = {}
+    binaries = {}
     for target, extension in TARGETS.items():
         path = assets / f"outpace-{version}-{target}.{extension}"
         prefix = f"outpace-{version}-{target}/"
@@ -62,6 +100,7 @@ def prepare(tag: str, assets: Path, output: Path, revision: str) -> None:
         values = {}
         if extension == "zip":
             with zipfile.ZipFile(path) as archive:
+                read_executable(archive, prefix, windows=True, retain=False)
                 for name in required:
                     # PowerShell Compress-Archive uses backslashes on Windows.
                     # Read exact normalized members without extracting paths;
@@ -75,6 +114,9 @@ def prepare(tag: str, assets: Path, output: Path, revision: str) -> None:
                     values[name] = archive.read(matches[0])
         else:
             with tarfile.open(path, "r:gz") as archive:
+                binary = read_executable(archive, prefix, windows=False, retain=target in LINUX)
+                if target in LINUX:
+                    binaries[LINUX[target]] = binary
                 for name in required:
                     matches = [item for item in archive.getmembers() if item.name == prefix + name]
                     if len(matches) != 1 or not matches[0].isfile() or matches[0].size > 64 * 1024 * 1024:
@@ -103,18 +145,7 @@ def prepare(tag: str, assets: Path, output: Path, revision: str) -> None:
             if name in notices and notices[name] != values[name]:
                 raise ValueError("Legal notices differ across release targets")
             notices[name] = values[name]
-    # Validate every selected member before creating the context. Never extract paths.
-    binaries = {}
-    for target, platform in LINUX.items():
-        with tarfile.open(assets / f"outpace-{version}-{target}.tar.gz", "r:gz") as archive:
-            name = f"outpace-{version}-{target}/outpace"
-            matches = [member for member in archive.getmembers() if member.name == name]
-            if len(matches) != 1 or not matches[0].isfile() or not matches[0].mode & 0o111:
-                raise ValueError(f"Expected exactly one regular executable: {name}")
-            with archive.extractfile(matches[0]) as source:
-                binaries[platform] = source.read()
-            if not binaries[platform]:
-                raise ValueError(f"Empty executable: {name}")
+    # Validate every target before creating the context. Never extract paths.
     output.mkdir(parents=True, exist_ok=False)
     for name, data in notices.items():
         (output / name).write_bytes(data)

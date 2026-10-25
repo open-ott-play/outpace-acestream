@@ -46,6 +46,10 @@ class PrepareTests(unittest.TestCase):
                         member.create_system = 0
                         member.external_attr = 0x20  # DOS archive bit, no Unix filetype.
                         target_zip.writestr(member, data)
+                    member = zipfile.ZipInfo((prefix + "outpace.exe").replace("/", zip_separator))
+                    member.create_system = 0
+                    member.external_attr = 0x20  # Native Windows binaries do not need Unix mode bits.
+                    target_zip.writestr(member, b"bin")
             with tarfile.open(root / f"outpace-source-{version}-{target}-{REVISION}.tar.gz", "w:gz") as complete:
                 for name, data in {"engine-source.tar.gz": source, "source.json": values["source.json"], "THIRD_PARTY_NOTICES.txt": values["THIRD_PARTY_NOTICES.txt"], "vendor/demo/lib.rs": b"// fixture"}.items():
                     member = tarfile.TarInfo("outpace-acestream-complete/" + name)
@@ -58,6 +62,61 @@ class PrepareTests(unittest.TestCase):
             f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n"
             for p in sorted(root.iterdir()) if p.name != "SHA256SUMS"
         ))
+
+    def alter_executable(self, root, target, alteration):
+        extension = prepare.TARGETS[target]
+        path = root / f"outpace-0.3.0-{target}.{extension}"
+        if extension == "zip":
+            with zipfile.ZipFile(path) as archive:
+                entries = [(member, archive.read(member)) for member in archive.infolist()]
+            with zipfile.ZipFile(path, "w") as archive:
+                for member, data in entries:
+                    if member.filename.endswith("outpace.exe"):
+                        if alteration == "missing":
+                            continue
+                        if alteration == "empty":
+                            data = b""
+                        if alteration == "symlink":
+                            member.external_attr = (stat.S_IFLNK | 0o777) << 16
+                        if alteration == "directory":
+                            member.external_attr = 0x10
+                        if alteration == "duplicate":
+                            archive.writestr(member.filename.replace("/", "\\"), data)
+                    archive.writestr(member, data)
+        else:
+            with tarfile.open(path) as archive:
+                entries = [(member, archive.extractfile(member).read()) for member in archive.getmembers()]
+            with tarfile.open(path, "w:gz") as archive:
+                for member, data in entries:
+                    if member.name.endswith("/outpace"):
+                        if alteration == "missing":
+                            continue
+                        if alteration == "empty":
+                            data = b""
+                        if alteration == "not_executable":
+                            member.mode = 0o644
+                        if alteration == "symlink":
+                            member.type = tarfile.SYMTYPE
+                            member.linkname = "other"
+                            data = b""
+                        if alteration == "duplicate":
+                            archive.addfile(member, io.BytesIO(data))
+                        member.size = len(data)
+                    archive.addfile(member, io.BytesIO(data))
+        self.checksums(root)
+
+    def test_every_target_requires_one_nonempty_regular_executable(self):
+        for target in prepare.TARGETS:
+            alterations = ("missing", "empty", "symlink", "duplicate")
+            alterations += ("directory",) if "windows" in target else ("not_executable",)
+            for alteration in alterations:
+                with self.subTest(target=target, alteration=alteration), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    self.fixture(root)
+                    self.alter_executable(root, target, alteration)
+                    with self.assertRaisesRegex(ValueError, "executable"):
+                        prepare.prepare("v0.3.0", root, root / "context", REVISION)
+                    self.assertFalse((root / "context").exists())
 
     def test_prepares_only_linux_executables(self):
         with tempfile.TemporaryDirectory() as tmp:

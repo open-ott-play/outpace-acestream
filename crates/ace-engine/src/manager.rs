@@ -484,7 +484,7 @@ impl StreamManager {
         let session = StreamSession::start(source, self.buffer);
         // Publication ends the pending transition before old-worker cleanup finishes.
         // Keep the replacement owned until this request can attach its real receiver.
-        let _transition_pin = session.subscribe().into_pin();
+        let _transition_pin = session.pin();
         // A completed generation may still have clients draining its queued data. Publish
         // the new source without reusing its old HLS worker or segment namespace.
         let obsolete = {
@@ -618,7 +618,6 @@ impl StreamManager {
                 session
             }
         };
-        let transition_pin = session.subscribe();
         let pkg = {
             let mut packagers = self.packagers.lock().await;
             if replacing {
@@ -651,6 +650,9 @@ impl StreamManager {
                 .media
                 .clone()
         };
+        // The worker attaches its receiver synchronously before this subscription can
+        // start a new source, even if acquiring the packager map had to wait.
+        let transition_pin = session.subscribe();
         if native {
             pkg.record_native_access();
         }
@@ -1495,6 +1497,23 @@ mod tests {
         }
     }
 
+    struct ImmediateSource {
+        data: Option<bytes::Bytes>,
+        pulls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl TsSource for ImmediateSource {
+        async fn next(&mut self) -> Option<bytes::Bytes> {
+            self.pulls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.data.take()
+        }
+
+        fn stats(&self) -> SourceStats {
+            SourceStats::default()
+        }
+    }
+
     fn reopen_manager() -> (
         Arc<StreamManager>,
         tokio::sync::mpsc::UnboundedSender<SourceResult>,
@@ -1534,7 +1553,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn direct_replacement_stays_owned_while_old_hls_cleanup_waits() {
         let (manager, sources, mut opened) = reopen_manager();
         sources.send(Ok(Box::new(FinishedSource))).unwrap();
@@ -1559,7 +1578,14 @@ mod tests {
             HlsEntry { media, control },
         );
         drop(previous);
-        sources.send(Ok(Box::new(IdleSource))).unwrap();
+        let pulls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let initial = bytes::Bytes::from_static(b"initial media");
+        sources
+            .send(Ok(Box::new(ImmediateSource {
+                data: Some(initial.clone()),
+                pulls: pulls.clone(),
+            })))
+            .unwrap();
         let replacement_request = {
             let manager = manager.clone();
             tokio::spawn(async move { manager.get_or_start("reopen", "same").await })
@@ -1568,6 +1594,10 @@ mod tests {
             .await
             .expect("replacement must reach old-worker cleanup");
         assert!(!replacement_request.is_finished());
+        // The ownership pin must protect the source without consuming it while the
+        // previous worker's cleanup prevents this response from attaching a reader.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(pulls.load(std::sync::atomic::Ordering::SeqCst), 0);
         manager.reap_idle_at(Instant::now()).await;
         let published = manager
             .get("reopen", "same")
@@ -1582,6 +1612,66 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&published, &returned));
         assert_eq!(returned.subscriber_count(), 0);
+        let mut reader = returned.subscribe();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), reader.rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            crate::session::StreamEvent::Data(initial)
+        );
+        wait_finished(&returned).await;
+        assert_eq!(pulls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        drop(reader);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_hls_receiver_is_attached_before_source_starts() {
+        let (sources, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (opened, mut opens) = tokio::sync::mpsc::unbounded_channel();
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(ReopenProvider {
+            sources: Mutex::new(rx),
+            opened,
+        }));
+        let manager = StreamManager::with_config(
+            registry,
+            32,
+            HlsConfig {
+                segment_packets: 128,
+                window_segments: 4,
+                segment_duration_ms: 1000,
+                startup_segments: 1,
+                startup_timeout_ms: 5000,
+            },
+        );
+        let pulls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        sources
+            .send(Ok(Box::new(ImmediateSource {
+                data: Some(bytes::Bytes::from(task4_input(true))),
+                pulls: pulls.clone(),
+            }) as Box<dyn TsSource>))
+            .unwrap();
+        // Hold exactly the lock between source creation and worker attachment. A
+        // lease's temporary subscription must not let the source run across this wait.
+        let packagers = manager.packagers.lock().await;
+        let request = manager.get_or_start_compatibility_hls("reopen", "same");
+        tokio::pin!(request);
+        assert!(futures::poll!(request.as_mut()).is_pending());
+        opens.try_recv().expect("source must have opened");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(pulls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(packagers);
+        let (media, session, pin) = request.await.unwrap();
+        assert_eq!(
+            media.wait_available(Duration::from_secs(1)).await,
+            crate::hls::HlsStatus::Ready
+        );
+        wait_finished(&session).await;
+        assert_eq!(pulls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(media.segment(0).is_some(), "initial media must reach HLS");
+        drop(pin);
         manager.shutdown().await;
     }
 
@@ -1615,6 +1705,9 @@ mod tests {
             if !first_hls {
                 assert!(manager.get_hls("reopen", "same").await.is_none());
             }
+            // A direct acquisition owns the source but does not consume it until a
+            // receiver attaches. Deliberately consume this finite replacement to EOF.
+            let _reader = (!first_hls).then(|| replacement.raw_receiver());
             wait_finished(&replacement).await;
             let joined = tokio::time::timeout(Duration::from_secs(1), second)
                 .await

@@ -57,6 +57,13 @@ pub(super) async fn ace_getstream(
     // A direct request owns an ordinary compatibility lease, just like a caller that follows
     // the JSON playback URL. The body holds exactly one StreamManager subscription, so dropping
     // it detaches this caller without stopping a shared source or another compatibility client.
+    // Own the hidden lease before awaiting source startup as well: a disconnected caller may
+    // cancel while provider resolution or another same-source request is still pending.
+    let direct_lease = AceDirectLeaseGuard {
+        sessions: s.ace_sessions.clone(),
+        playback_id: playback_id.clone(),
+        token: token.clone(),
+    };
     let Some((session_key, expires_at, cancel)) = s.ace_sessions.playback(&playback_id, &token)
     else {
         return StatusCode::NOT_FOUND.into_response();
@@ -69,21 +76,9 @@ pub(super) async fn ace_getstream(
             {
                 return StatusCode::NOT_FOUND.into_response();
             }
-            ace_stream_session_response(
-                session,
-                expires_at,
-                cancel,
-                Some(AceDirectLeaseGuard {
-                    sessions: s.ace_sessions.clone(),
-                    playback_id,
-                    token,
-                }),
-            )
+            ace_stream_session_response(session, expires_at, cancel, Some(direct_lease))
         }
-        Err(_) => {
-            s.ace_sessions.revoke(&playback_id, &token);
-            StatusCode::NOT_FOUND.into_response()
-        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 

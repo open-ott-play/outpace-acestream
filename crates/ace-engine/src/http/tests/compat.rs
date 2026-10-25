@@ -616,6 +616,74 @@ async fn ace_direct_start_failure_revokes_its_hidden_lease() {
 }
 
 #[tokio::test]
+async fn cancelled_direct_start_and_queued_request_release_only_their_hidden_leases() {
+    use std::sync::atomic::AtomicUsize;
+
+    struct PendingProvider(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl StreamProvider for PendingProvider {
+        fn network(&self) -> &'static str {
+            "fix"
+        }
+
+        async fn open(&self, _id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::future::pending().await
+        }
+    }
+
+    let opens = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(PendingProvider(opens.clone())));
+    let manager = StreamManager::new(registry);
+    let sessions = Arc::new(AceSessionStore::default());
+    let other_token = sessions.mint("other-viewer".into(), "other-source".into());
+    let app = router(AppState {
+        manager: manager.clone(),
+        networks: vec!["fix".into()],
+        resolve_content_ids_in_getstream: false,
+        ace_sessions: sessions.clone(),
+        experimental_ace_compat: true,
+        broadcasts: None,
+    });
+    let request = || {
+        Box::pin(
+            app.clone().oneshot(
+                Request::get("/ace/getstream?infohash=0123456789abcdef0123456789abcdef01234567")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+    };
+    let mut starting = request();
+    assert!(futures::poll!(starting.as_mut()).is_pending());
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    let mut queued = request();
+    assert!(futures::poll!(queued.as_mut()).is_pending());
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    assert_eq!(sessions.active_count(), 3);
+    let mut abandoned_waiter = request();
+    assert!(futures::poll!(abandoned_waiter.as_mut()).is_pending());
+    assert_eq!(sessions.active_count(), 4);
+    drop(abandoned_waiter);
+    assert_eq!(sessions.active_count(), 3);
+
+    drop(starting);
+    assert_eq!(sessions.active_count(), 2);
+    assert!(futures::poll!(queued.as_mut()).is_pending());
+    assert_eq!(opens.load(Ordering::SeqCst), 2);
+    drop(queued);
+
+    assert_eq!(sessions.active_count(), 1);
+    assert_eq!(
+        sessions.validate("other-viewer", &other_token).as_deref(),
+        Some("other-source")
+    );
+    assert!(manager.list().await.is_empty());
+}
+
+#[tokio::test]
 async fn ace_playback_start_failures_are_distinct_from_unregistered_network() {
     struct FailingProvider;
 

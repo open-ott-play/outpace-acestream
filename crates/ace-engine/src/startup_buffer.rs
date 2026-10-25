@@ -611,6 +611,7 @@ mod tests {
             StartupBufferedSource::new(Box::new(inner), config(20000, 4096, 30000), None),
             16,
         );
+        let _receiver = session.raw_receiver();
         tokio::task::yield_now().await;
         assert_eq!(session.stats().await.buffer_ms, 1000);
     }

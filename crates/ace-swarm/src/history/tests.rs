@@ -54,6 +54,8 @@ enum Fault {
     InvalidTimestamp,
     DuplicateChunk,
     MissingPiece(u32),
+    EarlyUnchoke,
+    EarlyUnchokeThenChoke,
 }
 
 struct FakePeer {
@@ -90,6 +92,12 @@ async fn peer(min_piece: u32, max_piece: u32, fault: Fault) -> FakePeer {
             max_piece,
         };
         let hello = outgoing(min_piece, window, addr);
+        if matches!(fault, Fault::EarlyUnchoke | Fault::EarlyUnchokeThenChoke) {
+            session.send(&PeerMessage::Unchoke).await.unwrap();
+            if matches!(fault, Fault::EarlyUnchokeThenChoke) {
+                session.send(&PeerMessage::Choke).await.unwrap();
+            }
+        }
         if session
             .send(&PeerMessage::Extended {
                 ext_id: 0,
@@ -104,6 +112,11 @@ async fn peer(min_piece: u32, max_piece: u32, fault: Fault) -> FakePeer {
         while let Ok(message) = session.read_message().await {
             match message {
                 PeerMessage::Interested => {
+                    if matches!(fault, Fault::EarlyUnchoke | Fault::EarlyUnchokeThenChoke) {
+                        // The peer has already announced its state before its
+                        // window and does not repeat it in response to interest.
+                        continue;
+                    }
                     if session.send(&PeerMessage::Unchoke).await.is_err() {
                         return;
                     }
@@ -198,6 +211,55 @@ async fn exact_older_range_is_verified_and_signature_trailer_removed() {
             .flat_map(|piece| (0..4).map(move |chunk| (piece, chunk)))
             .collect::<Vec<_>>()
     );
+}
+
+#[tokio::test]
+async fn unchoke_before_window_is_retained_without_waiting_for_a_repeat() {
+    let peer = peer(0, 500, Fault::EarlyUnchoke).await;
+    let range = fetch_history(
+        &info(),
+        &Identity::generate(),
+        &[peer.addr],
+        request(),
+        limits(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(range.attempted_peers, 1);
+    assert_eq!(
+        range
+            .pieces
+            .iter()
+            .map(|piece| piece.index)
+            .collect::<Vec<_>>(),
+        vec![42, 43]
+    );
+    assert_eq!(peer.requests.lock().unwrap().len(), 8);
+}
+
+#[tokio::test]
+async fn choke_before_window_revokes_an_earlier_unchoke() {
+    let peer = peer(0, 500, Fault::EarlyUnchokeThenChoke).await;
+    let result = fetch_history(
+        &info(),
+        &Identity::generate(),
+        &[peer.addr],
+        request(),
+        HistoryLimits {
+            connect_timeout: Duration::from_millis(250),
+            ..limits()
+        },
+    )
+    .await;
+    assert_eq!(
+        result,
+        Err(HistoryError::Unavailable {
+            piece: 42,
+            attempted_peers: 1,
+            last_failure: HistoryFailure::PeerTimeout,
+        })
+    );
+    assert!(peer.requests.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

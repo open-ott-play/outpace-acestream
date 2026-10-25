@@ -32,6 +32,8 @@ registry dependencies.
 
 Before publication, `tools/release/prepare_container.py` verifies the complete
 set of seven binary archives, seven complete-source archives and `SHA256SUMS`.
+Each target must contain exactly one regular, nonempty executable; Unix packages
+must retain executable permissions, while Windows ZIPs need no Unix mode bits.
 It checks the source revision, version, target, source digest, complete-source
 URL, legal notices and vendor content. The source revision must match the tag's
 resolved Git commit. A partial build or incomplete source set fails publication.

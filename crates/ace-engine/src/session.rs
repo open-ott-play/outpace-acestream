@@ -6,7 +6,7 @@ use ace_swarm::types::StreamMetadata;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Notify};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamEvent {
@@ -19,6 +19,7 @@ pub enum StreamEvent {
 /// A live session: pulls from one `TsSource` and broadcasts TS chunks to subscribers.
 pub struct StreamSession {
     tx: broadcast::WeakSender<StreamEvent>,
+    receiver_ready: Arc<Notify>,
     subscribers: Arc<AtomicU64>,
     stats: Arc<Mutex<SourceStats>>,
     live_stats: Option<StatsHandle>,
@@ -61,9 +62,10 @@ impl Subscription {
 }
 
 impl StreamSession {
-    /// Start pulling from `source` in a background task, broadcasting chunks. The pump stops
-    /// when the source ends. `buffer` is the broadcast backlog (how far a slow/late receiver
-    /// may lag before it drops old chunks).
+    /// Own `source` in a background task and start pulling after the first receiver attaches.
+    /// Initial media must not race ahead of that receiver. The pump then runs until the source
+    /// ends, including between receivers. `buffer` is the broadcast backlog (how far a
+    /// slow/late receiver may lag before it drops old chunks).
     pub fn start(mut source: Box<dyn TsSource>, buffer: usize) -> Arc<StreamSession> {
         let (tx, _rx) = broadcast::channel(buffer);
         let stats = Arc::new(Mutex::new(SourceStats::default()));
@@ -72,7 +74,10 @@ impl StreamSession {
         let weak_tx = tx.downgrade();
         let pump_tx = tx;
         let pump_stats = stats.clone();
+        let receiver_ready = Arc::new(Notify::new());
+        let pump_ready = receiver_ready.clone();
         let pump = tokio::spawn(async move {
+            pump_ready.notified().await;
             while let Some(chunk) = source.next().await {
                 *pump_stats.lock().await = source.stats();
                 if source.take_discontinuity() {
@@ -89,6 +94,7 @@ impl StreamSession {
         });
         Arc::new(StreamSession {
             tx: weak_tx,
+            receiver_ready,
             subscribers: Arc::new(AtomicU64::new(0)),
             stats,
             live_stats,
@@ -97,13 +103,19 @@ impl StreamSession {
         })
     }
 
-    pub fn subscribe(&self) -> Subscription {
+    /// Own this session without attaching a receiver or starting source consumption.
+    pub(crate) fn pin(&self) -> SessionPin {
         self.subscribers.fetch_add(1, Ordering::SeqCst);
+        SessionPin {
+            count: self.subscribers.clone(),
+        }
+    }
+
+    pub fn subscribe(&self) -> Subscription {
+        let pin = self.pin();
         Subscription {
             rx: self.raw_receiver(),
-            pin: SessionPin {
-                count: self.subscribers.clone(),
-            },
+            pin,
         }
     }
 
@@ -113,6 +125,7 @@ impl StreamSession {
 
     /// The source pump has exited (including EOF or failure). Old subscribers may still
     /// drain their queued data, but a fresh playback acquisition may start a new session.
+    /// Before the first receiver attaches, EOF and pull-driven statistics remain unobserved.
     pub fn is_finished(&self) -> bool {
         self.pump.is_finished()
     }
@@ -121,7 +134,11 @@ impl StreamSession {
     /// packager, which must not pin the session open against idle teardown).
     pub fn raw_receiver(&self) -> broadcast::Receiver<StreamEvent> {
         if let Some(tx) = self.tx.upgrade() {
-            tx.subscribe()
+            let rx = tx.subscribe();
+            // Keep a permit even if the pump has not been polled yet. The receiver must
+            // already exist when the source is allowed to yield its initial media.
+            self.receiver_ready.notify_one();
+            rx
         } else {
             // A late subscriber must observe EOF too, without creating a new live sender.
             let (_tx, rx) = broadcast::channel(1);
@@ -186,7 +203,7 @@ mod tests {
     async fn two_subscribers_share_one_source() {
         let source = TestProvider { chunks: 5 }.open("x").await.unwrap();
         let session = StreamSession::start(source, 16);
-        // Subscribe both before any await, so the (current-thread) pump can't run first.
+        // The first subscription leaves a start permit before the pump is polled.
         let mut a = session.subscribe();
         let mut b = session.subscribe();
         assert_eq!(session.subscriber_count(), 2);
@@ -199,6 +216,53 @@ mod tests {
         assert_eq!(ca[0], 0x47);
         drop(a);
         assert_eq!(session.subscriber_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ownership_pin_does_not_consume_initial_media() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        struct ImmediateSource {
+            pulls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl TsSource for ImmediateSource {
+            async fn next(&mut self) -> Option<Bytes> {
+                (self.pulls.fetch_add(1, Ordering::SeqCst) == 0)
+                    .then(|| Bytes::from_static(b"initial media"))
+            }
+            fn stats(&self) -> SourceStats {
+                SourceStats::default()
+            }
+        }
+
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let session = StreamSession::start(
+            Box::new(ImmediateSource {
+                pulls: pulls.clone(),
+            }),
+            8,
+        );
+        let pin = session.pin();
+        // Let every ready task run, including the pump, without attaching a consumer.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(pulls.load(Ordering::SeqCst), 0);
+        assert_eq!(session.subscriber_count(), 1);
+        assert!(!session.is_finished());
+
+        let mut rx = session.raw_receiver();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            StreamEvent::Data(Bytes::from_static(b"initial media"))
+        );
+        assert_eq!(rx.recv().await, Err(broadcast::error::RecvError::Closed));
+        assert_eq!(pulls.load(Ordering::SeqCst), 2);
+        drop(pin);
+        assert_eq!(session.subscriber_count(), 0);
     }
 
     #[tokio::test]
@@ -225,22 +289,23 @@ mod tests {
             }
         }
 
-        let dropped = Arc::new(AtomicBool::new(false));
-        let session = StreamSession::start(Box::new(BlockingSource(dropped.clone())), 16);
-        assert!(!dropped.load(Ordering::SeqCst));
-        drop(session); // last Arc gone → pump aborted → source dropped
+        for attach_receiver in [false, true] {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let session = StreamSession::start(Box::new(BlockingSource(dropped.clone())), 16);
+            let _pin = session.pin();
+            let _receiver = attach_receiver.then(|| session.raw_receiver());
+            tokio::task::yield_now().await;
+            assert!(!dropped.load(Ordering::SeqCst));
+            drop(session); // both waiting and running pumps must drop their source
 
-        // The abort + drop run on the next runtime poll; give it a moment.
-        for _ in 0..50 {
-            if dropped.load(Ordering::SeqCst) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !dropped.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("pump must be aborted and source dropped");
         }
-        assert!(
-            dropped.load(Ordering::SeqCst),
-            "pump must be aborted and source dropped"
-        );
     }
 
     #[tokio::test]

@@ -133,36 +133,51 @@ class WorkflowContracts(unittest.TestCase):
         self.assertIn("SHA256SUMS", publish["steps"][release_index]["with"]["files"])
         self.assertEqual(doc["jobs"]["publish-container"]["needs"], "publish-release")
 
-    def test_beta_assets_are_verified_in_draft_before_publication(self):
+    def test_all_release_assets_are_verified_in_draft_before_serial_publication(self):
         doc = workflow("release.yml")
         self.assertEqual(doc["concurrency"], {"group": "outpace-release-${{ github.ref }}", "cancel-in-progress": "false"})
-        steps = doc["jobs"]["publish-release"]["steps"]
+        publish = doc["jobs"]["publish-release"]
+        self.assertEqual(publish["concurrency"], {
+            "group": "outpace-github-release-publication", "cancel-in-progress": "false"})
+        steps = publish["steps"]
         upload_index = next(index for index, step in enumerate(steps) if step.get("uses", "").startswith("softprops/action-gh-release@"))
         upload = steps[upload_index]["with"]
         self.assertEqual(upload["prerelease"], "${{ needs.release-metadata.outputs.prerelease }}")
-        self.assertEqual(upload["draft"], upload["prerelease"])
-        self.assertEqual(upload["make_latest"], "${{ needs.release-metadata.outputs.make_latest }}")
+        self.assertEqual(upload["draft"], "true")
+        self.assertEqual(upload["make_latest"], "false")
         self.assertEqual(upload["fail_on_unmatched_files"], "true")
         guard_index = next(index for index, step in enumerate(steps) if "release_policy.py unpublished" in step.get("run", ""))
+        verify_index = next(index for index, step in enumerate(steps) if "release_policy.py draft" in step.get("run", ""))
+        decision_index = next(index for index, step in enumerate(steps) if "release_policy.py publication" in step.get("run", ""))
         final_index = next(index for index, step in enumerate(steps) if "gh release edit" in step.get("run", ""))
         self.assertLess(guard_index, upload_index)
-        self.assertLess(upload_index, final_index)
-        for index in (guard_index, final_index):
-            self.assertEqual(steps[index]["if"], "needs.release-metadata.outputs.prerelease == 'true'")
+        self.assertLess(upload_index, verify_index)
+        self.assertLess(verify_index, decision_index)
+        self.assertLess(decision_index, final_index)
+        for index in (guard_index, upload_index, verify_index, decision_index, final_index):
+            self.assertNotIn("if", steps[index])
+        self.assertIn("tools/release/prepare_container.py", steps[verify_index]["run"])
+        decision = steps[decision_index]
+        self.assertLess(decision["run"].index("gh api --paginate --slurp"),
+                        decision["run"].index("release_policy.py publication"))
+        self.assertEqual(steps[final_index]["env"]["MAKE_LATEST"],
+                         "${{ steps." + decision["id"] + ".outputs.make_latest }}")
+        self.assertEqual(steps[final_index]["env"]["PRERELEASE"],
+                         "${{ needs.release-metadata.outputs.prerelease }}")
         final = steps[final_index]["run"]
-        self.assertLess(final.index("release_policy.py draft"), final.index("gh release edit"))
-        self.assertLess(final.index("tools/release/prepare_container.py"), final.index("gh release edit"))
-        self.assertIn("--draft=false --prerelease --latest=false --verify-tag", final)
+        self.assertIn('--draft=false --prerelease="$PRERELEASE" --latest="$MAKE_LATEST" --verify-tag', final)
         self.assertIn("release_policy.py published", final)
+        self.assertNotIn("make_latest", doc["jobs"]["release-metadata"]["outputs"])
 
     def test_paginated_release_lists_use_external_jq(self):
         for name in ("release.yml", "publish-container.yml"):
             commands = "\n".join(steps_text(job) for job in workflow(name)["jobs"].values())
             listings = [line for line in commands.splitlines() if "gh api --paginate --slurp" in line]
-            self.assertEqual(len(listings), 1)
+            self.assertEqual(len(listings), 2 if name == "release.yml" else 1)
             # gh --slurp cannot be combined with its built-in --jq option.
-            self.assertIn("| jq 'add'", listings[0])
-            self.assertNotIn("--jq", listings[0])
+            for listing in listings:
+                self.assertIn("| jq 'add'", listing)
+                self.assertNotIn("--jq", listing)
 
     def test_containers_still_require_verified_assets_and_three_architectures(self):
         doc = workflow("publish-container.yml")

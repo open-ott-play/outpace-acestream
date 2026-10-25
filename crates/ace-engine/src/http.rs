@@ -271,7 +271,7 @@ pub fn router(state: AppState) -> Router {
                 .delete(broadcast_delete),
         );
     if compat {
-        router = router
+        let ace = Router::new()
             .route("/ace/getstream", get(ace_getstream))
             .route("/ace/r/{id}/{token}", get(ace_playback))
             .route("/ace/manifest.m3u8", get(ace_manifest))
@@ -288,7 +288,20 @@ pub fn router(state: AppState) -> Router {
             .route("/ace/stat/{id}/{token}", get(ace_stat))
             .route("/ace/cmd/{id}/{token}", get(ace_command))
             .route("/server/api", get(server_api))
-            .route("/webui/api/service", get(server_api));
+            .route("/webui/api/service", get(server_api))
+            // Errors and extractor rejections depend on the current playback state
+            // just as successful responses do. Never let a cache retain a transient
+            // missing segment, stale control result or token-bearing redirect.
+            .layer(axum::middleware::map_response(
+                |mut response: Response| async {
+                    response.headers_mut().insert(
+                        header::CACHE_CONTROL,
+                        axum::http::HeaderValue::from_static("no-store"),
+                    );
+                    response
+                },
+            ));
+        router = router.merge(ace);
     }
     router
         .with_state(state)

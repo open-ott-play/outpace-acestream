@@ -27,7 +27,6 @@ jobs:
     outputs:
       version: ${{ steps.release.outputs.version }}
       prerelease: ${{ steps.release.outputs.prerelease }}
-      make_latest: ${{ steps.release.outputs.make_latest }}
 
     steps:
       - name: Checkout
@@ -152,6 +151,11 @@ jobs:
   publish-release:
     name: Publish GitHub Release
     runs-on: ubuntu-24.04
+    # Builds remain concurrent, but the fresh Latest decision and publication
+    # must not race another tag's publication in this workflow.
+    concurrency:
+      group: outpace-github-release-publication
+      cancel-in-progress: false
     needs:
       - release-metadata
       - build-binaries
@@ -183,8 +187,7 @@ jobs:
           python3 tools/release/prepare_container.py \
             "$GITHUB_REF_NAME" dist "$RUNNER_TEMP/validated-release" "$GITHUB_SHA"
 
-      - name: Keep an existing beta release immutable
-        if: needs.release-metadata.outputs.prerelease == 'true'
+      - name: Keep every existing published release immutable
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -193,35 +196,54 @@ jobs:
           gh api --paginate --slurp "repos/$GH_REPO/releases?per_page=100" | jq 'add' > releases.json
           python3 tools/release/release_policy.py unpublished "$GITHUB_REF_NAME" releases.json
 
-      # Prerelease assets must be uploaded while still a draft on repositories
-      # with immutable releases. The next step verifies the uploaded set first.
-      - name: Publish release
+      # Both channels upload and verify all assets before making them public.
+      # Only the same-channel unpublished draft may be resumed on a retry.
+      - name: Upload release draft
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           generate_release_notes: true
           prerelease: ${{ needs.release-metadata.outputs.prerelease }}
-          draft: ${{ needs.release-metadata.outputs.prerelease }}
-          make_latest: ${{ needs.release-metadata.outputs.make_latest }}
+          draft: true
+          make_latest: false
           fail_on_unmatched_files: true
           files: |
             dist/outpace-*
             dist/SHA256SUMS
 
-      - name: Verify uploaded beta assets and publish the draft
-        if: needs.release-metadata.outputs.prerelease == 'true'
+      - name: Verify uploaded draft assets
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          gh release view "$GITHUB_REF_NAME" --json tagName,isDraft,isPrerelease > beta-release.json
-          python3 tools/release/release_policy.py draft "$GITHUB_REF_NAME" beta-release.json
-          gh release download "$GITHUB_REF_NAME" --dir "$RUNNER_TEMP/beta-release-assets" --pattern '*'
+          gh release view "$GITHUB_REF_NAME" --json tagName,isDraft,isPrerelease > draft-release.json
+          python3 tools/release/release_policy.py draft "$GITHUB_REF_NAME" draft-release.json
+          gh release download "$GITHUB_REF_NAME" --dir "$RUNNER_TEMP/draft-release-assets" --pattern '*'
           python3 tools/release/prepare_container.py "$GITHUB_REF_NAME" \
-            "$RUNNER_TEMP/beta-release-assets" "$RUNNER_TEMP/validated-beta-upload" "$GITHUB_SHA"
-          gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease --latest=false --verify-tag
-          gh release view "$GITHUB_REF_NAME" --json tagName,isDraft,isPrerelease > beta-release.json
-          python3 tools/release/release_policy.py published "$GITHUB_REF_NAME" beta-release.json
+            "$RUNNER_TEMP/draft-release-assets" "$RUNNER_TEMP/validated-draft-upload" "$GITHUB_SHA"
+
+      - name: Select Latest from the current published releases
+        id: publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/$GH_REPO/releases?per_page=100" | jq 'add' > releases-before-publication.json
+          python3 tools/release/release_policy.py publication "$GITHUB_REF_NAME" \
+            releases-before-publication.json >> "$GITHUB_OUTPUT"
+
+      - name: Publish the verified draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MAKE_LATEST: ${{ steps.publication.outputs.make_latest }}
+          PRERELEASE: ${{ needs.release-metadata.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease="$PRERELEASE" --latest="$MAKE_LATEST" --verify-tag
+          gh release view "$GITHUB_REF_NAME" --json tagName,isDraft,isPrerelease > published-release.json
+          python3 tools/release/release_policy.py published "$GITHUB_REF_NAME" published-release.json
 
   publish-container:
     name: Publish GHCR image from release archives

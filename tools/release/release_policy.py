@@ -65,14 +65,39 @@ def release_list(document: object) -> list[dict]:
 
 
 def ensure_unpublished(tag: str, document: object) -> None:
-    """A beta upload can create/resume a draft, never unpublish an existing release."""
+    """Create/resume a matching draft, never replace a published release."""
     version = parse_tag(tag)
-    if version.beta is None:
-        raise ValueError("Draft publication is reserved for beta releases")
     for release in release_list(document):
         if release["tag_name"] == tag:
-            if not release["draft"] or not release["prerelease"]:
-                raise ValueError("Cannot replace an existing published or non-beta release")
+            if not release["draft"] or release["prerelease"] is not (version.beta is not None):
+                raise ValueError("Cannot replace an existing published or wrong-channel release")
+
+
+def publication_metadata(tag: str, document: object) -> dict[str, str]:
+    """Choose Latest from a fresh inventory immediately before publishing a draft.
+
+    An older stable backport is publishable without replacing GitHub Latest.
+    The workflow serializes publication across tags so its own jobs cannot race
+    this decision. Beta releases never affect the stable Latest designation.
+    """
+    requested = parse_tag(tag)
+    releases = release_list(document)
+    ensure_unpublished(tag, releases)
+    if not any(release["tag_name"] == tag for release in releases):
+        raise ValueError("Requested release must still be a matching draft before publication")
+    latest = requested.beta is None
+    for release in releases:
+        if release["draft"]:
+            continue
+        try:
+            version = parse_tag(release["tag_name"])
+        except ValueError:
+            continue
+        if release["prerelease"] is not (version.beta is not None):
+            raise ValueError("Published release tag and prerelease status disagree")
+        if version.beta is None and requested.beta is None and version > requested:
+            latest = False
+    return {"make_latest": str(latest).lower()}
 
 
 def check_channel_advance(tag: str, document: object) -> None:
@@ -103,7 +128,7 @@ def main() -> None:
     meta = commands.add_parser("metadata")
     meta.add_argument("tag")
     meta.add_argument("--cargo-version")
-    for name in ("published", "draft", "unpublished", "channel"):
+    for name in ("published", "draft", "unpublished", "publication", "channel"):
         command = commands.add_parser(name)
         command.add_argument("tag")
         command.add_argument("document", type=Path)
@@ -118,6 +143,9 @@ def main() -> None:
                 validate_release(args.tag, document, draft=args.command == "draft")
             elif args.command == "unpublished":
                 ensure_unpublished(args.tag, document)
+            elif args.command == "publication":
+                for key, value in publication_metadata(args.tag, document).items():
+                    print(f"{key}={value}")
             else:
                 check_channel_advance(args.tag, document)
     except (ValueError, OSError) as error:

@@ -1,6 +1,52 @@
 use super::*;
 
 #[tokio::test]
+async fn ace_playback_errors_and_control_results_are_not_cacheable() {
+    let app = router(ace_hls_state(Duration::from_secs(60), 8));
+    for (path, status) in [
+        ("/ace/m/id/missing.m3u8", StatusCode::NOT_FOUND),
+        ("/ace/c/missing/0.ts", StatusCode::NOT_FOUND),
+        ("/ace/t/id/missing/0.m3u8", StatusCode::NOT_FOUND),
+        ("/ace/tc/missing/0/0.ts", StatusCode::NOT_FOUND),
+        ("/ace/tc/missing/not-a-number/0.ts", StatusCode::BAD_REQUEST),
+        ("/ace/stat/id/missing", StatusCode::OK),
+        (
+            "/ace/cmd/id/missing?method=timeshift_status",
+            StatusCode::OK,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{path}");
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&axum::http::HeaderValue::from_static("no-store")),
+            "a cached error or control result must not outlive its playback state: {path}"
+        );
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/ace/c/missing/0.ts")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+
+    let health = app
+        .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert!(health.headers().get(header::CACHE_CONTROL).is_none());
+}
+
+#[tokio::test]
 async fn ace_manifest_redirects_to_stable_authenticated_native_hls_view() {
     let id = "0123456789abcdef0123456789abcdef01234567";
     let state = ace_hls_state(Duration::from_secs(60), 8);

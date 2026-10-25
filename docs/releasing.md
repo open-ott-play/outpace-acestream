@@ -47,7 +47,7 @@ verifier and its negative tests together.
    builds all seven platforms and validates the complete archive set.
 3. The workflow creates a prerelease draft, uploads the assets, then downloads
    and validates the uploaded set before publishing with
-   `--prerelease --latest=false`. Uploading while still a draft supports GitHub
+   `--prerelease=true --latest=false`. Uploading while still a draft supports GitHub
    immutable releases. A failed upload leaves a draft that can be retried;
    an already published beta is never changed back into a draft or overwritten.
 4. The container workflow consumes the published assets and updates only the
@@ -59,6 +59,15 @@ If GitHub publication succeeded but container publication failed, run
 publication for a published beta. Fix source or packaging defects in a new tag.
 Moving from beta to stable requires a separate reviewed version change and a
 new stable tag; it is not a rename of the beta release or its assets.
+
+Stable releases use the same draft-upload-verification path. Only an unpublished
+draft with the matching tag and prerelease status may be resumed; published
+stable and beta assets are never overwritten by this workflow. GitHub
+publication is serialized across tags, while platform builds remain parallel.
+Immediately before publication, a fresh paginated release inventory determines
+whether a stable version may become Latest. An older stable backport can be
+published without replacing a newer stable release; beta never becomes Latest.
+This guard covers workflow-driven publication, not independent manual edits.
 
 ## Containers from verified release artifacts
 

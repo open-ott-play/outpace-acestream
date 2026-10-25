@@ -4,6 +4,7 @@ use ace_wire::live_codec::build_piece;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
@@ -368,12 +369,12 @@ async fn dropping_future_closes_its_peer_connection() {
     ));
     tokio::select! {
         result = &mut operation => panic!("unexpected completion: {result:?}"),
-        _ = async {
+        observed = timeout(Duration::from_secs(1), async {
             loop {
                 if !peer.requests.lock().unwrap().is_empty() { break; }
                 tokio::task::yield_now().await;
             }
-        } => {}
+        }) => { observed.expect("peer never observed a request"); }
     }
     drop(operation);
     timeout(Duration::from_secs(1), async {
@@ -500,23 +501,128 @@ fn missing_or_inverted_window_is_never_assumed_to_start_at_zero() {
 }
 
 #[test]
-fn receive_budget_counts_control_messages_and_payload_without_copying() {
+fn receive_message_budget_is_independent_of_wire_byte_budget() {
     let mut budget = ReadBudget {
-        bytes: 64,
+        bytes: Arc::new(AtomicU64::new(64)),
         messages: 2,
     };
-    budget.consume(&PeerMessage::KeepAlive).unwrap();
-    budget.consume(&PeerMessage::KeepAlive).unwrap();
-    assert_eq!(
-        budget.consume(&PeerMessage::KeepAlive),
-        Err(HistoryFailure::ReceiveLimit)
-    );
-    let mut budget = ReadBudget {
-        bytes: 64,
+    budget.consume_message().unwrap();
+    budget.consume_message().unwrap();
+    assert_eq!(budget.consume_message(), Err(HistoryFailure::ReceiveLimit));
+    assert_eq!(budget.bytes.load(Ordering::Relaxed), 64);
+}
+
+#[tokio::test]
+async fn transport_budget_caps_reads_and_survives_connection_replacement() {
+    let budget = ReadBudget {
+        bytes: Arc::new(AtomicU64::new(5)),
         messages: 100,
     };
+    let mut first = BudgetedStream {
+        inner: b"abc".as_slice(),
+        remaining: Arc::clone(&budget.bytes),
+    };
+    let mut data = [0; 16];
+    assert_eq!(first.read(&mut data).await.unwrap(), 3);
+    // Ordinary EOF retains unused budget; it must not be reported as exhaustion.
+    assert_eq!(first.read(&mut data).await.unwrap(), 0);
     assert_eq!(
-        budget.consume(&PeerMessage::Bitfield(vec![0; 65])),
-        Err(HistoryFailure::ReceiveLimit)
+        budget.failure(HistoryFailure::PeerIo),
+        HistoryFailure::PeerIo
     );
+    drop(first);
+    let mut next = BudgetedStream {
+        inner: b"defg".as_slice(),
+        remaining: Arc::clone(&budget.bytes),
+    };
+    assert_eq!(next.read(&mut data).await.unwrap(), 2);
+    assert_eq!(&data[..2], b"de");
+    assert!(budget.exhausted());
+    assert_eq!(next.inner, b"fg");
+    assert!(next.read(&mut data).await.is_err());
+    assert_eq!(next.inner, b"fg");
+    assert_eq!(
+        budget.failure(HistoryFailure::PeerIo),
+        HistoryFailure::ReceiveLimit
+    );
+    // A zero-capacity read does not need more bytes, even at the budget boundary.
+    assert_eq!(next.read(&mut []).await.unwrap(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn partial_read_cancellation_retains_bytes_without_charging_pending_polls() {
+    let remaining = Arc::new(AtomicU64::new(8));
+    let (mut sender, receiver) = tokio::io::duplex(16);
+    sender.write_all(b"abc").await.unwrap();
+    let mut stream = BudgetedStream {
+        inner: receiver,
+        remaining: Arc::clone(&remaining),
+    };
+    let mut data = [0; 6];
+    assert!(
+        timeout(Duration::from_millis(10), stream.read_exact(&mut data))
+            .await
+            .is_err()
+    );
+    assert_eq!(remaining.load(Ordering::Relaxed), 5);
+    assert_eq!(&data[..3], b"abc");
+    drop(stream);
+    assert!(sender.write_all(b"d").await.is_err());
+    let mut next = BudgetedStream {
+        inner: b"next read".as_slice(),
+        remaining: Arc::clone(&remaining),
+    };
+    assert_eq!(next.read(&mut data).await.unwrap(), 5);
+    assert_eq!(&data[..5], b"next ");
+    assert!(next.read(&mut data).await.is_err());
+}
+
+#[tokio::test]
+async fn transport_budget_includes_successful_handshake_bytes() {
+    let remaining = Arc::new(AtomicU64::new(1024));
+    let (client, server) = tokio::io::duplex(1024);
+    let mut client = PeerSession::new(BudgetedStream {
+        inner: client,
+        remaining: Arc::clone(&remaining),
+    });
+    let mut server = PeerSession::new(server);
+    let (sent, accepted) = tokio::join!(
+        client.perform_handshake([0; 20], random_peer_id()),
+        server.accept_handshake(random_peer_id(), |hash| *hash == [0; 20]),
+    );
+    sent.unwrap();
+    accepted.unwrap();
+    assert_eq!(
+        remaining.load(Ordering::Relaxed),
+        1024 - ace_wire::handshake::HANDSHAKE_LEN as u64
+    );
+}
+
+#[tokio::test]
+async fn final_u32_piece_is_a_valid_single_piece_range() {
+    let peer = peer(u32::MAX, u32::MAX, Fault::None).await;
+    let result = fetch_history(
+        &info(),
+        &Identity::generate(),
+        &[peer.addr],
+        HistoryRequest {
+            start_piece: u32::MAX,
+            piece_count: 1,
+        },
+        limits(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.pieces.len(), 1);
+    assert_eq!(result.pieces[0].index, u32::MAX);
+    assert_eq!(
+        &result.pieces[0].payload[..],
+        vec![255; 1024 - source().signature_len()]
+    );
+    assert!(peer
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(piece, _)| *piece == u32::MAX));
 }

@@ -29,6 +29,11 @@ segment grace, in-flight HTTP bodies, peer buffers and runtime metadata add to
 process memory. A viewer does not get another copy of the history store. Replay
 snapshots hold only coordinates and cannot prevent pruning.
 
+Ordinary live playlist, segment and readiness reads also prune expired history.
+A stalled source therefore releases expired history reservations while its
+clients continue polling, without requiring a separate timeshift-status request.
+Its current live window remains available under the normal live retention rules.
+
 Only active HLS packagers collect history. Raw `/ace/getstream` sessions, origin
 HLS redirects and inactive channels do not secretly start recording. History
 ends when the packager is removed and disappears on process restart. The
@@ -84,6 +89,10 @@ a snapshot whose prefix is gone returns 410 rather than a silently truncated
 playlist. A stopped/expired lease or replaced source returns 404. Failed seeks
 and unavailable live returns leave the current view intact.
 
+All Ace compatibility responses, including errors and control results, carry
+`Cache-Control: no-store`. Preserve this policy in a proxy: caching a temporary
+404 or 503 can hide subsequent recovery or return stale playback state.
+
 A paused or slow viewer can fall outside retention. Show an explicit message
 and offer a new seek or return to live. Increasing the limit cannot recover
 media already pruned or media from before acquisition began. Retaining more
@@ -114,6 +123,11 @@ when a piece is unavailable. Dropping the future cancels its connection.
 
 Hard limits include 128 pieces, 64 MiB requested payload, 32 candidate peers,
 60 seconds, bounded control/wire input and one active connection at a time.
+The receive allowance covers the whole operation, including handshakes,
+read-ahead, incomplete frames and bytes received before cancellation or peer
+fallback. Replacing a connection does not reset the allowance. The wire limit
+is twice the requested byte budget plus 512 KiB; a separate decoded-message
+limit also applies.
 The operator example has tighter defaults and a 90-second overall budget that
 also includes resolution/discovery and two comparison fetches:
 

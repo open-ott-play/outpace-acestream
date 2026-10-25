@@ -335,6 +335,9 @@ impl HlsPackager {
     }
 
     fn expire(&self, st: &mut HlsState) {
+        // Readiness polling also keeps stalled/recovering sources alive. Expired
+        // archive reservations must not depend on receiving another media packet.
+        st.history.prune(Instant::now());
         if st.strict
             && matches!(st.status, HlsStatus::Starting | HlsStatus::Recovering)
             && st
@@ -941,7 +944,11 @@ impl HlsPackager {
     }
 
     fn render_playlist(st: &mut HlsState, segment_prefix: &str) -> String {
-        Self::prune_segment_grace(st, Instant::now());
+        let now = Instant::now();
+        // Stalled sources can still serve a live window. Release expired archive
+        // charges while they are read, so they cannot starve other sources' history.
+        st.history.prune(now);
+        Self::prune_segment_grace(st, now);
         let playlist_duration: f64 = st.segments.iter().map(|s| f64::from(s.duration)).sum();
         for segment in &mut st.segments {
             let grace = Duration::from_secs_f64(
@@ -1019,6 +1026,7 @@ impl HlsPackager {
     }
 
     fn retained_segment(st: &mut HlsState, seq: u64, now: Instant) -> Option<Bytes> {
+        st.history.prune(now);
         Self::prune_segment_grace(st, now);
         if seq < st.media_seq {
             return st
@@ -3252,6 +3260,59 @@ mod tests {
         let mut state = p.state.lock().unwrap();
         state.cur = vec![marker; TS_PACKET * 3];
         p.emit_at(&mut state, TS_PACKET * 3, duration, now);
+    }
+
+    #[test]
+    fn live_reads_release_expired_history_budget_for_other_sources() {
+        for read_kind in ["manifest", "segment", "failed-status"] {
+            let config = HlsConfig {
+                startup_segments: 1,
+                ..HlsConfig::default()
+            };
+            let a = HlsPackager::new(config.clone(), None);
+            let b = HlsPackager::new(config, None);
+            let history_config = HlsHistoryConfig {
+                max_seconds: 60,
+                max_bytes: TS_PACKET * 3,
+                global_max_bytes: TS_PACKET * 3,
+            };
+            let budget = HistoryBudget::new(history_config.global_max_bytes);
+            for packager in [&a, &b] {
+                let mut state = packager.state.lock().unwrap();
+                state.history = HistoryStore::new(history_config, budget.clone());
+                state.independent_start = true;
+            }
+            let now = Instant::now();
+            emit_synthetic_at(&a, 1, 5.0, now - Duration::from_secs(61));
+            let original = a.state.lock().unwrap().segments[0].bytes.clone();
+            emit_synthetic_at(&b, 2, 5.0, now);
+            assert_eq!(b.history_status().retained_bytes, 0);
+
+            // A has stalled, but its live viewer keeps requesting already completed
+            // media. Those reads must reclaim expired archive charges without changing
+            // the live window or requiring the viewer to call a timeshift endpoint.
+            match read_kind {
+                "manifest" => {
+                    let playlist = a.playlist_snapshot("/synthetic", false).unwrap();
+                    assert!(playlist.contains("/synthetic/0.ts"));
+                }
+                "segment" => assert_eq!(a.compatibility_segment(0).unwrap(), original),
+                "failed-status" => {
+                    a.fail_generation(GenerationId(0), HlsFailure::Deadline);
+                    assert_eq!(a.status(), HlsStatus::Failed(HlsFailure::Deadline));
+                }
+                _ => unreachable!(),
+            }
+            emit_synthetic_at(&b, 3, 5.0, Instant::now());
+            assert_eq!(
+                b.history_status().retained_bytes,
+                TS_PACKET * 3,
+                "a stalled source must not reserve expired history against another source"
+            );
+            let view = b.prepare_history(Duration::from_secs(1)).unwrap();
+            assert_eq!(view.first_seq, 1);
+            assert_eq!(a.state.lock().unwrap().segments[0].bytes, original);
+        }
     }
 
     #[test]

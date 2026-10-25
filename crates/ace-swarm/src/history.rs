@@ -12,7 +12,7 @@
 //! no detached tasks survive cancellation. Missing pieces never cause a jump to live.
 
 use crate::types::StreamInfo;
-use ace_peer::session::{connect, PeerSession};
+use ace_peer::session::PeerSession;
 use ace_wire::extended::{ExtendedHandshake, LivePosition, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::handshake::random_peer_id;
 use ace_wire::identity::Identity;
@@ -23,8 +23,14 @@ use ace_wire::reassembly::PieceReassembler;
 use bytes::Bytes;
 use std::collections::HashSet;
 use std::fmt;
+use std::io;
 use std::net::SocketAddrV4;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
@@ -322,7 +328,7 @@ async fn fetch_inner(
             Ok(Err(reason)) => failure = reason,
             Err(_) => failure = HistoryFailure::PeerTimeout,
         }
-        if failure == HistoryFailure::ReceiveLimit {
+        if failure == HistoryFailure::ReceiveLimit || budget.exhausted() {
             return Err(HistoryError::ReceiveLimit);
         }
     }
@@ -361,14 +367,21 @@ async fn connect_window(
     info: &StreamInfo,
     peer: SocketAddrV4,
     budget: &mut ReadBudget,
-) -> Result<(PeerSession<TcpStream>, HistoryPeerWindow), HistoryFailure> {
-    let mut session = connect(&peer.to_string())
+) -> Result<(HistorySession, HistoryPeerWindow), HistoryFailure> {
+    if budget.exhausted() {
+        return Err(HistoryFailure::ReceiveLimit);
+    }
+    let stream = TcpStream::connect(peer)
         .await
         .map_err(|_| HistoryFailure::Connect)?;
+    let mut session = PeerSession::new(BudgetedStream {
+        inner: stream,
+        remaining: Arc::clone(&budget.bytes),
+    });
     session
         .perform_handshake(info.infohash, random_peer_id())
         .await
-        .map_err(|_| HistoryFailure::Handshake)?;
+        .map_err(|_| budget.failure(HistoryFailure::Handshake))?;
     for _ in 0..32 {
         if let PeerMessage::Extended { ext_id: 0, payload } = read(&mut session, budget).await? {
             return Ok((session, parse_window(&payload, peer)?));
@@ -403,7 +416,7 @@ fn parse_window(payload: &[u8], peer: SocketAddrV4) -> Result<HistoryPeerWindow,
 
 async fn fetch_piece(
     info: &StreamInfo,
-    session: &mut PeerSession<TcpStream>,
+    session: &mut HistorySession,
     piece: u32,
     window: &mut HistoryPeerWindow,
     budget: &mut ReadBudget,
@@ -477,33 +490,87 @@ async fn fetch_piece(
     }
 }
 
+type HistorySession = PeerSession<BudgetedStream<TcpStream>>;
+
+/// One independent peer connection reads at a time. Keeping the counter outside
+/// the session charges handshake, read-ahead and partial frames even when that
+/// session is dropped by a timeout or fallback. Atomic storage keeps the future
+/// Send without holding a lock across I/O.
+struct BudgetedStream<S> {
+    inner: S,
+    remaining: Arc<AtomicU64>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for BudgetedStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let this = self.get_mut();
+        let available = this.remaining.load(Ordering::Relaxed);
+        if available == 0 {
+            return Poll::Ready(Err(io::Error::other("history receive budget exhausted")));
+        }
+        let limit = usize::try_from(available)
+            .unwrap_or(usize::MAX)
+            .min(buf.remaining());
+        let mut limited = ReadBuf::new(buf.initialize_unfilled_to(limit));
+        let result = Pin::new(&mut this.inner).poll_read(cx, &mut limited);
+        let received = limited.filled().len();
+        this.remaining.fetch_sub(received as u64, Ordering::Relaxed);
+        buf.advance(received);
+        result
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for BudgetedStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 struct ReadBudget {
-    bytes: u64,
+    bytes: Arc<AtomicU64>,
     messages: usize,
 }
 
 impl ReadBudget {
     fn new(limits: HistoryLimits) -> Self {
         Self {
-            bytes: limits.max_bytes * 2 + 512 * 1024,
+            bytes: Arc::new(AtomicU64::new(limits.max_bytes * 2 + 512 * 1024)),
             messages: MAX_MESSAGES,
         }
     }
 
-    fn consume(&mut self, msg: &PeerMessage) -> Result<(), HistoryFailure> {
-        // Conservative framing overhead; accounting never serializes/copies a payload.
-        let payload = match msg {
-            PeerMessage::Piece { block, .. } => block.len(),
-            PeerMessage::Extended { payload, .. } | PeerMessage::Unknown { payload, .. } => {
-                payload.len()
-            }
-            PeerMessage::Bitfield(bits) => bits.len(),
-            _ => 0,
-        } as u64;
-        self.bytes = self
-            .bytes
-            .checked_sub(payload + 32)
-            .ok_or(HistoryFailure::ReceiveLimit)?;
+    fn exhausted(&self) -> bool {
+        self.bytes.load(Ordering::Relaxed) == 0
+    }
+
+    fn failure(&self, fallback: HistoryFailure) -> HistoryFailure {
+        if self.exhausted() {
+            HistoryFailure::ReceiveLimit
+        } else {
+            fallback
+        }
+    }
+
+    fn consume_message(&mut self) -> Result<(), HistoryFailure> {
         self.messages = self
             .messages
             .checked_sub(1)
@@ -513,14 +580,17 @@ impl ReadBudget {
 }
 
 async fn read(
-    session: &mut PeerSession<TcpStream>,
+    session: &mut HistorySession,
     budget: &mut ReadBudget,
 ) -> Result<PeerMessage, HistoryFailure> {
+    if budget.messages == 0 {
+        return Err(HistoryFailure::ReceiveLimit);
+    }
     let msg = session
         .read_message()
         .await
-        .map_err(|_| HistoryFailure::PeerIo)?;
-    budget.consume(&msg)?;
+        .map_err(|_| budget.failure(HistoryFailure::PeerIo))?;
+    budget.consume_message()?;
     Ok(msg)
 }
 

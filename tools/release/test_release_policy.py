@@ -53,15 +53,46 @@ class ReleasePolicyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 policy.validate_release("v0.9.0", document)
 
-    def test_beta_can_create_or_resume_only_an_unpublished_beta_draft(self):
-        tag = "v0.9.0-beta.1"
-        policy.ensure_unpublished(tag, [])
-        policy.ensure_unpublished(tag, [release(tag, draft=True)])
-        for document in ([release(tag)], [release(tag, draft=True, prerelease=False)]):
-            with self.assertRaises(ValueError):
-                policy.ensure_unpublished(tag, document)
-        with self.assertRaises(ValueError):
-            policy.ensure_unpublished("v0.9.0", [])
+    def test_both_channels_can_create_or_resume_only_matching_unpublished_drafts(self):
+        for tag in ("v0.9.0", "v0.9.0-beta.1"):
+            with self.subTest(tag=tag):
+                policy.ensure_unpublished(tag, [])
+                policy.ensure_unpublished(tag, [release(tag, draft=True)])
+                for document in ([release(tag)],
+                                 [release(tag, draft=True, prerelease="beta" not in tag)]):
+                    with self.assertRaises(ValueError):
+                        policy.ensure_unpublished(tag, document)
+
+    def test_publication_promotes_only_newest_stable_and_never_beta(self):
+        for tag, other, expected in (
+            ("v0.9.0", "v0.8.9", "true"),
+            ("v0.10.0", "v0.9.9", "true"),
+            ("v0.9.1", "v0.10.0", "false"),
+            ("v1.2.3", "v2.0.0", "false"),
+            ("v1.2.3", "v9.0.0-beta.1", "true"),
+            ("v1.2.3-beta.1", "v0.1.0", "false"),
+            ("v1.2.3-beta.2", "v1.2.3-beta.1", "false"),
+        ):
+            with self.subTest(tag=tag, other=other):
+                self.assertEqual(policy.publication_metadata(
+                    tag, [release(tag, draft=True), release(other)]),
+                    {"make_latest": expected})
+        self.assertEqual(policy.publication_metadata("v1.2.3", [
+            release("v1.2.3", draft=True), release("v9.0.0", draft=True),
+            release("legacy")]), {"make_latest": "true"})
+        self.assertEqual(policy.publication_metadata(
+            "v1.2.3-beta.1", [release("v1.2.3-beta.1", draft=True)]),
+            {"make_latest": "false"})
+
+    def test_publication_rechecks_matching_draft_and_rejects_inconsistent_inventory(self):
+        for tag in ("v0.9.0", "v0.9.0-beta.1"):
+            for document in ([], [release("v0.8.0")], [release(tag)],
+                             [release(tag, draft=True, prerelease="beta" not in tag)],
+                             [release(tag, draft=True), release(tag, draft=True)],
+                             [release(tag, draft=True), release("v1.0.0", prerelease=True)],
+                             [release(tag, draft=True), {"tag_name": "legacy"}]):
+                with self.subTest(tag=tag, document=document), self.assertRaises(ValueError):
+                    policy.publication_metadata(tag, document)
 
     def test_channels_compare_versions_numerically_and_independently(self):
         for tag, other in (("v0.9.0-beta.10", "v0.9.0-beta.2"),
@@ -111,6 +142,16 @@ class ReleasePolicyTests(unittest.TestCase):
                                        text=True, capture_output=True)
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("newer beta", completed.stderr)
+            document.write_text(json.dumps([release("v0.9.1", draft=True), release("v0.10.0")]))
+            completed = subprocess.run([sys.executable, script, "publication", "v0.9.1", str(document)],
+                                       text=True, capture_output=True)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout, "make_latest=false\n")
+            document.write_text(json.dumps([release("v0.9.1")]))
+            completed = subprocess.run([sys.executable, script, "publication", "v0.9.1", str(document)],
+                                       text=True, capture_output=True)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(completed.stdout, "")
 
 
 if __name__ == "__main__":

@@ -683,6 +683,155 @@ async fn cancelled_direct_start_and_queued_request_release_only_their_hidden_lea
     assert!(manager.list().await.is_empty());
 }
 
+struct PendingStartProvider {
+    opens: Arc<std::sync::atomic::AtomicUsize>,
+    cancelled: Arc<std::sync::atomic::AtomicUsize>,
+    resume_waiter: bool,
+}
+
+struct PendingOpenGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for PendingOpenGuard {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl StreamProvider for PendingStartProvider {
+    fn network(&self) -> &'static str {
+        "fix"
+    }
+
+    async fn open(&self, _id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+        let previous = self.opens.fetch_add(1, Ordering::SeqCst);
+        if previous > 0 && self.resume_waiter {
+            return Ok(Box::new(FixtureSource { pos: 0 }));
+        }
+        let _guard = PendingOpenGuard(self.cancelled.clone());
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn stopping_pending_playback_releases_same_source_waiter() {
+    use std::sync::atomic::AtomicUsize;
+
+    let opens = Arc::new(AtomicUsize::new(0));
+    let cancelled = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(PendingStartProvider {
+        opens: opens.clone(),
+        cancelled: cancelled.clone(),
+        resume_waiter: true,
+    }));
+    let mut state = ace_compat_state(0);
+    state.manager = StreamManager::new(registry);
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    let stopped = state.ace_sessions.mint(id.into(), id.into());
+    let surviving = state.ace_sessions.mint(id.into(), id.into());
+    let app = router(state.clone());
+    let request = |token: &str| {
+        Box::pin(
+            app.clone().oneshot(
+                Request::get(format!("/ace/r/{id}/{token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+    };
+    let mut first = request(&stopped);
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    let mut second = request(&surviving);
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/ace/cmd/{id}/{stopped}?method=stop"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = tokio::time::timeout(Duration::from_secs(1), first)
+        .await
+        .expect("stop must cancel the pending provider open")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+
+    let response = tokio::time::timeout(Duration::from_secs(1), second)
+        .await
+        .expect("another viewer must acquire the released same-source start lock")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(opens.load(Ordering::SeqCst), 2);
+    assert!(state.ace_sessions.validate(id, &surviving).is_some());
+    assert_eq!(
+        state
+            .manager
+            .get("fix", id)
+            .await
+            .unwrap()
+            .subscriber_count(),
+        1
+    );
+    drop(response);
+    state.manager.shutdown().await;
+}
+
+async fn assert_pending_playback_expires(direct: bool) {
+    use std::sync::atomic::AtomicUsize;
+
+    let opens = Arc::new(AtomicUsize::new(0));
+    let cancelled = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(PendingStartProvider {
+        opens: opens.clone(),
+        cancelled: cancelled.clone(),
+        resume_waiter: false,
+    }));
+    let mut state = ace_compat_state(0);
+    state.manager = StreamManager::new(registry);
+    state.ace_sessions = Arc::new(AceSessionStore::new(Duration::from_secs(1), 8));
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    let path = if direct {
+        format!("/ace/getstream?infohash={id}")
+    } else {
+        let token = state.ace_sessions.mint(id.into(), id.into());
+        format!("/ace/r/{id}/{token}")
+    };
+    let mut request =
+        Box::pin(router(state.clone()).oneshot(Request::get(path).body(Body::empty()).unwrap()));
+    assert!(futures::poll!(request.as_mut()).is_pending());
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let response = tokio::time::timeout(Duration::from_secs(1), request)
+        .await
+        .expect("lease expiry must interrupt a provider that never completes")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+    assert!(state.manager.list().await.is_empty());
+    if direct {
+        assert_eq!(state.ace_sessions.active_count(), 0);
+    }
+    state.manager.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_direct_playback_expires_without_provider_completion() {
+    assert_pending_playback_expires(true).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_json_playback_expires_without_provider_completion() {
+    assert_pending_playback_expires(false).await;
+}
+
 #[tokio::test]
 async fn ace_playback_start_failures_are_distinct_from_unregistered_network() {
     struct FailingProvider;

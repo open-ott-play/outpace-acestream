@@ -31,6 +31,9 @@ const PCR_MODULUS: u64 = 1 << 33;
 const SDT_PID: u16 = 0x0011;
 const SEGMENT_GRACE_MAX_COUNT: usize = 32;
 const SEGMENT_GRACE_MAX_AGE: Duration = Duration::from_secs(120);
+// Finalized segments cannot reuse assembly capacity. Reclaim substantial slack once,
+// before live/history/grace share the allocation; leave smaller savings zero-copy.
+const SEGMENT_COMPACTION_MIN_SAVINGS: usize = 256 * 1024;
 
 /// A monotonically increasing token fencing writes from retired workers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -837,8 +840,7 @@ impl HlsPackager {
         let mut seg = std::mem::replace(&mut st.cur, rest);
         st.audio.emitted(&mut seg);
         let discontinuity = std::mem::take(&mut st.discontinuity_pending);
-        let allocation_bytes = seg.capacity();
-        let bytes = Bytes::from(seg);
+        let (bytes, allocation_bytes) = Self::freeze_segment(seg);
         let seq = st.media_seq + st.segments.len() as u64;
         st.history.push(
             seq,
@@ -868,6 +870,20 @@ impl HlsPackager {
         }
         st.max_segment_duration = st.max_segment_duration.max(duration);
         st.scanned_packets = 0;
+    }
+
+    fn freeze_segment(segment: Vec<u8>) -> (Bytes, usize) {
+        if segment.capacity() - segment.len() >= SEGMENT_COMPACTION_MIN_SAVINGS {
+            // Unlike shrink_to_fit's best effort, conversion to a boxed slice removes
+            // excess capacity. Charge that owned allocation, not the old Vec capacity
+            // or merely the visible length of a still-overallocated Bytes buffer.
+            let compact = segment.into_boxed_slice();
+            let allocation_bytes = compact.len();
+            (Bytes::from(compact), allocation_bytes)
+        } else {
+            let allocation_bytes = segment.capacity();
+            (Bytes::from(segment), allocation_bytes)
+        }
     }
 
     fn prune_segment_grace(st: &mut HlsState, now: Instant) {
@@ -1035,9 +1051,8 @@ impl HlsPackager {
                 .find(|segment| segment.seq == seq)
                 .map(|segment| segment.bytes.clone());
         }
-        st.segments
-            .get((seq - st.media_seq) as usize)
-            .map(|segment| segment.bytes.clone())
+        let index = usize::try_from(seq.checked_sub(st.media_seq)?).ok()?;
+        st.segments.get(index).map(|segment| segment.bytes.clone())
     }
 
     pub(crate) fn was_accessed_within(&self, now: Instant, grace: Duration) -> bool {
@@ -3260,6 +3275,128 @@ mod tests {
         let mut state = p.state.lock().unwrap();
         state.cur = vec![marker; TS_PACKET * 3];
         p.emit_at(&mut state, TS_PACKET * 3, duration, now);
+    }
+
+    #[test]
+    fn completed_segment_compaction_preserves_small_slack_and_charges_owned_capacity() {
+        let payload_len = TS_PACKET * 3;
+        for spare in [
+            0,
+            SEGMENT_COMPACTION_MIN_SAVINGS - 1,
+            SEGMENT_COMPACTION_MIN_SAVINGS,
+            SEGMENT_COMPACTION_MIN_SAVINGS + 1,
+        ] {
+            // A boxed slice converted to Vec has this exact capacity on every allocator.
+            let mut segment = vec![0x47; payload_len + spare]
+                .into_boxed_slice()
+                .into_vec();
+            segment.truncate(payload_len);
+            let original_ptr = segment.as_ptr();
+            let (bytes, charge) = HlsPackager::freeze_segment(segment);
+            assert_eq!(&bytes[..], vec![0x47; payload_len]);
+            if spare < SEGMENT_COMPACTION_MIN_SAVINGS {
+                assert_eq!(bytes.as_ptr(), original_ptr, "small savings stay zero-copy");
+                assert_eq!(charge, payload_len + spare);
+            } else {
+                assert_eq!(charge, payload_len);
+            }
+            // Recover the uniquely owned allocation: a smaller charge must correspond
+            // to a genuinely smaller capacity, not an undercharged Bytes view.
+            let owned: Vec<u8> = bytes.into();
+            assert_eq!(owned.capacity(), charge);
+        }
+    }
+
+    #[test]
+    fn compact_segments_share_media_across_live_history_and_grace_within_budgets() {
+        let p = HlsPackager::new(
+            HlsConfig {
+                window_segments: 1,
+                startup_segments: 1,
+                ..HlsConfig::default()
+            },
+            None,
+        );
+        let payload_len = TS_PACKET * 4096;
+        let history_config = HlsHistoryConfig {
+            max_seconds: 60,
+            max_bytes: payload_len * 3,
+            global_max_bytes: payload_len * 3,
+        };
+        p.state.lock().unwrap().history = HistoryStore::new(
+            history_config,
+            HistoryBudget::new(history_config.global_max_bytes),
+        );
+        let now = Instant::now();
+        let mut shared = Vec::new();
+        for seq in 0..3 {
+            let mut state = p.state.lock().unwrap();
+            state.cur = vec![seq as u8; payload_len * 2]
+                .into_boxed_slice()
+                .into_vec();
+            state.cur.truncate(payload_len);
+            state.cur.extend_from_slice(&[0x47; TS_PACKET]);
+            state.independent_start = true;
+            state.discontinuity_pending = seq == 0;
+            p.emit_at(&mut state, payload_len, 6.0, now);
+            assert_eq!(
+                state.cur,
+                vec![0x47; TS_PACKET],
+                "the un-emitted tail survives"
+            );
+            let segment = state.segments.back().unwrap();
+            assert_eq!(segment.allocation_bytes, payload_len);
+            assert_eq!(segment.duration, 6.0);
+            assert_eq!(segment.discontinuity, seq == 0);
+            assert_eq!(&segment.bytes[..], vec![seq as u8; payload_len]);
+            shared.push(segment.bytes.clone());
+            drop(state);
+            p.compatibility_playlist_with_segment_prefix("/synthetic");
+        }
+        let view = p.prepare_history(Duration::from_secs(15)).unwrap();
+        assert_eq!((view.first_seq, view.last_seq), (0, 2));
+        assert_eq!(p.history_status().retained_bytes, payload_len * 3);
+        for (seq, original) in shared.iter().enumerate() {
+            let replay = p.history_segment(&view, seq as u64).unwrap();
+            let live_or_grace = p.compatibility_segment(seq as u64).unwrap();
+            assert_eq!(replay.as_ptr(), original.as_ptr());
+            assert_eq!(live_or_grace.as_ptr(), original.as_ptr());
+            assert_eq!(replay, *original);
+        }
+        let mut state = p.state.lock().unwrap();
+        assert_eq!(state.media_seq, 2);
+        assert_eq!(state.retired_bytes, payload_len * 2);
+        assert_eq!(state.retired_segments.len(), 2);
+        // Compaction saves space but never weakens either history or grace accounting.
+        assert!(state.retired_bytes <= HLS_SEGMENT_GRACE_MAX_BYTES);
+        state.history.prune(now + Duration::from_secs(61));
+        assert_eq!(
+            state
+                .history
+                .status(now + Duration::from_secs(61))
+                .retained_bytes,
+            0
+        );
+        HlsPackager::prune_segment_grace(&mut state, now + Duration::from_secs(61));
+        assert_eq!(state.retired_bytes, 0);
+    }
+
+    #[test]
+    fn segment_lookup_rejects_wide_offsets_without_aliasing_retained_media() {
+        let p = pkg();
+        let now = Instant::now();
+        // On a 32-bit target, the old narrowing cast mapped MAX - u32::MAX to zero.
+        p.state.lock().unwrap().media_seq = u64::from(u32::MAX);
+        emit_synthetic_at(&p, 7, 6.0, now);
+        let mut state = p.state.lock().unwrap();
+        let expected = state.segments[0].bytes.clone();
+        assert_eq!(
+            HlsPackager::retained_segment(&mut state, u64::from(u32::MAX), now),
+            Some(expected)
+        );
+        assert!(HlsPackager::retained_segment(&mut state, u64::MAX, now).is_none());
+        assert!(HlsPackager::retained_segment(&mut state, 0, now).is_none());
+        assert!(HlsPackager::retained_segment(&mut state, u64::from(u32::MAX) + 1, now).is_none());
     }
 
     #[test]

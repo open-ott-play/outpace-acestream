@@ -769,9 +769,10 @@ impl StreamManager {
             }
             controls
         };
-        for control in controls {
-            control.join().await;
-        }
+        // A child reap can wait on OS cleanup indefinitely. Transfer its join to
+        // the existing coordinator so it cannot delay later idle sweeps for
+        // unrelated sources. Explicit stop/shutdown still await owned cleanup.
+        drop(controls);
     }
 
     /// The reaper holds only a Weak manager, including while sleeping.
@@ -2396,6 +2397,61 @@ mod tests {
         .unwrap();
         release_cleanup.notify_one();
         stopping.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_sweeps_progress_while_cleanup_is_pending_and_shutdown_still_joins() {
+        let (manager, cleanup_started, release_cleanup) =
+            manager_with_blocking_worker_for_test().await;
+        let stale = Instant::now() - manager.grace - Duration::from_secs(1);
+        manager
+            .get_hls("test", "slow-cleanup")
+            .await
+            .unwrap()
+            .set_last_access_for_test(stale);
+
+        let first_sweep =
+            tokio::time::timeout(Duration::from_secs(1), manager.reap_idle_at(Instant::now()))
+                .await;
+        if first_sweep.is_err() {
+            release_cleanup.notify_one();
+            manager.shutdown().await;
+            panic!("idle sweep must transfer cleanup without waiting for child reap");
+        }
+        tokio::time::timeout(Duration::from_secs(1), cleanup_started.notified())
+            .await
+            .expect("removed worker must receive cancellation");
+        assert!(manager.get_hls("test", "slow-cleanup").await.is_none());
+        let pending = manager.cleanup.pending.lock().unwrap().clone();
+        assert!(
+            pending.iter().any(|done| !*done.borrow()),
+            "the coordinator must retain unfinished cleanup ownership"
+        );
+
+        let second = manager
+            .get_or_start_hls("test", "later-idle")
+            .await
+            .unwrap();
+        second.set_last_access_for_test(stale);
+        tokio::time::timeout(Duration::from_secs(1), manager.reap_idle_at(Instant::now()))
+            .await
+            .expect("a later idle sweep must progress while prior cleanup is pending");
+        assert!(manager.get("test", "later-idle").await.is_none());
+        assert!(manager.get_hls("test", "later-idle").await.is_none());
+        assert_eq!(second.status(), crate::hls::HlsStatus::Stopped);
+
+        // Cancelling a shutdown waiter must not abandon the transferred join.
+        {
+            let mut shutdown = Box::pin(manager.shutdown());
+            assert!(futures::poll!(shutdown.as_mut()).is_pending());
+        }
+        assert!(pending.iter().any(|done| !*done.borrow()));
+        release_cleanup.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), manager.shutdown())
+            .await
+            .expect("shutdown must join transferred workers after cleanup is released");
+        assert!(pending.iter().all(|done| *done.borrow()));
+        assert!(manager.cleanup.pending.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

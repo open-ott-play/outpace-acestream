@@ -65,6 +65,7 @@ pub(super) async fn activate_upstream_peer(
     // leaves its runtime, gossip reader, and request slots intact.
     let replaced = replacing.and_then(|(peers, id)| drop_peer_runtime(id, peers, continuity));
     continuity.register_active_peer(peer_id, upstream.addr, upstream.window);
+    continuity.set_peer_unchoked(peer_id, upstream.unchoked);
     if continuity.reconnect_pool {
         continuity.recovery_event(RecoveryEvent::UpstreamReconnect);
     }

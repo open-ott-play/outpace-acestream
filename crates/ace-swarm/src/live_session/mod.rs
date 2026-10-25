@@ -179,6 +179,8 @@ pub(super) struct ConnectedUpstream {
     pub(super) session: PeerSession<TcpStream>,
     pub(super) addr: SocketAddrV4,
     pub(super) window: WireLivePosition,
+    /// Latest choke state received before the live window; the peer need not repeat it.
+    pub(super) unchoked: bool,
     /// The public IP this peer echoed to us in `yourip`, if any — harvested for reachability
     /// observability (issue #22) when this upstream is activated.
     pub(super) yourip: Option<IpAddr>,

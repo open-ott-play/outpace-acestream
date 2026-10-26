@@ -36,7 +36,7 @@ async fn source_offer_is_available_without_compat_or_active_streams() {
     let metadata: serde_json::Value = serde_json::from_str(crate::source::METADATA).unwrap();
     assert_eq!(
         metadata["source_sha256"],
-        format!("{:x}", Sha256::digest(&bytes))
+        hex::encode(Sha256::digest(&bytes))
     );
     let response = app
         .oneshot(

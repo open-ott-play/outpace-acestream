@@ -34,6 +34,13 @@ pub struct Bundle {
     pub sha256: String,
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
@@ -235,7 +242,7 @@ pub fn package(root: &Path) -> io::Result<Bundle> {
             }
             entry.mode = mode;
         }
-        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let digest = sha256_hex(&bytes);
         if !entry.sha256.is_empty() && entry.sha256 != digest {
             manifest.tree_state = "modified".into();
         }
@@ -270,7 +277,7 @@ pub fn package(root: &Path) -> io::Result<Bundle> {
     archive.append_data(&mut header, format!("{PREFIX}/{MANIFEST}"), &bytes[..])?;
     let bytes = archive.into_inner()?.finish()?;
     Ok(Bundle {
-        sha256: format!("{:x}", Sha256::digest(&bytes)),
+        sha256: sha256_hex(&bytes),
         bytes,
         paths: paths.into_iter().collect(),
         revision: manifest.base_revision,

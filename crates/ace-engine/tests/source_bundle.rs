@@ -165,3 +165,26 @@ fn exported_inventory_cannot_escape_the_source_root() {
     fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
     assert!(source_bundle::package(&root).is_err());
 }
+
+#[test]
+fn sha256_representation_preserves_manifest_and_archive_hashes() {
+    use sha2::{Digest, Sha256};
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("README.md"), b"abc").unwrap();
+    let bundle = source_bundle::package(&fixture.0).unwrap();
+    let files = contents(&bundle.bytes);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&files["outpace-acestream/SOURCE-MANIFEST.json"]).unwrap();
+    let readme = manifest["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == "README.md")
+        .unwrap();
+    assert_eq!(
+        readme["sha256"],
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(bundle.sha256, hex::encode(Sha256::digest(&bundle.bytes)));
+    assert_eq!(bundle.sha256.len(), 64);
+}

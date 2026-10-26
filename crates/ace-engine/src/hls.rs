@@ -998,6 +998,8 @@ impl HlsPackager {
     }
 
     fn render_playlist(st: &mut HlsState, segment_prefix: &str) -> String {
+        use std::fmt::Write as _;
+
         let now = Instant::now();
         // Stalled sources can still serve a live window. Release expired archive
         // charges while they are read, so they cannot starve other sources' history.
@@ -1012,32 +1014,30 @@ impl HlsPackager {
             segment.advertised_grace =
                 Some(segment.advertised_grace.unwrap_or_default().max(grace));
         }
+        // Formatting into a String is infallible; avoid temporary strings per line.
         let mut out = String::from("#EXTM3U\n#EXT-X-VERSION:3\n");
-        out.push_str(&format!(
-            "#EXT-X-TARGETDURATION:{}\n",
+        let _ = writeln!(
+            out,
+            "#EXT-X-TARGETDURATION:{}",
             st.max_segment_duration.ceil() as u64
-        ));
+        );
         if let Some(offset) = Self::advisory_start_offset(st) {
-            out.push_str(&format!(
-                "#EXT-X-START:TIME-OFFSET=-{offset:.3},PRECISE=NO\n"
-            ));
+            let _ = writeln!(out, "#EXT-X-START:TIME-OFFSET=-{offset:.3},PRECISE=NO");
         }
-        out.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", st.media_seq));
+        let _ = writeln!(out, "#EXT-X-MEDIA-SEQUENCE:{}", st.media_seq);
         if st.discontinuity_sequence != 0 {
-            out.push_str(&format!(
-                "#EXT-X-DISCONTINUITY-SEQUENCE:{}\n",
+            let _ = writeln!(
+                out,
+                "#EXT-X-DISCONTINUITY-SEQUENCE:{}",
                 st.discontinuity_sequence
-            ));
+            );
         }
         for (i, segment) in st.segments.iter().enumerate() {
             if segment.discontinuity {
                 out.push_str("#EXT-X-DISCONTINUITY\n");
             }
-            out.push_str(&format!("#EXTINF:{:.3},\n", segment.duration));
-            out.push_str(&format!(
-                "{segment_prefix}/{}.ts\n",
-                st.media_seq + i as u64
-            ));
+            let _ = writeln!(out, "#EXTINF:{:.3},", segment.duration);
+            let _ = writeln!(out, "{segment_prefix}/{}.ts", st.media_seq + i as u64);
         }
         if st.ended {
             out.push_str("#EXT-X-ENDLIST\n");
@@ -2060,7 +2060,22 @@ mod tests {
         drop(state);
 
         let playlist = p.playlist("test", "synthetic");
-        assert!(playlist.contains("#EXT-X-START:TIME-OFFSET=-29.000,PRECISE=NO"));
+        assert_eq!(
+            playlist,
+            concat!(
+                "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:7\n",
+                "#EXT-X-START:TIME-OFFSET=-29.000,PRECISE=NO\n",
+                "#EXT-X-MEDIA-SEQUENCE:0\n",
+                "#EXTINF:4.000,\n/streams/test/synthetic/seg/0.ts\n",
+                "#EXTINF:6.000,\n/streams/test/synthetic/seg/1.ts\n",
+                "#EXTINF:5.000,\n/streams/test/synthetic/seg/2.ts\n",
+                "#EXTINF:7.000,\n/streams/test/synthetic/seg/3.ts\n",
+                "#EXTINF:4.000,\n/streams/test/synthetic/seg/4.ts\n",
+                "#EXTINF:6.000,\n/streams/test/synthetic/seg/5.ts\n",
+                "#EXTINF:5.000,\n/streams/test/synthetic/seg/6.ts\n",
+                "#EXTINF:7.000,\n/streams/test/synthetic/seg/7.ts\n",
+            )
+        );
     }
 
     #[test]
@@ -2674,6 +2689,38 @@ mod tests {
         assert!(p.segment(1).is_none());
         assert_eq!(p.segment(3).unwrap().len(), 3 * TS_PACKET);
         assert!(p.segment(99).is_none());
+    }
+
+    #[test]
+    fn playlist_bytes_preserve_sliding_discontinuities_and_eof() {
+        let p = pkg();
+        assert_eq!(
+            p.compatibility_playlist_with_segment_prefix("/synthetic/seg"),
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n"
+        );
+
+        let now = Instant::now();
+        p.state.lock().unwrap().discontinuity_pending = true;
+        emit_synthetic_at(&p, 0, 1.25, now);
+        emit_synthetic_at(&p, 1, 10.0 / 3.0, now);
+        p.state.lock().unwrap().discontinuity_pending = true;
+        emit_synthetic_at(&p, 2, 0.001, now);
+        // The three-segment window evicts its first discontinuity here.
+        emit_synthetic_at(&p, 3, 1.5, now);
+        let expected = concat!(
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n",
+            "#EXT-X-MEDIA-SEQUENCE:1\n#EXT-X-DISCONTINUITY-SEQUENCE:1\n",
+            "#EXTINF:3.333,\n/synthetic/seg/1.ts\n",
+            "#EXT-X-DISCONTINUITY\n#EXTINF:0.001,\n/synthetic/seg/2.ts\n",
+            "#EXTINF:1.500,\n/synthetic/seg/3.ts\n",
+        );
+        assert_eq!(p.playlist_with_segment_prefix("/synthetic/seg"), expected);
+
+        p.finish();
+        assert_eq!(
+            p.compatibility_playlist_with_segment_prefix("/synthetic/seg"),
+            [expected, "#EXT-X-ENDLIST\n"].concat()
+        );
     }
 
     #[test]

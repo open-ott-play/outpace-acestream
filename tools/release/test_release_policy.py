@@ -3,6 +3,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 
 import release_policy as policy
@@ -14,6 +15,33 @@ def release(tag, *, draft=False, prerelease=None):
 
 
 class ReleasePolicyTests(unittest.TestCase):
+    def test_repository_release_version_matches_both_workspace_locks(self):
+        root = Path(__file__).resolve().parents[2]
+        workspace = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]
+        version = workspace["package"]["version"]
+        members = {}
+        for directory in workspace["members"]:
+            package = tomllib.loads((root / directory / "Cargo.toml").read_text())["package"]
+            self.assertEqual(package["version"], {"workspace": True}, directory)
+            members[package["name"]] = version
+        fuzz = tomllib.loads((root / "fuzz/Cargo.toml").read_text())
+        fuzz_members = {
+            name for name, dependency in fuzz["dependencies"].items()
+            if isinstance(dependency, dict) and "path" in dependency
+        }
+        self.assertTrue(fuzz_members)
+        self.assertLessEqual(fuzz_members, members.keys())
+        for filename, required in (("Cargo.lock", members.keys()),
+                                   ("fuzz/Cargo.lock", fuzz_members)):
+            packages = tomllib.loads((root / filename).read_text())["package"]
+            local = {package["name"]: package for package in packages
+                     if package["name"] in members}
+            with self.subTest(lock=filename):
+                self.assertLessEqual(required, local.keys())
+                for name, package in local.items():
+                    self.assertNotIn("source", package, name)
+                    self.assertEqual(package["version"], members[name], name)
+
     def test_only_canonical_stable_and_numbered_beta_tags_are_accepted(self):
         for tag in ("v0.0.0", "v1.20.3", "v0.9.0-beta.1", "v2.10.0-beta.123"):
             with self.subTest(tag=tag):

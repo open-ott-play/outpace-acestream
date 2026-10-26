@@ -288,3 +288,306 @@ fn resync_synthetic_vector_keeps_prefix_and_resumes_without_new_psi() {
     assert_eq!(markers(&output[1].bytes), b"rs");
     assert!(output[1].discontinuity);
 }
+
+struct BufferedOutputFixture {
+    info: StreamInfo,
+    continuity: Continuity,
+    seed: SeedConfig,
+    store: Arc<tokio::sync::Mutex<PieceStore>>,
+    producer: SocketAddrV4,
+}
+
+async fn buffered_output_fixture() -> BufferedOutputFixture {
+    let auth = ace_wire::live_auth::LiveSourceAuth::generate();
+    let payload = [
+        pat(PMT),
+        pmt(PMT, VIDEO, 0x1b),
+        packet(VIDEO, b'a', true),
+        packet(VIDEO, b'b', false),
+        packet(VIDEO, b'c', false),
+    ]
+    .concat();
+    let mut signed = payload.clone();
+    signed.extend(auth.sign(&payload));
+    let info = StreamInfo {
+        infohash: [0; 20],
+        piece_length: signed.len() as u64,
+        chunk_length: signed.len() as u64,
+        trackers: vec![],
+        metadata: Default::default(),
+        sig_len: auth.signature_len(),
+        source_pubkey: auth.pubkey_der(),
+    };
+    let policy = LiveRecoveryConfig {
+        max_active_upstreams: 1,
+        request_timeout_ms: 20,
+        request_check_interval_ms: 5,
+        ..LiveRecoveryConfig::default()
+    };
+    let seed = SeedConfig {
+        metrics: None,
+        registry: SeedRegistry::new(),
+        store_factory: test_store_factory(4096, None),
+        enabled: false,
+        prefetch_pieces: 1,
+        live_recovery: policy,
+        warm_peers: WarmPeerCache::new(std::path::Path::new(""), true),
+    };
+    let store = Arc::new(tokio::sync::Mutex::new(PieceStore::new(
+        info.piece_length,
+        info.chunk_length,
+        4096,
+    )));
+    let (mut continuity, _) = Continuity::fresh(&info, 0, 1, 1, policy);
+    let chunk = LiveChunk::from_message(&build_piece(0, 1, 0, [0; 8], &signed)).unwrap();
+    let accepted = continuity
+        .receive_live_chunk(&chunk, info.chunk_length, &store, Instant::now())
+        .await
+        .unwrap();
+    assert!(accepted.contributed && accepted.progressed);
+    assert!(continuity.note_chunk(1, 0, 1));
+    assert_eq!(continuity.reasm.next_needed(), 0);
+    assert!(continuity.reasm.has_complete_piece(1));
+    // The retained data came from a different transport, not the announcing peer below.
+    let producer = SocketAddrV4::new([127, 0, 0, 2].into(), 8621);
+    continuity.piece_producers.insert(1, Some(producer));
+    BufferedOutputFixture {
+        info,
+        continuity,
+        seed,
+        store,
+        producer,
+    }
+}
+
+async fn buffered_output_after_window_move(eviction: bool) {
+    let fixture = buffered_output_fixture().await;
+    let warm = fixture.seed.warm_peers.clone();
+    let producer = fixture.producer;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = match listener.local_addr().unwrap() {
+        std::net::SocketAddr::V4(addr) => addr,
+        _ => unreachable!(),
+    };
+    let client = TcpStream::connect(addr).await.unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (advance_tx, advance_rx) = tokio::sync::oneshot::channel();
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async move {
+        let mut session = PeerSession::new(server);
+        loop {
+            if matches!(
+                session.read_message().await.unwrap(),
+                PeerMessage::Interested
+            ) {
+                break;
+            }
+        }
+        ready_tx.send(()).unwrap();
+        advance_rx.await.unwrap();
+        let announcement = if eviction {
+            let mut payload = vec![0; 4];
+            payload.extend_from_slice(&1u32.to_be_bytes());
+            PeerMessage::Unknown { id: 10, payload }
+        } else {
+            PeerMessage::Have(2)
+        };
+        session.send(&announcement).await.unwrap();
+        // Deliberately no Piece (or any other message) after the cursor-moving event.
+        // The complete, verified piece is already in the retained reassembler.
+        finish_rx.await.unwrap();
+    });
+    let (tx, mut rx) = mpsc::channel(1);
+    tasks.spawn(async move {
+        let mut continuity = Some(fixture.continuity);
+        let mut candidates = SessionCandidates::default();
+        candidates.learn(addr, CandidateKind::Source);
+        candidates.failed(addr, Instant::now() + Duration::from_secs(60));
+        let end = follow_peer_pool(
+            vec![ConnectedUpstream {
+                session: PeerSession::new(client),
+                addr,
+                window: WireLivePosition {
+                    min_piece: 0,
+                    max_piece: 1,
+                    position: -1,
+                    distance_from_source: 1,
+                },
+                unchoked: true,
+                yourip: None,
+            }],
+            &fixture.info,
+            &Identity::generate(),
+            1,
+            &tx,
+            &Arc::new(AtomicU64::new(0)),
+            &Arc::new(AtomicU64::new(0)),
+            &Arc::new(AtomicU32::new(0)),
+            &fixture.seed,
+            &fixture.store,
+            &mut continuity,
+            vec![],
+            vec![],
+            completed_discovery(|_| Box::pin(async { vec![] })),
+            &mut candidates,
+            &Arc::new(AtomicU32::new(0)),
+            None,
+        )
+        .await;
+        assert!(matches!(end, FollowEnd::ConsumerGone));
+        assert_eq!(continuity.unwrap().reasm.next_needed(), 2);
+        assert!(
+            !candidates.eligible(Instant::now()).contains(&addr),
+            "announcing another producer's retained bytes must not reset the sender's cooldown"
+        );
+    });
+    tokio::time::timeout(Duration::from_secs(2), ready_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "the missing prefix must not be emitted"
+    );
+    advance_tx.send(()).unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("window movement must release buffered output without another Piece")
+        .unwrap();
+    assert_eq!(markers(&output.bytes), b"ab");
+    assert_eq!(output.discontinuity, eviction);
+    assert!(output.startup_complete);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(60), rx.recv())
+            .await
+            .is_err(),
+        "repeated pool ticks must not emit the retained piece twice"
+    );
+    assert_eq!(warm.candidate_addresses(&[0; 20]), vec![producer]);
+    drop(rx);
+    tokio::time::timeout(Duration::from_secs(2), tasks.join_next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    finish_tx.send(()).unwrap();
+    tasks.join_next().await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn have_releases_buffered_authenticated_piece_without_new_piece_message() {
+    buffered_output_after_window_move(false).await;
+}
+
+#[tokio::test]
+async fn eviction_releases_buffered_authenticated_piece_without_new_piece_message() {
+    buffered_output_after_window_move(true).await;
+}
+
+#[tokio::test]
+async fn buffered_output_drain_preserves_backpressure_and_emits_once() {
+    let mut fixture = buffered_output_fixture().await;
+    fixture.continuity.head = 2;
+    let downloaded = Arc::new(AtomicU64::new(0));
+    let mut peers = BTreeMap::new();
+    let mut candidates = SessionCandidates::default();
+    let (tx, mut rx) = mpsc::channel(1);
+    tx.send(LiveOutput {
+        bytes: Bytes::from_static(b"occupied"),
+        discontinuity: false,
+        startup_complete: false,
+    })
+    .await
+    .unwrap();
+    {
+        let drain = pool::drain_ready_output(
+            &mut fixture.continuity,
+            &fixture.info,
+            &tx,
+            &downloaded,
+            &fixture.seed,
+            &mut candidates,
+            &mut peers,
+        );
+        tokio::pin!(drain);
+        tokio::select! {
+            biased;
+            _ = &mut drain => panic!("full output channel must apply backpressure"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert_eq!(downloaded.load(Ordering::Relaxed), 0);
+        assert_eq!(rx.recv().await.unwrap().bytes.as_ref(), b"occupied");
+        assert!(drain.await.unwrap());
+    }
+    let output = rx.recv().await.unwrap();
+    assert_eq!(markers(&output.bytes), b"ab");
+    assert_eq!(
+        downloaded.load(Ordering::Relaxed),
+        output.bytes.len() as u64
+    );
+    assert!(!pool::drain_ready_output(
+        &mut fixture.continuity,
+        &fixture.info,
+        &tx,
+        &downloaded,
+        &fixture.seed,
+        &mut candidates,
+        &mut peers,
+    )
+    .await
+    .unwrap());
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn buffered_output_drain_stops_workers_when_consumer_closes() {
+    let mut fixture = buffered_output_fixture().await;
+    fixture.continuity.head = 2;
+    let downloaded = Arc::new(AtomicU64::new(0));
+    let mut candidates = SessionCandidates::default();
+    let (commands, _command_rx) = mpsc::channel(1);
+    let (worker_owned, worker_dropped) = tokio::sync::oneshot::channel::<()>();
+    let worker = tokio::spawn(async move {
+        let _owned = worker_owned;
+        std::future::pending::<()>().await;
+    });
+    let mut peers = BTreeMap::from([(
+        0,
+        PeerRuntime {
+            addr: fixture.producer,
+            min_piece: 0,
+            max_piece: 2,
+            unchoked_peer: false,
+            produced_output: false,
+            seen_ids: HashSet::new(),
+            commands,
+            worker,
+        },
+    )]);
+    let (tx, rx) = mpsc::channel(1);
+    drop(rx);
+    assert!(pool::drain_ready_output(
+        &mut fixture.continuity,
+        &fixture.info,
+        &tx,
+        &downloaded,
+        &fixture.seed,
+        &mut candidates,
+        &mut peers,
+    )
+    .await
+    .is_err());
+    assert!(peers.is_empty());
+    assert_eq!(downloaded.load(Ordering::Relaxed), 0);
+    assert!(fixture
+        .seed
+        .warm_peers
+        .candidate_addresses(&[0; 20])
+        .is_empty());
+    assert!(tokio::time::timeout(Duration::from_secs(1), worker_dropped)
+        .await
+        .unwrap()
+        .is_err());
+}

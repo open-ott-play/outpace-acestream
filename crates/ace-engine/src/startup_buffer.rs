@@ -40,7 +40,8 @@ struct StartupReservoir {
     queued_bytes: usize,
     clock: SelectedPcrClock,
     partial: Vec<u8>,
-    first_clean_byte: Option<Instant>,
+    /// Absolute startup origin. Media resets discard queued data, not elapsed waiting time.
+    first_byte_at: Option<Instant>,
     release_clock_duration: Option<Duration>,
     release_bytes: usize,
     phase: Phase,
@@ -60,7 +61,7 @@ impl StartupReservoir {
             queued_bytes: 0,
             clock: SelectedPcrClock::new(),
             partial: Vec::with_capacity(TS_PACKET_LEN),
-            first_clean_byte: None,
+            first_byte_at: None,
             release_clock_duration: None,
             release_bytes: 0,
             phase: if config.target_ms == 0 {
@@ -78,15 +79,19 @@ impl StartupReservoir {
                 _ => None,
             };
         }
-        if self.first_clean_byte.is_none() {
-            self.first_clean_byte = Some(Instant::now());
+        // Empty reads cannot grow queue metadata or start the media deadline. A source
+        // gap has already been handled by collect_next, and an existing deadline still runs.
+        if chunk.is_empty() {
+            let reason = self.ready_reason(Instant::now());
+            if let Some(reason) = reason {
+                self.release(reason);
+            }
+            return reason;
         }
+        self.first_byte_at.get_or_insert_with(Instant::now);
 
         if let Some(retain_from) = self.observe_bytes(&chunk) {
             self.discard_prefix(retain_from, &mut chunk);
-        }
-        if self.first_clean_byte.is_none() {
-            self.first_clean_byte = Some(Instant::now());
         }
         let crosses_cap = self.queued_bytes.saturating_add(chunk.len()) > self.config.max_bytes;
         self.queued_bytes += chunk.len();
@@ -142,7 +147,6 @@ impl StartupReservoir {
         if self.clock.observe(timing) != ClockObservation::Reset {
             return false;
         }
-        self.first_clean_byte = None;
         self.release_clock_duration = None;
         self.release_bytes = 0;
         if !timing.discontinuity {
@@ -184,7 +188,6 @@ impl StartupReservoir {
         self.queued_bytes = 0;
         self.partial.clear();
         self.clock.reset();
-        self.first_clean_byte = None;
     }
 
     fn duration(&self) -> Duration {
@@ -211,7 +214,7 @@ impl StartupReservoir {
             }
             Phase::Collecting
                 if self
-                    .first_clean_byte
+                    .first_byte_at
                     .is_some_and(|start| now.duration_since(start) >= self.config.timeout()) =>
             {
                 Some(ReleaseReason::Deadline)
@@ -223,7 +226,7 @@ impl StartupReservoir {
     fn deadline(&self) -> Option<Instant> {
         (self.phase == Phase::Collecting)
             .then(|| {
-                self.first_clean_byte
+                self.first_byte_at
                     .map(|start| start + self.config.timeout())
             })
             .flatten()
@@ -373,6 +376,10 @@ impl TsSource for StartupBufferedSource {
                 Phase::Released => {
                     let next = self.inner.next().await;
                     self.publish_stats();
+                    if next.as_ref().is_some_and(Bytes::is_empty) {
+                        self.pending_discontinuity |= self.inner.take_discontinuity();
+                        continue;
+                    }
                     return next;
                 }
             }
@@ -381,7 +388,10 @@ impl TsSource for StartupBufferedSource {
 
     fn take_discontinuity(&mut self) -> bool {
         if self.reservoir.phase == Phase::Released {
-            self.inner.take_discontinuity()
+            // An empty post-gap reservoir may reach its deadline before new media arrives.
+            // Consume both flags even when the carried gap is already true.
+            let inner = self.inner.take_discontinuity();
+            std::mem::take(&mut self.pending_discontinuity) || inner
         } else {
             std::mem::take(&mut self.released_chunk_discontinuity)
         }
@@ -798,6 +808,218 @@ mod tests {
         let mut buffered =
             StartupBufferedSource::new(Box::new(source), config(10_000, 4096, 10), None);
         assert_eq!(buffered.next().await.unwrap()[20], b'a');
+    }
+
+    struct ControlledSource {
+        rx: tokio::sync::mpsc::UnboundedReceiver<(Bytes, bool, bool)>,
+        discontinuity: bool,
+        startup_complete: bool,
+    }
+
+    #[async_trait]
+    impl TsSource for ControlledSource {
+        async fn next(&mut self) -> Option<Bytes> {
+            let (bytes, discontinuity, startup_complete) = self.rx.recv().await?;
+            self.discontinuity = discontinuity;
+            self.startup_complete = startup_complete;
+            Some(bytes)
+        }
+        fn take_discontinuity(&mut self) -> bool {
+            std::mem::take(&mut self.discontinuity)
+        }
+        fn startup_complete(&self) -> bool {
+            self.startup_complete
+        }
+        fn stats(&self) -> SourceStats {
+            SourceStats::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_gaps_preserve_absolute_deadline_and_ordered_startup_gate() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let source = ControlledSource {
+            rx,
+            discontinuity: false,
+            startup_complete: false,
+        };
+        let mut buffered =
+            StartupBufferedSource::new(Box::new(source), config(30_000, 4096, 10_000), None);
+        let retained = packet(PID, Some(0), false, b'c');
+        {
+            let next = buffered.next();
+            tokio::pin!(next);
+            assert!(futures::poll!(next.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_secs(20)).await;
+            assert!(futures::poll!(next.as_mut()).is_pending());
+
+            let started = Instant::now();
+            tx.send((packet(PID, Some(0), false, b'a'), false, false))
+                .unwrap();
+            assert!(futures::poll!(next.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_secs(4)).await;
+            tx.send((packet(PID, Some(0), false, b'b'), true, false))
+                .unwrap();
+            assert!(futures::poll!(next.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_secs(4)).await;
+            tx.send((retained.clone(), true, false)).unwrap();
+            assert!(futures::poll!(next.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_millis(1999)).await;
+            assert!(futures::poll!(next.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert_eq!(next.await, Some(retained));
+            assert_eq!(Instant::now() - started, Duration::from_secs(10));
+        }
+        assert!(buffered.take_discontinuity());
+        assert!(!buffered.take_discontinuity());
+        assert!(!buffered.startup_complete());
+
+        // The deadline cancelled a pending receive, not the source. Subsequent media
+        // must pass through without regating or promoting historical data to live.
+        for (marker, complete) in [(b'd', false), (b'e', true)] {
+            let bytes = packet(PID, Some(90_000), false, marker);
+            tx.send((bytes.clone(), false, complete)).unwrap();
+            let before = Instant::now();
+            assert_eq!(buffered.next().await, Some(bytes));
+            assert_eq!(Instant::now(), before);
+            assert_eq!(buffered.startup_complete(), complete);
+            assert!(!buffered.take_discontinuity());
+        }
+        drop(tx);
+        assert!(buffered.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_startup_burst_waits_for_first_media_byte_without_queueing() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut buffered = StartupBufferedSource::new(
+            Box::new(ControlledSource {
+                rx,
+                discontinuity: false,
+                startup_complete: false,
+            }),
+            config(30_000, 4096, 10_000),
+            None,
+        );
+        let bytes = packet(PID, Some(0), false, b'a');
+        {
+            let next = buffered.next();
+            tokio::pin!(next);
+            for _ in 0..16 {
+                tx.send((Bytes::new(), false, true)).unwrap();
+            }
+            assert!(futures::poll!(next.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_secs(20)).await;
+            assert!(futures::poll!(next.as_mut()).is_pending());
+            let first_byte = Instant::now();
+            tx.send((bytes.clone(), false, false)).unwrap();
+            assert!(futures::poll!(next.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_secs(10)).await;
+            assert_eq!(next.await, Some(bytes));
+            assert_eq!(Instant::now() - first_byte, Duration::from_secs(10));
+        }
+        assert!(!buffered.startup_complete());
+        assert!(!buffered.take_discontinuity());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_gap_at_deadline_preserves_marker_for_next_real_payload() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut buffered = StartupBufferedSource::new(
+            Box::new(ControlledSource {
+                rx,
+                discontinuity: false,
+                startup_complete: false,
+            }),
+            config(30_000, 4096, 10_000),
+            None,
+        );
+        {
+            let next = buffered.next();
+            tokio::pin!(next);
+            tx.send((packet(PID, Some(0), false, b'a'), false, true))
+                .unwrap();
+            assert!(futures::poll!(next.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_secs(9)).await;
+            tx.send((Bytes::new(), true, true)).unwrap();
+            assert!(futures::poll!(next.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_secs(1)).await;
+            // The old prefix was discarded; expiry is not an empty payload or EOF.
+            assert!(futures::poll!(next.as_mut()).is_pending());
+            tx.send((Bytes::new(), true, true)).unwrap();
+            assert!(futures::poll!(next.as_mut()).is_pending());
+            let bytes = packet(PID, Some(90_000), false, b'b');
+            tx.send((bytes.clone(), true, false)).unwrap();
+            let before = Instant::now();
+            assert_eq!(next.await, Some(bytes));
+            assert_eq!(Instant::now(), before, "no second startup gate");
+        }
+        assert!(!buffered.startup_complete(), "use the real payload's flag");
+        assert!(buffered.take_discontinuity());
+        assert!(
+            !buffered.take_discontinuity(),
+            "both gap flags were consumed"
+        );
+        drop(tx);
+        assert!(buffered.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transport_and_clock_resets_preserve_absolute_deadline() {
+        for transport_marker in [false, true] {
+            let mut reservoir = StartupReservoir::new(config(30_000, 4096, 10_000), None);
+            let started = Instant::now();
+            reservoir.push(packet(PID, Some(180_000), false, b'a'), false);
+            tokio::time::advance(Duration::from_secs(4)).await;
+            reservoir.push(packet(PID, Some(270_000), false, b'b'), false);
+            tokio::time::advance(Duration::from_secs(4)).await;
+            let reset = packet(PID, Some(90_000), transport_marker, b'c');
+            reservoir.push(reset.clone(), false);
+            assert_eq!(
+                reservoir.deadline(),
+                Some(started + Duration::from_secs(10))
+            );
+            assert_eq!(reservoir.queued_bytes(), reset.len());
+            tokio::time::advance(Duration::from_secs(2)).await;
+            assert_eq!(
+                reservoir.push(packet(PID, Some(180_000), false, b'd'), true),
+                Some(ReleaseReason::Deadline)
+            );
+            let first = reservoir.pop_front().unwrap();
+            assert_eq!(first.bytes, reset);
+            assert!(!first.startup_complete);
+            assert!(reservoir.pop_front().unwrap().startup_complete);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_queue_after_gap_exits_collection_at_original_deadline() {
+        let mut reservoir = StartupReservoir::new(config(30_000, 4096, 10_000), None);
+        for _ in 0..1024 {
+            reservoir.push(Bytes::new(), false);
+        }
+        assert!(
+            reservoir.queue.is_empty(),
+            "no retained empty-chunk metadata"
+        );
+        assert_eq!(reservoir.deadline(), None, "no media byte received yet");
+        reservoir.push(packet(PID, Some(0), false, b'a'), false);
+        let deadline = reservoir.deadline().unwrap();
+        tokio::time::advance(Duration::from_secs(9)).await;
+        reservoir.discontinuity();
+        assert!(reservoir.queue.is_empty());
+        assert_eq!(reservoir.deadline(), Some(deadline));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            reservoir.push(Bytes::new(), true),
+            Some(ReleaseReason::Deadline),
+            "empty reads must still enforce an existing deadline"
+        );
+        assert!(reservoir.pop_front().is_none());
+        reservoir.finish_drain();
+        assert_eq!(reservoir.phase, Phase::Released);
+        assert_eq!(reservoir.deadline(), None, "future reads must pass through");
+        assert_eq!(reservoir.ready_reason(Instant::now()), None);
     }
 
     #[tokio::test]

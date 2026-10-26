@@ -19,14 +19,16 @@ pub(super) async fn vod_stream(
     let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     match parse_byte_range(range, total) {
         // Whole file (no usable Range): 200 with Accept-Ranges so players know they *can* seek.
-        RangeOutcome::Full => match vod.open_range(0, total - 1).await {
+        RangeOutcome::Full => match s.manager.open_vod_range(vod.as_ref(), 0, total - 1).await {
             Ok(source) => vod_response_from_source(source),
             Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
         },
-        RangeOutcome::Satisfiable(start, end) => match vod.open_range(start, end).await {
-            Ok(source) => vod_partial_response(source, start, end, total),
-            Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
-        },
+        RangeOutcome::Satisfiable(start, end) => {
+            match s.manager.open_vod_range(vod.as_ref(), start, end).await {
+                Ok(source) => vod_partial_response(source, start, end, total),
+                Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
+            }
+        }
         // A well-formed range that can't be met: 416 with the resource's true length.
         RangeOutcome::Unsatisfiable => axum::http::Response::builder()
             .status(StatusCode::RANGE_NOT_SATISFIABLE)
@@ -207,7 +209,7 @@ pub(super) async fn vod_hls_segment(
     let Some((start, end)) = layout.segment_range(index) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match vod.open_range(start, end).await {
+    match s.manager.open_vod_range(vod.as_ref(), start, end).await {
         Ok(source) => vod_hls_segment_response(source),
         Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
     }

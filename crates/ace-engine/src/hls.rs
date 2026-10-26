@@ -437,7 +437,28 @@ impl HlsPackager {
 
     fn reset_for_gap(&self, deduplicate_source_marker: bool) {
         let mut st = self.state.lock().unwrap();
+        Self::log_continuity_reset(
+            &st,
+            if deduplicate_source_marker {
+                "source_event"
+            } else {
+                "receiver_lag"
+            },
+        );
         Self::reset_partial(&mut st, deduplicate_source_marker);
+    }
+
+    /// Log the first reset after published media, coalescing further resets until the next
+    /// segment. Do not emit per-packet messages while waiting for a fresh access point.
+    fn log_continuity_reset(st: &HlsState, reason: &'static str) {
+        if !st.discontinuity_pending && !st.segments.is_empty() {
+            crate::alog!(
+                "[hls] continuity reset: reason={} generation={:?} next_sequence={}",
+                reason,
+                st.generation,
+                st.media_seq.saturating_add(st.segments.len() as u64)
+            );
+        }
     }
 
     fn reset_partial(st: &mut HlsState, deduplicate_source_marker: bool) {
@@ -497,6 +518,7 @@ impl HlsPackager {
             }
             // Transport markers must reset state before an excluded PID can be filtered.
             if ts_timing(&packet).discontinuity && !st.deduplicate_source_marker {
+                Self::log_continuity_reset(st, "transport_marker");
                 st.audio.reset();
                 st.access.reset();
                 self.discard_incomplete_run(st);
@@ -505,6 +527,9 @@ impl HlsPackager {
             let result = st.audio.observe(packet);
             if result.changed {
                 let pending = st.discontinuity_pending || !st.awaiting_access_point;
+                if pending {
+                    Self::log_continuity_reset(st, "audio_layout");
+                }
                 st.access.reset();
                 self.discard_incomplete_run(st);
                 st.discontinuity_pending = pending;
@@ -551,6 +576,7 @@ impl HlsPackager {
                         st.deduplicate_source_marker = false;
                     }
                 } else {
+                    Self::log_continuity_reset(st, "transport_marker");
                     st.access.reset();
                     st.cur.drain(..packet_offset + TS_PACKET);
                     st.scanned_packets = 0;
@@ -586,6 +612,7 @@ impl HlsPackager {
                     continue;
                 };
                 if prefix.len() + TS_PACKET > self.max_segment_bytes {
+                    Self::log_continuity_reset(st, "access_prefix_limit");
                     if duplicate_source_marker {
                         st.deduplicate_source_marker = false;
                     }
@@ -615,6 +642,7 @@ impl HlsPackager {
 
             let observation = Self::observe_clock(st, timing);
             if observation == ClockObservation::Reset {
+                Self::log_continuity_reset(st, "clock_reset");
                 st.access.reset();
                 st.audio.reset();
                 st.cur.drain(..packet_offset + TS_PACKET);
@@ -673,6 +701,7 @@ impl HlsPackager {
                 st.deduplicate_source_marker = false;
                 timing.discontinuity = false;
             } else {
+                Self::log_continuity_reset(st, "transport_marker");
                 st.access.reset();
                 self.discard_incomplete_run(st);
                 return;
@@ -680,6 +709,7 @@ impl HlsPackager {
         }
 
         if Self::observe_clock(st, timing) == ClockObservation::Reset {
+            Self::log_continuity_reset(st, "clock_reset");
             st.access.reset();
             st.audio.reset();
             self.discard_incomplete_run(st);
@@ -748,6 +778,7 @@ impl HlsPackager {
             return;
         }
 
+        Self::log_continuity_reset(st, "untimed_segment_limit");
         self.discard_incomplete_run(st);
         if is_access_point {
             let prefix = st
@@ -842,6 +873,13 @@ impl HlsPackager {
         let discontinuity = std::mem::take(&mut st.discontinuity_pending);
         let (bytes, allocation_bytes) = Self::freeze_segment(seg);
         let seq = st.media_seq + st.segments.len() as u64;
+        if discontinuity {
+            crate::alog!(
+                "[hls] discontinuity published: generation={:?} sequence={}",
+                st.generation,
+                seq
+            );
+        }
         st.history.push(
             seq,
             bytes.clone(),

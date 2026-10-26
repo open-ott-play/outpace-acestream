@@ -779,8 +779,7 @@ async fn failed_candidate_writes_preserve_the_only_provisional_peer() {
     shutdown_peer_runtimes(&mut peers);
 }
 
-#[tokio::test]
-async fn queued_chunk_requests_stop_when_known_floor_advances() {
+async fn queued_chunk_requests_stop_after_floor_change(eviction: bool) {
     // One frame of capacity leaves a request write in progress, unlike a timer-only race.
     let (client, server) = tokio::io::duplex(15);
     let (commands, rx) = mpsc::channel(4);
@@ -815,8 +814,17 @@ async fn queued_chunk_requests_stop_when_known_floor_advances() {
         server.read_message().await.unwrap(),
         PeerMessage::Unknown { id: 6, .. }
     ));
-    c.head = 10;
-    advance_pool_requests(&mut BTreeMap::new(), &mut c, 1).await;
+    if eviction {
+        c.register_active_peer(1, addr, window(9, 10));
+        c.set_peer_unchoked(1, true);
+        assert_eq!(
+            c.skip_evicted_gap(c.next_needed_since + c.live_recovery.request_timeout()),
+            Some(9)
+        );
+    } else {
+        c.head = 10;
+        advance_pool_requests(&mut BTreeMap::new(), &mut c, 1).await;
+    }
     let mut stale_after_observation = 0;
     loop {
         let msg = tokio::time::timeout(Duration::from_secs(1), server.read_message())
@@ -835,7 +843,18 @@ async fn queued_chunk_requests_stop_when_known_floor_advances() {
     }
     drop(commands);
     worker.await.unwrap();
-    assert!(stale_after_observation<=1,"only a write already underway before the new head may complete; queued stale chunk writes must stop, got {stale_after_observation}");
+    assert_eq!(c.request_floor.load(Ordering::Relaxed), 9);
+    assert!(stale_after_observation<=1,"only a write already underway before the new cursor may complete; queued stale chunk writes must stop, got {stale_after_observation}");
+}
+
+#[tokio::test]
+async fn queued_chunk_requests_stop_when_known_floor_advances() {
+    queued_chunk_requests_stop_after_floor_change(false).await;
+}
+
+#[tokio::test]
+async fn queued_chunk_requests_stop_when_eviction_moves_cursor_without_a_new_head() {
+    queued_chunk_requests_stop_after_floor_change(true).await;
 }
 
 #[tokio::test]

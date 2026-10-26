@@ -955,6 +955,7 @@ async fn serve_http_inner(
     eprintln!("  status:  http://{}/streams", config.bind);
     let cancel_rtmp = rtmp.cancel.clone();
     let draining_broadcasts = broadcasts.clone();
+    let draining_manager = state.manager.clone();
     let result: Result<(), Box<dyn std::error::Error>> = async {
         let startup = async {
             // BTreeMap iteration is deterministic; API traffic cannot race these claims.
@@ -977,6 +978,10 @@ async fn serve_http_inner(
                 // Close/cancel before HTTP graceful drain can wait on a live request body.
                 draining_broadcasts.close_admissions();
                 cancel_rtmp.send_replace(true);
+                // Continuous provider responses end when their source sender closes. Waiting
+                // for HTTP drain before stopping the manager would keep those bodies alive
+                // indefinitely (or until compatibility authorization expires).
+                draining_manager.shutdown().await;
                 if let Err(error) = draining_broadcasts.shutdown().await {
                     crate::alog!("[broadcast] shutdown: {}", error.code());
                 }
@@ -2373,6 +2378,8 @@ mod tests {
 mod tests_options51;
 #[cfg(test)]
 mod tests_pull206;
+#[cfg(test)]
+mod tests_shutdown;
 
 #[cfg(test)]
 mod inbound_policy_tests;

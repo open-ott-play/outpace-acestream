@@ -107,7 +107,8 @@ impl ActivePeers {
 
     /// Admit each scheduled request before recording peer ownership. A driver can reject
     /// work when its bounded command queue is full without losing the request or clearing
-    /// an earlier, still-outstanding retry on this or another peer.
+    /// an earlier, still-outstanding retry on this or another peer. A rejected peer is
+    /// excluded for the rest of this pass; the same piece can fall back to another peer.
     pub fn assign_if(
         &mut self,
         scheduler: &mut Scheduler,
@@ -126,22 +127,25 @@ impl ActivePeers {
                 in_flight: peer.in_flight.len(),
             })
             .collect();
-        let assigned = scheduler.assign(next_needed, head, &views);
-        let mut out = Vec::with_capacity(assigned.len());
-        let mut attempted = BTreeSet::new();
-        for (peer_id, piece) in assigned {
-            attempted.insert(piece);
-            if let Some(peer) = self.peers.get_mut(&peer_id) {
-                let assignment = PeerAssignment { peer_id, piece };
-                if admit(assignment) {
-                    peer.in_flight.insert(piece);
-                    out.push(assignment);
+        let mut rejected = BTreeSet::new();
+        let assigned =
+            scheduler.assign_with_admission(next_needed, head, &views, |peer_id, piece| {
+                if admit(PeerAssignment { peer_id, piece }) {
+                    true
                 } else {
-                    scheduler.on_drop(piece);
+                    rejected.insert(peer_id);
+                    false
                 }
-            } else {
-                scheduler.on_drop(piece);
-            }
+            });
+        let mut out = Vec::with_capacity(assigned.len());
+        for (peer_id, piece) in assigned {
+            // Views came from this unchanged map; successful admission owns the slot.
+            self.peers
+                .get_mut(&peer_id)
+                .unwrap()
+                .in_flight
+                .insert(piece);
+            out.push(PeerAssignment { peer_id, piece });
         }
         // Normal scheduling prefers peers with spare capacity, giving slow requests a
         // chance on another peer first. If every usable peer is full, a timeout retry to
@@ -149,7 +153,7 @@ impl ActivePeers {
         // untrusted live head, and never dispatch the same piece twice in one pass.
         if next_needed <= head {
             for (&peer_id, peer) in &self.peers {
-                if !peer.unchoked {
+                if !peer.unchoked || rejected.contains(&peer_id) {
                     continue;
                 }
                 for &piece in peer.in_flight.range(next_needed..=head) {
@@ -157,7 +161,6 @@ impl ActivePeers {
                         || piece > peer.max_piece
                         || scheduler.requested.contains(&piece)
                         || scheduler.completed.contains(&piece)
-                        || !attempted.insert(piece)
                     {
                         continue;
                     }
@@ -165,6 +168,11 @@ impl ActivePeers {
                     if admit(assignment) {
                         scheduler.requested.insert(piece);
                         out.push(assignment);
+                    } else {
+                        // A full queue stays excluded for this non-awaiting pass, but a
+                        // different existing owner can still accept the same retry.
+                        rejected.insert(peer_id);
+                        break;
                     }
                 }
             }
@@ -184,6 +192,14 @@ impl ActivePeers {
             .get(&id)
             .map(|peer| peer.in_flight.len())
             .unwrap_or(0)
+    }
+
+    /// Whether any remaining peer still owns an outstanding copy of this request.
+    /// Removing one transport must not cancel an already-admitted retry on another.
+    pub fn any_in_flight(&self, piece: u64) -> bool {
+        self.peers
+            .values()
+            .any(|peer| peer.in_flight.contains(&piece))
     }
 
     /// A piece finished: clear it from every peer's in-flight set (it may be tracked against
@@ -256,6 +272,19 @@ impl Scheduler {
     /// has spare in-flight capacity. Returns `(peer_id, piece)` pairs and records them as
     /// in-flight.
     pub fn assign(&mut self, next_needed: u64, head: u64, peers: &[PeerView]) -> Vec<(u64, u64)> {
+        self.assign_with_admission(next_needed, head, peers, |_, _| true)
+    }
+
+    /// Reserve slots only after the bounded driver queue accepts a request. Rejecting a
+    /// peer excludes it for this pass and retries the SAME piece on another eligible peer,
+    /// preserving cursor-first scheduling and avoiding overbooking a precomputed batch.
+    fn assign_with_admission(
+        &mut self,
+        next_needed: u64,
+        head: u64,
+        peers: &[PeerView],
+        mut admit: impl FnMut(u64, u64) -> bool,
+    ) -> Vec<(u64, u64)> {
         // Drop bookkeeping for pieces we've moved past.
         self.requested.retain(|&p| p >= next_needed);
         self.completed.retain(|&p| p >= next_needed);
@@ -289,15 +318,24 @@ impl Scheduler {
             if !self.requested.contains(&piece) && !self.completed.contains(&piece) {
                 // Prefer the peer with the most spare capacity that covers this piece —
                 // spreads load and keeps the rarest-window peers in reserve.
-                if let Some(slot) = cap
+                while let Some(slot) = cap
                     .iter_mut()
                     .filter(|(p, c)| *c > 0 && p.covers(piece))
                     .max_by_key(|(_, c)| *c)
                 {
-                    out.push((slot.0.id, piece));
-                    slot.1 -= 1;
-                    total_spare -= 1;
-                    self.requested.insert(piece);
+                    if admit(slot.0.id, piece) {
+                        out.push((slot.0.id, piece));
+                        slot.1 -= 1;
+                        total_spare -= 1;
+                        self.requested.insert(piece);
+                        break;
+                    }
+                    // At most one rejection per peer per pass. Neither ownership nor
+                    // capacity is consumed by a failed send, and the horizon stays fixed.
+                    slot.1 = 0;
+                    total_spare = cap
+                        .iter()
+                        .fold(0usize, |total, (_, spare)| total.saturating_add(*spare));
                 }
             }
             if total_spare == 0 {
@@ -645,17 +683,154 @@ mod tests {
 
         active.insert(2, addr(), win(0, 10));
         active.set_unchoked(2, true);
+        let mut attempts = Vec::new();
         assert!(active
             .assign_if(&mut scheduler, 5, 5, |assignment| {
-                assert_eq!(assignment.peer_id, 2);
+                attempts.push(assignment.peer_id);
                 false
             })
             .is_empty());
+        assert_eq!(attempts, vec![2, 1]);
         assert_eq!(active.in_flight_count(1), 1);
         assert_eq!(active.in_flight_count(2), 0);
         assert_eq!(scheduler.in_flight_count(), 0);
 
         assert_eq!(active.assign(&mut scheduler, 5, 5).len(), 1);
         assert_eq!(active.in_flight_count(2), 1);
+    }
+
+    #[test]
+    fn full_command_queue_falls_back_without_skipping_the_cursor_or_overbooking() {
+        let mut active = ActivePeers::new();
+        for id in [1, 2] {
+            active.insert(id, addr(), win(7, 8));
+            active.set_unchoked(id, true);
+        }
+        let mut scheduler = Scheduler::new(1);
+        let (available, mut available_rx) = tokio::sync::mpsc::channel(1);
+        let (full, mut full_rx) = tokio::sync::mpsc::channel(1);
+        full.try_send(()).unwrap();
+        let mut attempts = Vec::new();
+        let assigned = active.assign_if(&mut scheduler, 7, 8, |assignment| {
+            attempts.push(assignment);
+            let queue = if assignment.peer_id == 2 {
+                &full
+            } else {
+                &available
+            };
+            queue.try_send(()).is_ok()
+        });
+        assert_eq!(
+            attempts,
+            vec![
+                PeerAssignment {
+                    peer_id: 2,
+                    piece: 7
+                },
+                PeerAssignment {
+                    peer_id: 1,
+                    piece: 7
+                },
+            ]
+        );
+        assert_eq!(
+            assigned,
+            vec![PeerAssignment {
+                peer_id: 1,
+                piece: 7
+            }]
+        );
+        assert_eq!(active.in_flight_count(1), 1);
+        assert_eq!(active.in_flight_count(2), 0);
+        assert_eq!(scheduler.requested, BTreeSet::from([7]));
+        available_rx.try_recv().unwrap();
+        assert!(available_rx.try_recv().is_err());
+
+        // Rejection is per-pass, not a permanent ban. Once its queue drains, peer 2
+        // gets the next piece; piece 7 is never assigned twice or allowed to exceed cap.
+        full_rx.try_recv().unwrap();
+        let next = active.assign_if(&mut scheduler, 7, 8, |assignment| {
+            assert_eq!(
+                assignment,
+                PeerAssignment {
+                    peer_id: 2,
+                    piece: 8
+                }
+            );
+            full.try_send(()).is_ok()
+        });
+        assert_eq!(
+            next,
+            vec![PeerAssignment {
+                peer_id: 2,
+                piece: 8
+            }]
+        );
+        assert_eq!(scheduler.requested, BTreeSet::from([7, 8]));
+        assert_eq!(active.in_flight_count(1), 1);
+        assert_eq!(active.in_flight_count(2), 1);
+        assert!(active
+            .assign_if(&mut scheduler, 7, 8, |_| panic!("no duplicate requests"))
+            .is_empty());
+    }
+
+    #[test]
+    fn all_full_queues_have_one_attempt_each_and_do_not_advance_the_horizon() {
+        let mut active = ActivePeers::new();
+        for id in [1, 2, 3] {
+            active.insert(id, addr(), win(0, i64::MAX));
+            active.set_unchoked(id, true);
+        }
+        let mut scheduler = Scheduler::new(2);
+        let mut attempts = Vec::new();
+        assert!(active
+            .assign_if(&mut scheduler, 0, u64::MAX, |assignment| {
+                attempts.push(assignment);
+                false
+            })
+            .is_empty());
+        assert_eq!(attempts.len(), 3);
+        assert!(attempts.iter().all(|assignment| assignment.piece == 0));
+        assert_eq!(
+            attempts.iter().map(|a| a.peer_id).collect::<BTreeSet<_>>(),
+            BTreeSet::from([1, 2, 3])
+        );
+        assert_eq!(scheduler.in_flight_count(), 0);
+        for id in [1, 2, 3] {
+            assert_eq!(active.in_flight_count(id), 0);
+        }
+        let next = active.assign(&mut scheduler, 0, u64::MAX);
+        assert_eq!(
+            next.iter().map(|a| a.piece).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn rejected_new_peer_can_fall_back_to_an_existing_owner_at_capacity() {
+        let mut active = ActivePeers::new();
+        active.insert(1, addr(), win(7, 7));
+        active.set_unchoked(1, true);
+        let mut scheduler = Scheduler::new(1);
+        active.assign(&mut scheduler, 7, 7);
+        scheduler.on_drop(7);
+        active.insert(2, addr(), win(7, 7));
+        active.set_unchoked(2, true);
+        let mut attempts = Vec::new();
+        let assigned = active.assign_if(&mut scheduler, 7, 7, |assignment| {
+            attempts.push(assignment.peer_id);
+            assignment.peer_id == 1
+        });
+        assert_eq!(attempts, vec![2, 1]);
+        assert_eq!(
+            assigned,
+            vec![PeerAssignment {
+                peer_id: 1,
+                piece: 7
+            }]
+        );
+        assert_eq!(active.in_flight_count(1), 1);
+        assert_eq!(active.in_flight_count(2), 0);
+        assert_eq!(scheduler.in_flight_count(), 1);
     }
 }

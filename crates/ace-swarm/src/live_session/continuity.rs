@@ -249,6 +249,9 @@ impl Continuity {
         }
         self.recovery_event(RecoveryEvent::SkippedEvictedGap);
         self.reasm.skip_to(floor);
+        // Workers may already have whole-piece requests queued. Stop their remaining
+        // chunks below the new cursor just as a live-head skip does.
+        self.request_floor.fetch_max(floor, Ordering::Relaxed);
         self.arm_output_gate();
         self.active_peers.prune_below(floor);
         self.requested_at.retain(|&p, _| p >= floor);

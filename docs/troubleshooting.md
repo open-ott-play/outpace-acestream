@@ -106,6 +106,21 @@ startup targets trades resilience for latency. Account for engine, proxy and
 player buffers together; do not independently increase all three. Change one
 setting at a time and compare actual startup and sustained decode results.
 
+### Continuity and recovery diagnostics
+
+A `[hls] continuity reset` event identifies the first reset after published media:
+`source_event`, `receiver_lag`, `transport_marker`, `audio_layout`, `clock_reset`,
+`access_prefix_limit`, or `untimed_segment_limit`. Further resets are coalesced
+until another segment is published. `[hls] discontinuity published` records the
+actual marked segment's generation and sequence. These local coordinates are
+not programme timestamps or proof that a peer-network archive exists.
+
+For normalized audio, `[hls] recovery started` includes the triggering reason and
+generation change; `[hls] recovery failed` adds the terminal failure. A paired
+source/transport marker does not produce a second recovery event. These events
+help separate the observed reset from a hypothesis about missing peer data.
+They do not by themselves establish a source outage or a network bottleneck.
+
 ## HTTP errors and stale sessions
 
 | Symptom | Meaning and remedy |

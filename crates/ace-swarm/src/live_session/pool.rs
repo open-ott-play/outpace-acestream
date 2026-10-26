@@ -109,6 +109,101 @@ pub(super) fn recovery_channel_capacities(
     Ok((event_capacity, live_recovery.max_active_upstreams))
 }
 
+/// Drain authenticated contiguous pieces independently of the event that moved the cursor.
+/// HAVE/eviction/reconnect can expose an already-complete piece without another Piece message.
+/// `take_ready` remains the sole consumer, and output retains the normal awaited backpressure.
+pub(super) async fn drain_ready_output(
+    continuity: &mut Continuity,
+    info: &StreamInfo,
+    tx: &mpsc::Sender<LiveOutput>,
+    downloaded: &Arc<AtomicU64>,
+    seed: &SeedConfig,
+    candidates: &mut SessionCandidates,
+    peers: &mut BTreeMap<u64, PeerRuntime>,
+) -> Result<bool, ()> {
+    if continuity.startup_deadline.is_some() {
+        return Ok(false);
+    }
+    continuity.skip_far_behind_live(Instant::now());
+    if !continuity
+        .reasm
+        .has_complete_piece(continuity.reasm.next_needed())
+    {
+        return Ok(false);
+    }
+    let before = continuity.reasm.next_needed();
+    let ready = take_ready_with_stats(continuity, seed.metrics.as_ref(), info);
+    let after = continuity.reasm.next_needed();
+    let productive: std::collections::BTreeSet<_> = continuity
+        .piece_producers
+        .range(before..after)
+        .filter_map(|(_, producer)| *producer)
+        .collect();
+    continuity
+        .piece_producers
+        .retain(|&piece, _| piece >= after);
+    let authenticated = info.sig_len > 0
+        && ace_wire::live_auth::signature_len_from_pubkey_der(&info.source_pubkey)
+            == Some(info.sig_len);
+    if !ready.is_empty() && !continuity.authenticated_logged && authenticated {
+        continuity.authenticated_logged = true;
+        crate::alog!("[ace] discovery stage=authenticated-contiguous");
+    }
+    let outputs = continuity.resync_output(&ready);
+    let output_count = outputs.len();
+    let mut made_output = false;
+    for (index, output) in outputs.into_iter().enumerate() {
+        let aligned = output.bytes;
+        if continuity.emitted == 0 {
+            crate::alog!("[ace] discovery stage=first-source-output");
+        }
+        continuity.emitted += aligned.len() as u64;
+        if continuity.emitted >= continuity.next_log {
+            crate::alog!(
+                "[ace] served {} MiB (head={}, next piece needed={})",
+                continuity.emitted >> 20,
+                continuity.head,
+                continuity.reasm.next_needed()
+            );
+            continuity.next_log = continuity.emitted + (4 << 20);
+        }
+        let len = aligned.len() as u64;
+        if tx
+            .send(LiveOutput {
+                bytes: aligned,
+                discontinuity: output.discontinuity,
+                startup_complete: index + 1 == output_count && continuity.output_startup_complete(),
+            })
+            .await
+            .is_err()
+        {
+            shutdown_peer_runtimes(peers);
+            return Err(());
+        }
+        downloaded.fetch_add(len, Ordering::Relaxed);
+        made_output = true;
+    }
+    if made_output {
+        // With no new Piece event there is no triggering peer to credit. Use retained
+        // contribution evidence, never the sender of the HAVE/eviction notification.
+        for producer in productive {
+            for peer in peers.values_mut().filter(|peer| peer.addr == producer) {
+                peer.produced_output = true;
+            }
+            candidates.productive(producer);
+            if authenticated {
+                seed.warm_peers.record_productive(
+                    info.infohash,
+                    producer,
+                    candidates.kind(producer),
+                );
+            }
+        }
+        continuity.next_needed_since = Instant::now();
+    }
+    Ok(made_output)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 pub(super) async fn follow_peer_pool(
@@ -336,6 +431,18 @@ pub(super) async fn follow_peer_pool_with_discovery(
             let lost = advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
             record_pool_losses(candidates, &mut loss_count, lost);
         }
+        // A preceding HAVE or reconnect may have exposed buffered authenticated data.
+        // Drain it before deciding that the pool has stopped making useful progress.
+        match drain_ready_output(
+            continuity, info, tx, downloaded, seed, candidates, &mut peers,
+        )
+        .await
+        {
+            Ok(true) => last_progress = Instant::now(),
+            Ok(false) => {}
+            Err(()) => return FollowEnd::ConsumerGone,
+        }
+        let now = Instant::now();
         let Some(stale_budget) =
             stale_upstream_budget(last_progress, now, live_recovery.stale_upstream_timeout())
                 .or_else(|| {
@@ -363,6 +470,17 @@ pub(super) async fn follow_peer_pool_with_discovery(
         let newly_lost =
             retransmit_stalled_requests(&mut peers, continuity, chunks_per_piece, now).await;
         record_pool_losses(candidates, &mut loss_count, newly_lost);
+        // The sweep itself can skip an evicted gap. Do not wait for network input to
+        // publish the complete piece now at the cursor (it will not be requested again).
+        match drain_ready_output(
+            continuity, info, tx, downloaded, seed, candidates, &mut peers,
+        )
+        .await
+        {
+            Ok(true) => last_progress = Instant::now(),
+            Ok(false) => {}
+            Err(()) => return FollowEnd::ConsumerGone,
+        }
         if peers.is_empty() {
             return FollowEnd::PeerLost(loss_count);
         }
@@ -738,75 +856,14 @@ pub(super) async fn follow_peer_pool_with_discovery(
                     if let Some(observer) = &continuity.contribution_observer {
                         let _ = observer.send((piece, addr));
                     }
-                    let before = continuity.reasm.next_needed();
-                    let ready = take_ready_with_stats(continuity, seed.metrics.as_ref(), info);
-                    let after = continuity.reasm.next_needed();
-                    let productive: Vec<_> = continuity
-                        .piece_producers
-                        .range(before..after)
-                        .filter_map(|(_, producer)| *producer)
-                        .collect();
-                    continuity
-                        .piece_producers
-                        .retain(|&piece, _| piece >= after);
-                    if !ready.is_empty() {
-                        if !continuity.authenticated_logged
-                            && info.sig_len > 0
-                            && ace_wire::live_auth::signature_len_from_pubkey_der(
-                                &info.source_pubkey,
-                            ) == Some(info.sig_len)
-                        {
-                            continuity.authenticated_logged = true;
-                            crate::alog!("[ace] discovery stage=authenticated-contiguous");
-                        }
-                        let outputs = continuity.resync_output(&ready);
-                        let output_count = outputs.len();
-                        for (index, output) in outputs.into_iter().enumerate() {
-                            let aligned = output.bytes;
-                            if continuity.emitted == 0 {
-                                crate::alog!("[ace] discovery stage=first-source-output");
-                            }
-                            continuity.emitted += aligned.len() as u64;
-                            if continuity.emitted >= continuity.next_log {
-                                crate::alog!(
-                                    "[ace] {addr}: served {} MiB (head={}, next piece needed={})",
-                                    continuity.emitted >> 20,
-                                    continuity.head,
-                                    continuity.reasm.next_needed()
-                                );
-                                continuity.next_log = continuity.emitted + (4 << 20);
-                            }
-                            let len = aligned.len() as u64;
-                            if tx
-                                .send(LiveOutput {
-                                    bytes: aligned,
-                                    discontinuity: output.discontinuity,
-                                    startup_complete: index + 1 == output_count
-                                        && continuity.output_startup_complete(),
-                                })
-                                .await
-                                .is_err()
-                            {
-                                shutdown_peer_runtimes(&mut peers);
-                                return FollowEnd::ConsumerGone;
-                            }
-                            downloaded.fetch_add(len, Ordering::Relaxed);
-                            made_output = true;
-                        }
-                    }
-                    if made_output
-                        && info.sig_len > 0
-                        && ace_wire::live_auth::signature_len_from_pubkey_der(&info.source_pubkey)
-                            == Some(info.sig_len)
+                    made_output = match drain_ready_output(
+                        continuity, info, tx, downloaded, seed, candidates, &mut peers,
+                    )
+                    .await
                     {
-                        for producer in productive {
-                            seed.warm_peers.record_productive(
-                                info.infohash,
-                                producer,
-                                candidates.kind(producer),
-                            );
-                        }
-                    }
+                        Ok(made_output) => made_output,
+                        Err(()) => return FollowEnd::ConsumerGone,
+                    };
                     let newly_lost =
                         advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
                     record_pool_losses(candidates, &mut loss_count, newly_lost);
@@ -956,15 +1013,6 @@ pub(super) async fn follow_peer_pool_with_discovery(
         }
         if should_refresh_stale_deadline(continuity.emitted, made_output, made_activity) {
             last_progress = Instant::now();
-        }
-        if made_output {
-            if let Some(peer) = peers.get_mut(&peer_id) {
-                peer.produced_output = true;
-            }
-            candidates.productive(addr);
-            // Contiguous output means the playback cursor advanced: reset the per-piece
-            // eviction-skip timer so it only fires when the cursor is genuinely stuck.
-            continuity.next_needed_since = Instant::now();
         }
     }
 }

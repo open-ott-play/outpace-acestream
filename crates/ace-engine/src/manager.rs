@@ -3,7 +3,7 @@
 
 use crate::config::HlsConfig;
 use crate::hls::HlsPackager;
-use crate::provider::{ProviderError, ProviderRegistry, TsSource, VodContent};
+use crate::provider::{ProviderError, ProviderRegistry, TsSource, VodByteSource, VodContent};
 use crate::session::{StreamSession, Subscription};
 use ace_swarm::types::{StreamInfo, StreamMetadata};
 use std::collections::{HashMap, HashSet};
@@ -16,6 +16,38 @@ use tokio::task::JoinHandle;
 /// A resolved VOD plus its last-access time (for idle expiry), keyed by `(network, id)`.
 type VodCacheEntry = (Arc<dyn VodContent>, Instant);
 type StreamKey = (String, String);
+
+/// A VOD response can outlive its cached descriptor. Its reader must still stop when
+/// the manager closes admissions, so HTTP drain does not wait for a stalled range.
+struct ShutdownVodSource {
+    source: Option<Box<dyn VodByteSource>>,
+    length: u64,
+    stopping: watch::Receiver<bool>,
+}
+
+#[async_trait::async_trait]
+impl VodByteSource for ShutdownVodSource {
+    fn content_length(&self) -> u64 {
+        self.length
+    }
+
+    async fn next(&mut self) -> Option<bytes::Bytes> {
+        if *self.stopping.borrow() {
+            self.source.take();
+            return None;
+        }
+        let source = self.source.as_mut()?;
+        let next = tokio::select! {
+            biased;
+            _ = self.stopping.changed() => None,
+            next = source.next() => next,
+        };
+        if next.is_none() {
+            self.source.take();
+        }
+        next
+    }
+}
 
 #[derive(Default)]
 struct HlsLifecycleState {
@@ -284,6 +316,7 @@ pub struct StreamManager {
     cleanup: CleanupTracker,
     reaper: StdMutex<Option<WorkerControl>>,
     shutting_down: std::sync::atomic::AtomicBool,
+    shutdown_signal: watch::Sender<bool>,
 }
 
 impl StreamManager {
@@ -346,6 +379,7 @@ impl StreamManager {
             cleanup: CleanupTracker::default(),
             reaper: StdMutex::new(None),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
+            shutdown_signal: watch::channel(false).0,
         })
     }
 
@@ -360,6 +394,42 @@ impl StreamManager {
 
     pub(crate) fn hls_startup_timeout(&self) -> Duration {
         Duration::from_millis(self.hls.startup_timeout_ms)
+    }
+
+    /// Dropping the operation releases its per-key locks and transition guards. The
+    /// publication fence remains authoritative if shutdown races a completed open.
+    async fn while_running<T>(
+        &self,
+        operation: impl Future<Output = Result<T, ProviderError>>,
+    ) -> Result<T, ProviderError> {
+        let mut stopping = self.shutdown_signal.subscribe();
+        if *stopping.borrow() {
+            return Err(ProviderError::NotFound);
+        }
+        let result = tokio::select! {
+            biased;
+            _ = stopping.changed() => Err(ProviderError::NotFound),
+            result = operation => result,
+        };
+        if *stopping.borrow() {
+            return Err(ProviderError::NotFound);
+        }
+        result
+    }
+
+    pub(crate) async fn open_vod_range(
+        &self,
+        content: &dyn VodContent,
+        start: u64,
+        end: u64,
+    ) -> Result<Box<dyn VodByteSource>, ProviderError> {
+        let source = self.while_running(content.open_range(start, end)).await?;
+        let length = source.content_length();
+        Ok(Box::new(ShutdownVodSource {
+            source: Some(source),
+            length,
+            stopping: self.shutdown_signal.subscribe(),
+        }))
     }
 
     /// Offline pre-check that `id` can be opened on `network`; see
@@ -391,6 +461,15 @@ impl StreamManager {
         network: &str,
         id: &str,
     ) -> Result<Arc<dyn VodContent>, ProviderError> {
+        self.while_running(self.resolve_vod_inner(network, id))
+            .await
+    }
+
+    async fn resolve_vod_inner(
+        &self,
+        network: &str,
+        id: &str,
+    ) -> Result<Arc<dyn VodContent>, ProviderError> {
         let key = (network.to_string(), id.to_string());
         if let Some(v) = self.cached_vod(&key).await {
             return Ok(v);
@@ -404,6 +483,13 @@ impl StreamManager {
         }
         let provider = self.registry.get(network).ok_or(ProviderError::NotFound)?;
         let vod: Arc<dyn VodContent> = Arc::from(provider.resolve_vod(id).await?);
+        let _finalizing = self.hls_finalization.lock().await;
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ProviderError::NotFound);
+        }
         self.vod_cache
             .lock()
             .await
@@ -453,6 +539,15 @@ impl StreamManager {
     /// Get the running session for `(network, id)` or start one via the provider. Returns
     /// `NotFound` if the network is unregistered.
     pub async fn get_or_start(
+        self: &Arc<Self>,
+        network: &str,
+        id: &str,
+    ) -> Result<Arc<StreamSession>, ProviderError> {
+        self.while_running(self.get_or_start_inner(network, id))
+            .await
+    }
+
+    async fn get_or_start_inner(
         self: &Arc<Self>,
         network: &str,
         id: &str,
@@ -554,6 +649,16 @@ impl StreamManager {
     }
 
     async fn get_or_start_pinned_hls(
+        self: &Arc<Self>,
+        network: &str,
+        id: &str,
+        native: bool,
+    ) -> Result<(Arc<HlsPackager>, Arc<StreamSession>, Subscription), ProviderError> {
+        self.while_running(self.get_or_start_pinned_hls_inner(network, id, native))
+            .await
+    }
+
+    async fn get_or_start_pinned_hls_inner(
         self: &Arc<Self>,
         network: &str,
         id: &str,
@@ -809,6 +914,7 @@ impl StreamManager {
             let _finalizing = self.hls_finalization.lock().await;
             self.shutting_down
                 .store(true, std::sync::atomic::Ordering::Release);
+            self.shutdown_signal.send_replace(true);
             if let Some(reaper) = self.reaper.lock().unwrap().take() {
                 reaper.cancel();
                 controls.push(reaper);
@@ -820,6 +926,7 @@ impl StreamManager {
             }
             controls.extend(entries.drain().map(|(_, entry)| entry.control));
             self.sessions.lock().await.clear();
+            self.vod_cache.lock().await.clear();
         }
         for control in controls {
             control.join().await;
@@ -830,6 +937,7 @@ impl StreamManager {
 
 impl Drop for StreamManager {
     fn drop(&mut self) {
+        self.shutdown_signal.send_replace(true);
         if let Some(reaper) = self.reaper.get_mut().unwrap().as_ref() {
             reaper.cancel();
         }
@@ -839,6 +947,9 @@ impl Drop for StreamManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests_shutdown;
 
 #[cfg(test)]
 mod tests {

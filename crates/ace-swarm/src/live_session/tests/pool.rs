@@ -660,3 +660,65 @@ async fn full_peer_window_updates_availability_below_global_head() {
     assert_eq!((peers[&1].min_piece, peers[&1].max_piece), (185, 210));
     shutdown_peer_runtimes(&mut peers);
 }
+
+#[tokio::test]
+async fn closed_old_owner_preserves_admitted_retry_and_does_not_duplicate_next_tick() {
+    let policy = LiveRecoveryConfig {
+        max_piece_advance: 2,
+        ..default_live_recovery()
+    };
+    let (mut c, _) = Continuity::fresh(&info(), 7, 7, 1, policy);
+    let old_addr = "127.0.0.1:1".parse().unwrap();
+    let (old, mut old_commands) = test_pool_peer(old_addr);
+    let mut peers = BTreeMap::from([(2, old)]);
+    c.register_active_peer(2, old_addr, live_pos(7, 7));
+    c.set_peer_unchoked(2, true);
+    assert!(advance_pool_requests(&mut peers, &mut c, 1)
+        .await
+        .is_empty());
+    assert!(matches!(
+        old_commands.try_recv(),
+        Ok(PeerCommand::RequestPiece { piece: 7, .. })
+    ));
+    drop(old_commands); // Closed command queue, but old piece 7 ownership remains.
+
+    let new_addr = "127.0.0.1:2".parse().unwrap();
+    let (replacement, mut new_commands) = test_pool_peer(new_addr);
+    peers.insert(1, replacement);
+    c.register_active_peer(1, new_addr, live_pos(7, 8));
+    c.set_peer_unchoked(1, true);
+    c.update_peer_window(2, 7, 8);
+    c.head = 8;
+    c.scheduler.on_drop(7);
+    c.requested_at.remove(&7);
+    // Spare capacity selects replacement for 7, then discovers old's Closed queue
+    // while requesting 8 and falls back to replacement. Dropping old must preserve 7.
+    assert_eq!(
+        advance_pool_requests(&mut peers, &mut c, 1).await,
+        vec![old_addr]
+    );
+    for wanted in [7, 8] {
+        assert!(matches!(
+            new_commands.try_recv(),
+            Ok(PeerCommand::RequestPiece { piece, .. }) if piece == wanted
+        ));
+    }
+    assert_eq!(c.active_peers.in_flight_count(1), 2);
+    assert_eq!(c.active_peers.in_flight_count(2), 0);
+    assert_eq!(c.scheduler.in_flight_count(), 2);
+    let retry_at = c.requested_at[&7];
+    assert!(advance_pool_requests(&mut peers, &mut c, 1)
+        .await
+        .is_empty());
+    assert!(
+        new_commands.try_recv().is_err(),
+        "live retry must not be dispatched twice"
+    );
+    assert_eq!(c.requested_at[&7], retry_at);
+
+    // Removing the final owner still frees both pieces for a later replacement.
+    assert_eq!(drop_peer_runtime(1, &mut peers, &mut c), Some(new_addr));
+    assert_eq!(c.scheduler.in_flight_count(), 0);
+    assert!(!c.active_peers.any_in_flight(7));
+    assert!(!c.active_peers.any_in_flight(8));
+}

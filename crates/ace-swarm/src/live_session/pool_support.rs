@@ -443,7 +443,11 @@ pub(super) fn drop_peer_runtime(
     continuity.admitted_upstreams = peers.len() as u32;
     continuity.publish_upstreams();
     for piece in continuity.active_peers.remove(peer_id) {
-        continuity.scheduler.on_drop(piece);
+        // The same sweep may already have admitted a retry on another transport.
+        // Keep its global ownership and timer until that remaining request completes.
+        if !continuity.active_peers.any_in_flight(piece) {
+            continuity.scheduler.on_drop(piece);
+        }
     }
     let _ = peer.commands.try_send(PeerCommand::Stop);
     peer.worker.abort();

@@ -522,15 +522,27 @@ impl EnabledWorker {
         let old = self.recovery.generation;
         let generation = match self.recovery.invalidate(Instant::now(), reason) {
             Ok(generation) => generation,
-            Err(reason) => {
+            Err(failure) => {
+                crate::alog!(
+                    "[hls] recovery failed: reason={:?} generation={:?} failure={:?}",
+                    reason,
+                    old,
+                    failure
+                );
                 // Readiness cannot remain visible during the following child reap.
-                self.media.fail_generation(old, reason);
-                return Err(reason);
+                self.media.fail_generation(old, failure);
+                return Err(failure);
             }
         };
         if generation == old {
             return Ok(());
         }
+        crate::alog!(
+            "[hls] recovery started: reason={:?} previous_generation={:?} generation={:?}",
+            reason,
+            old,
+            generation
+        );
         // A recovery while still starting preserves that original absolute clock.
         if self.media.status() == HlsStatus::Ready {
             self.deadline = Instant::now() + Duration::from_millis(self.config.startup_timeout_ms);

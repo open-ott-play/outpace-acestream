@@ -67,9 +67,11 @@ Environment variables parsed by the daemon include:
   `134217728` (128 MiB). The input chunk crossing this threshold is retained intact before
   release, so queued payload can exceed the threshold by at most one input chunk. Queue
   metadata, backing-allocation capacity and the rest of the daemon add memory overhead.
-- `OUTPACE_PREBUFFER_TIMEOUT_MS` - deadline after the first clean media byte for reaching the
-  target duration, default `15000`. On expiry, outpace degrades gracefully by releasing the
-  available queue; it does not turn a short advertised live window into a playback failure.
+- `OUTPACE_PREBUFFER_TIMEOUT_MS` - absolute deadline after the first nonempty media chunk for
+  reaching the target duration, default `15000`. Source gaps and transport-clock resets discard
+  stale queued media but do not restart this deadline. On expiry, outpace releases the remaining
+  queue and then passes through incoming media. This does not bypass the source's live-head
+  catch-up gate or guarantee that a player has received its first decodable frame.
 - `OUTPACE_REQUEST_TIMEOUT_MS` - per-piece request timeout before re-requesting or skipping an
   evicted gap, default `1500`; must be lower than `OUTPACE_STALE_UPSTREAM_TIMEOUT_MS`. A live
   player drains in realtime, so raising this leaves a stuck piece to be healed by the much slower

@@ -26,34 +26,46 @@ async fn peer_connects_handshakes_and_downloads_a_chunk_from_us() {
     let addr = listener.local_addr().unwrap();
     let our_id = random_peer_id();
     let identity = Arc::new(Identity::generate());
-    tokio::spawn(PeerListener::serve(
+    let mut listener_tasks = tokio::task::JoinSet::new();
+    listener_tasks.spawn(PeerListener::serve(
         listener, registry, our_id, [0u8; 8], 8, identity, 8, None,
     ));
 
-    let stream = TcpStream::connect(addr).await.unwrap();
-    let mut client = PeerSession::new(stream);
-    client
-        .perform_handshake(infohash, random_peer_id())
-        .await
-        .unwrap();
-    client.send(&PeerMessage::Interested).await.unwrap();
-    client.send(&chunk_request(9, 0)).await.unwrap();
+    // One deadline covers both waits; unrelated messages must not extend it.
+    let exchange = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let stream = TcpStream::connect(addr).await?;
+        let mut client = PeerSession::new(stream);
+        client.perform_handshake(infohash, random_peer_id()).await?;
+        client.send(&PeerMessage::Interested).await?;
+        // Upload permission is granted asynchronously. A request sent while still
+        // choked can be dropped before the coordinator's Unchoke reaches us.
+        while !matches!(client.read_message().await?, PeerMessage::Unchoke) {}
+        client.send(&chunk_request(9, 0)).await?;
 
-    loop {
-        if let m @ PeerMessage::Piece { .. } = client.read_message().await.unwrap() {
-            let lc = LiveChunk::from_message(&m).unwrap();
-            assert_eq!(
-                lc,
-                LiveChunk {
-                    piece: 9,
-                    piece_header: [0u8; 8],
-                    chunk: 0,
-                    data: vec![5, 5, 5, 5]
-                }
-            );
-            break;
+        loop {
+            if let m @ PeerMessage::Piece { .. } = client.read_message().await? {
+                return Ok::<_, ace_peer::PeerError>(m);
+            }
         }
-    }
+    })
+    .await;
+    // The exchange has dropped its client socket. Reap our listener even on a
+    // timeout or peer error, before any assertion can panic.
+    listener_tasks.shutdown().await;
+
+    let message = exchange
+        .expect("handshake, unchoke and piece exchange must finish within 5 seconds")
+        .expect("seeded chunk exchange must succeed");
+    let lc = LiveChunk::from_message(&message).unwrap();
+    assert_eq!(
+        lc,
+        LiveChunk {
+            piece: 9,
+            piece_header: [0u8; 8],
+            chunk: 0,
+            data: vec![5, 5, 5, 5]
+        }
+    );
 }
 
 /// A real leech client (e.g. `AceProvider::follow_one_peer`) waits for the peer's extended

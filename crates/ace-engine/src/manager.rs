@@ -21,6 +21,9 @@ type StreamKey = (String, String);
 /// the manager closes admissions, so HTTP drain does not wait for a stalled range.
 struct ShutdownVodSource {
     source: Option<Box<dyn VodByteSource>>,
+    // A response may outlive the router that created it. Keep its cancellation owner
+    // alive until EOF or body drop; explicit shutdown still interrupts the reader.
+    manager: Option<Arc<StreamManager>>,
     length: u64,
     stopping: watch::Receiver<bool>,
 }
@@ -34,6 +37,7 @@ impl VodByteSource for ShutdownVodSource {
     async fn next(&mut self) -> Option<bytes::Bytes> {
         if *self.stopping.borrow() {
             self.source.take();
+            self.manager.take();
             return None;
         }
         let source = self.source.as_mut()?;
@@ -44,6 +48,7 @@ impl VodByteSource for ShutdownVodSource {
         };
         if next.is_none() {
             self.source.take();
+            self.manager.take();
         }
         next
     }
@@ -418,7 +423,7 @@ impl StreamManager {
     }
 
     pub(crate) async fn open_vod_range(
-        &self,
+        self: &Arc<Self>,
         content: &dyn VodContent,
         start: u64,
         end: u64,
@@ -427,6 +432,7 @@ impl StreamManager {
         let length = source.content_length();
         Ok(Box::new(ShutdownVodSource {
             source: Some(source),
+            manager: Some(self.clone()),
             length,
             stopping: self.shutdown_signal.subscribe(),
         }))

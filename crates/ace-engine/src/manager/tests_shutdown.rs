@@ -258,3 +258,103 @@ async fn shutdown_cancels_pending_vod_range_open_and_body_read() {
         assert!(manager.open_vod_range(&content, 0, 15).await.is_err());
     }
 }
+
+struct FiniteRange(Arc<AtomicUsize>);
+struct FiniteReader {
+    chunks: std::collections::VecDeque<bytes::Bytes>,
+    drops: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl VodContent for FiniteRange {
+    fn content_length(&self) -> u64 {
+        6
+    }
+    async fn open_range(&self, _: u64, _: u64) -> Result<Box<dyn VodByteSource>, ProviderError> {
+        Ok(Box::new(FiniteReader {
+            chunks: [
+                bytes::Bytes::from_static(b"abc"),
+                bytes::Bytes::from_static(b"def"),
+            ]
+            .into_iter()
+            .collect(),
+            drops: self.0.clone(),
+        }))
+    }
+}
+
+#[async_trait]
+impl VodByteSource for FiniteReader {
+    fn content_length(&self) -> u64 {
+        6
+    }
+    async fn next(&mut self) -> Option<bytes::Bytes> {
+        self.chunks.pop_front()
+    }
+}
+
+impl Drop for FiniteReader {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn vod_reader_owns_manager_until_eof_or_body_drop() {
+    for consume in [true, false] {
+        let manager = StreamManager::new(ProviderRegistry::new());
+        let weak = Arc::downgrade(&manager);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let content = FiniteRange(drops.clone());
+        let mut source = manager.open_vod_range(&content, 0, 5).await.unwrap();
+        drop(manager);
+        assert!(weak.upgrade().is_some(), "the open body owns its manager");
+        assert_eq!(source.content_length(), 6);
+        if consume {
+            assert_eq!(source.next().await.unwrap().as_ref(), b"abc");
+            assert_eq!(source.next().await.unwrap().as_ref(), b"def");
+            assert!(weak.upgrade().is_some());
+            assert!(source.next().await.is_none());
+            assert!(weak.upgrade().is_none(), "EOF releases the manager owner");
+            assert!(source.next().await.is_none());
+        }
+        drop(source);
+        assert!(
+            weak.upgrade().is_none(),
+            "body drop releases the manager owner"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn explicit_shutdown_cancels_vod_reader_and_releases_its_manager_owner() {
+    let manager = StreamManager::new(ProviderRegistry::new());
+    let weak = Arc::downgrade(&manager);
+    let content = PendingRange {
+        block_open: false,
+        entered: Arc::new(Notify::new()),
+        reads: Arc::new(Notify::new()),
+        drops: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut source = manager.open_vod_range(&content, 0, 15).await.unwrap();
+    drop(manager);
+    {
+        let reading = source.next();
+        tokio::pin!(reading);
+        assert!(futures::poll!(reading.as_mut()).is_pending());
+        content.reads.notified().await;
+        let controller = weak.upgrade().expect("the open reader keeps its manager");
+        timeout(Duration::from_secs(1), controller.shutdown())
+            .await
+            .expect("the body owner must not block explicit shutdown");
+        drop(controller);
+        assert!(timeout(Duration::from_secs(1), reading)
+            .await
+            .unwrap()
+            .is_none());
+    }
+    assert!(weak.upgrade().is_none());
+    assert_eq!(content.drops.load(Ordering::SeqCst), 1);
+    assert!(source.next().await.is_none());
+}

@@ -207,6 +207,15 @@ async fn resolve_public(host: &str, port: u16) -> Result<SocketAddr> {
 /// All production callers validate the destination first; tests pin a synthetic hostname to
 /// their own loopback fixture. A second DNS lookup cannot rebind the actual connection.
 async fn fetch_from(url: &str, host: &str, addr: SocketAddr) -> Result<Vec<SocketAddrV4>> {
+    let (_client, response) = request_from(url, host, addr).await?;
+    read_response(response).await
+}
+
+async fn request_from(
+    url: &str,
+    host: &str,
+    addr: SocketAddr,
+) -> Result<(reqwest::Client, reqwest::Response)> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -215,13 +224,17 @@ async fn fetch_from(url: &str, host: &str, addr: SocketAddr) -> Result<Vec<Socke
         .resolve(host, addr)
         .build()
         .map_err(|_| "HTTP tracker client failed")?;
-    let mut response = client
+    let response = client
         .get(url)
         .header("Accept-Encoding", "identity")
         .header("User-Agent", concat!("outpace/", env!("CARGO_PKG_VERSION")))
         .send()
         .await
         .map_err(|_| "HTTP tracker request failed")?;
+    Ok((client, response))
+}
+
+async fn read_response(mut response: reqwest::Response) -> Result<Vec<SocketAddrV4>> {
     if !response.status().is_success() {
         return Err("HTTP tracker status");
     }
@@ -630,21 +643,44 @@ mod tests {
 
     #[tokio::test]
     async fn stalled_body_obeys_total_request_deadline() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") && request.len() < 8192 {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            assert!(request.ends_with(b"\r\n\r\n"));
             stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n")
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nx")
                 .await
                 .unwrap();
             std::future::pending::<()>().await;
         });
         let url = format!("http://tracker.example.test:{}/announce", addr.port());
-        let result = tokio::time::timeout(
+        let (_client, response) = tokio::time::timeout(
             REQUEST_TIMEOUT + Duration::from_secs(2),
-            fetch_from(&url, "tracker.example.test", addr),
+            request_from(&url, "tracker.example.test", addr),
         )
+        .await
+        .expect("fixture setup exceeded its guard")
+        .expect("fixture did not reach the response-body phase");
+        // Freeze only after real TCP setup. The Response retains the original
+        // request deadline; the separate guard does not grant a new body timeout.
+        tokio::time::pause();
+        let result = tokio::time::timeout(REQUEST_TIMEOUT + Duration::from_secs(2), async {
+            let body = read_response(response);
+            tokio::pin!(body);
+            let pending = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(body.as_mut(), cx).is_pending())
+            })
+            .await;
+            assert!(pending, "fixture must leave an unfinished response body");
+            tokio::time::advance(REQUEST_TIMEOUT).await;
+            body.await
+        })
         .await;
         task.abort();
         assert_eq!(

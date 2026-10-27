@@ -48,10 +48,11 @@ Copy [`compose.yml`](../tools/deploy/lxc/compose.yml) to `/opt/outpace/compose.y
 `/opt/outpace/.env`:
 
 ```dotenv
-OUTPACE_IMAGE=ghcr.io/open-ott-play/outpace-acestream:0.8.1
+OUTPACE_IMAGE=ghcr.io/open-ott-play/outpace-acestream:0.9.0
 ```
 
-Use an accepted immutable release digest in production. The file uses
+Verify that the selected release is published and use its accepted immutable
+image digest in production. The file uses
 `network_mode: host`, so the listeners bind the guest's own addresses and WARP applies to the
 daemon directly. The router, not Docker, publishes the peer port.
 

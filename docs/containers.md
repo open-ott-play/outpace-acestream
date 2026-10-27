@@ -5,15 +5,20 @@ player or proxy. It supports Linux `amd64`, `arm64`, and `arm/v7`. Docker Deskto
 can run it on macOS or Windows through its Linux VM; a native binary is also
 available in the [installation guide](installation.md).
 
-These instructions pin **v0.8.1** to its published multi-platform image digest:
+These examples target **v0.9.0**. Confirm publication on the
+[release page](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.0)
+and inspect the multi-platform image before starting it:
 
 ```bash
-export OUTPACE_IMAGE='ghcr.io/open-ott-play/outpace-acestream@sha256:fd83adbe4286f4d6b6578370d9b8a92bf9fa3f2e79be7ed15d0db439d4c385a6'
+export OUTPACE_IMAGE='ghcr.io/open-ott-play/outpace-acestream:0.9.0'
+docker buildx imagetools inspect "$OUTPACE_IMAGE"
 docker pull "$OUTPACE_IMAGE"
 ```
 
-Docker selects the matching platform from that index. A tag such as `latest`
-can move; record the digest you actually deploy and review the
+Docker selects the matching platform from that index. For production, replace
+the tag with `ghcr.io/open-ott-play/outpace-acestream@sha256:<verified-index-digest>`
+after checking the published source and image metadata. Tags can move; record
+the digest you actually deploy and review the
 [release notes](https://github.com/open-ott-play/outpace-acestream/releases).
 No registry credentials are required to pull this public image.
 
@@ -75,12 +80,14 @@ have one, then edit it. Preserve an existing operator configuration.
 Set these values in `.env`:
 
 ```dotenv
-OUTPACE_IMAGE=ghcr.io/open-ott-play/outpace-acestream@sha256:fd83adbe4286f4d6b6578370d9b8a92bf9fa3f2e79be7ed15d0db439d4c385a6
+OUTPACE_IMAGE=ghcr.io/open-ott-play/outpace-acestream:0.9.0
 OUTPACE_ACE_COMPAT=1
 OUTPACE_CACHE_TYPE=memory
 OUTPACE_CACHE_DIR=/var/lib/outpace/cache
 OUTPACE_ENABLE_PORT_MAPPING=0
 ```
+
+Replace the example image tag with the verified index digest for production.
 
 Create a local `compose.override.yml` to apply the restricted runtime:
 
@@ -132,8 +139,8 @@ between two simultaneously running engines.
 `OUTPACE_DATA_DIR`.** Its default cache path was computed before the data-dir
 environment override; depending on the runtime user it can point outside the
 mounted volume. The examples use `/var/lib/outpace/cache`, which fixes that
-case without making the root filesystem writable. The source branch includes
-a later fix, but that does not change the already published v0.8.1 binary.
+case without making the root filesystem writable. Version 0.9.0 includes
+the fix, but that does not change an existing v0.8.1 binary.
 
 Even `OUTPACE_CACHE_TYPE=memory` persists small warm-peer hints under that cache
 directory. On Unix the engine requests a private directory mode of 0700 and

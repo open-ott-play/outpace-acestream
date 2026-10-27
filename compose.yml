@@ -2,7 +2,7 @@ name: outpace
 
 services:
   outpace:
-    image: ${OUTPACE_IMAGE:-ghcr.io/open-ott-play/outpace-acestream:latest}
+    image: ${OUTPACE_IMAGE:-ghcr.io/open-ott-play/outpace-acestream:0.9.0}
     restart: unless-stopped
     environment:
       # Listeners bind inside the container; host exposure is controlled by ports below.

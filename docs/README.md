@@ -16,8 +16,9 @@ proxy supplies the viewing interface and channel catalog.
 | Select environment values and buffering limits | [Configuration reference](configuration.md) |
 | Diagnose startup, codecs, network, cache or deployment problems | [Troubleshooting](troubleshooting.md) |
 
-Start with the platform-specific recipe. The examples use published v0.8.1
-artifacts and distinguish later source fixes from that immutable release.
+Start with the platform-specific recipe. The examples target v0.9.0; verify
+the published assets and source before installing. Historical version
+differences remain explicit.
 Preserve the data directory across upgrades; use the upgrade and rollback
 sections before replacing an existing service.
 
@@ -42,7 +43,7 @@ sections before replacing an existing service.
 - [RC fuzz assessment](fuzzing.md): bounded targets, synthetic corpora and source-bound evidence.
 - [CI and dependency maintenance](ci-cd.md): required checks, shared security analysis and Renovate.
 - [Release acceptance](releasing.md): immutable releases, corresponding source and publication checks.
-- [Timeshift beta](timeshift.md): retained-media replay, per-viewer controls, peer-history experiment and limits.
+- [Retained replay](timeshift.md): retained-media replay, per-viewer controls, peer-history experiment and limits.
 
 - [Development](development.md): source builds, meaningful validation and safe
   diagnostic reports.

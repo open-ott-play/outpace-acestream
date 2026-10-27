@@ -4,6 +4,7 @@ name: CI
 # No path filters, on purpose: when a path filter skips a workflow, its required
 # checks stay "Pending" forever and block the pull request.
 on:
+  workflow_call:
   pull_request:
   push:
     branches: [main]

@@ -1,6 +1,7 @@
 name: hygiene
 
 on:
+  workflow_call:
   push:
   pull_request:
 

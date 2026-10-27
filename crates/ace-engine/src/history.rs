@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 
 const MAX_SEGMENTS: usize = 4096;
 
+#[cfg(test)]
+mod retention_model;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HlsHistoryConfig {

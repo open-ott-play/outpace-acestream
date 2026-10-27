@@ -74,6 +74,10 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # The RTMP loopback test self-skips without ffmpeg; the hosted image has none.
+      - name: Prefer the provisioned Ubuntu archive fallback
+        if: ${{ runner.environment == 'github-hosted' && runner.os == 'Linux' }}
+        run: sudo env RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS" "$(command -v node)" tools/ci/prepare_ubuntu_mirrors.cjs
+
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
 
@@ -125,6 +129,9 @@ jobs:
         with:
           build-warnings: ""
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Prefer the provisioned Ubuntu archive fallback
+        if: ${{ runner.environment == 'github-hosted' && runner.os == 'Linux' }}
+        run: sudo env RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS" "$(command -v node)" tools/ci/prepare_ubuntu_mirrors.cjs
       - name: Install synthetic media tools
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       # The opted-in suite verifies every required encoder/generator and ffprobe;

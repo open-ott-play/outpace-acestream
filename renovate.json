@@ -31,6 +31,19 @@
       "packageNameTemplate": "https://github.com/victron-venus/venus-os-ci-toolkit",
       "datasourceTemplate": "git-refs",
       "fileFormat": "yaml"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^tools/hygiene/allowed-identifiers\\.txt$/"
+      ],
+      "matchStrings": [
+        "(?<currentDigest>[a-f0-9]{40}) # renovate: shared-toolkit-ref;"
+      ],
+      "currentValueTemplate": "main",
+      "depNameTemplate": "victron-venus/venus-os-ci-toolkit",
+      "packageNameTemplate": "https://github.com/victron-venus/venus-os-ci-toolkit",
+      "datasourceTemplate": "git-refs"
     }
   ],
   "packageRules": [
@@ -87,9 +100,10 @@
       "enabled": false
     },
     {
-      "description": "Update the shared runner checkout pin together with its reusable workflow reference.",
+      "description": "Update shared workflow runtime and reviewed hash inventory together with callable references.",
       "matchManagers": [
-        "custom.jsonata"
+        "custom.jsonata",
+        "custom.regex"
       ],
       "groupName": "GitHub Actions and reusable workflows",
       "groupSlug": "ci-workflows",
@@ -97,7 +111,10 @@
       "separateMajorMinor": false,
       "separateMinorPatch": false,
       "separateMultipleMajor": false,
-      "automerge": false
+      "automerge": false,
+      "matchDepNames": [
+        "victron-venus/venus-os-ci-toolkit"
+      ]
     }
   ],
   "platformAutomerge": true,

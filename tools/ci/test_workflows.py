@@ -4,6 +4,7 @@ BaseLoader preserves GitHub Actions' YAML 1.2 ``on`` spelling and reads scalar
 values as strings. No workflow command is executed by these checks.
 """
 from pathlib import Path
+import json
 import re
 import unittest
 
@@ -107,6 +108,34 @@ class WorkflowContracts(unittest.TestCase):
         })
         candidate = workflow("fuzz-candidate.yml")["jobs"]["fuzz"]
         self.assertEqual(job["uses"].rsplit("@", 1)[1], candidate["with"]["toolkit-ref"])
+
+    def test_toolkit_update_includes_references_and_reviewed_hash_inventory(self):
+        package = "victron-venus/venus-os-ci-toolkit"
+        expected = workflow("fuzz-candidate.yml")["jobs"]["fuzz"]["with"]["toolkit-ref"]
+        for filename in ("fuzz-candidate.yml", "security.yml"):
+            text = (WORKFLOWS / filename).read_text()
+            self.assertRegex(text, re.escape(package) + r"/.+@" + expected + r" # main\n")
+        config = json.loads((ROOT / "renovate.json").read_text())
+        managers = [manager for manager in config["customManagers"]
+                    if manager.get("customType") == "regex"
+                    and any("allowed-identifiers" in path
+                            for path in manager.get("managerFilePatterns", []))]
+        self.assertEqual(len(managers), 1)
+        manager = managers[0]
+        self.assertEqual(manager["depNameTemplate"], package)
+        self.assertEqual(manager["datasourceTemplate"], "git-refs")
+        self.assertEqual(manager["currentValueTemplate"], "main")
+        pattern = manager["matchStrings"][0].replace("(?<currentDigest>", "(?P<currentDigest>")
+        inventory = (ROOT / "tools/hygiene/allowed-identifiers.txt").read_text()
+        matches = list(re.finditer(pattern, inventory))
+        self.assertEqual([match.group("currentDigest") for match in matches], [expected])
+        for custom_manager in ("custom.jsonata", "custom.regex"):
+            rules = [rule for rule in config["packageRules"]
+                     if custom_manager in rule.get("matchManagers", [])
+                     and package in rule.get("matchDepNames", [])]
+            self.assertEqual(len(rules), 1)
+            self.assertEqual(rules[0]["groupSlug"], "ci-workflows")
+            self.assertFalse(rules[0]["automerge"])
 
     def test_stable_and_beta_release_keep_full_source_matrix_and_verifier(self):
         doc = workflow("release.yml")

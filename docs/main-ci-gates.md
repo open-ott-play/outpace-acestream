@@ -6,12 +6,21 @@ Do not apply repository rulesets directly from this checkout. The historical
 [`.github/main-ruleset.json`](../.github/main-ruleset.json) is an upstream reference,
 not the active policy or an apply payload for this fork.
 
-The effective `Public software - required review and CI` ruleset was read back
-from GitHub on 2026-10-24. It targets the default branch, requires a pull request,
-blocks deletion and non-fast-forward updates, and has no bypass actors. It
-requires one approving review, dismisses stale reviews after new commits,
-requires approval of the most recent push and requires resolution of review
-threads. The branch must include the current base before it can merge.
+The `Public software - required review and CI` ruleset targets the default
+branch, requires a pull request, and blocks deletion and non-fast-forward
+updates. Ordinary merges require one approving review, dismiss stale reviews
+after new commits, require approval of the most recent push and require
+resolution of review threads. The branch must include the current base before
+an ordinary merge.
+
+The 2026-10-24 readback had no bypass actors. The subsequent
+[Terraform owner policy](https://github.com/4alvit/terraform-github-open-ott-play/blob/main/docs/public-security.md#emergency-owner-merges)
+permits an explicit organization-owner emergency merge **through a pull request
+only**. Record the reason, reviewed commit and available check evidence in the
+PR. This does not authorize direct pushes or grant automation a bypass. Required
+checks remain mandatory for ordinary merges, and missing or failed checks must
+not be described as passing. Read back the live rulesets to verify which policy
+has been applied.
 
 The five required check contexts are bound to the GitHub Actions app:
 

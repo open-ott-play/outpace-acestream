@@ -27,6 +27,13 @@ Positive controls ensure valid metainfo, frames, metadata messages, peer records
 and aligned media actually reach successful parse paths. Unexpected panics and
 assertion failures are findings; the harness does not suppress them.
 
+These four targets do not exercise the daemon's viewer leases, shared history
+budget or runtime shutdown. Those stateful paths have separate deterministic
+`ace-engine` tests, including multi-store retention and listener cleanup after
+startup failure or cancellation. The generated-media integration test checks
+decoded replay and independent viewers. A successful parser assessment does not
+replace these checks or qualify every possible playback sequence.
+
 ## Budgets and execution policy
 
 Each target accepts at most 16 KiB and has a 60-second mutation budget: four

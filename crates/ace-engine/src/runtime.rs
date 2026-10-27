@@ -48,6 +48,65 @@ pub struct EngineRuntime {
     announce_port_tx: tokio::sync::watch::Sender<Option<u16>>,
     identity: Arc<ace_wire::identity::Identity>,
     source_configs: BTreeMap<String, ValidatedSourceConfig>,
+    background: RuntimeTasks,
+}
+
+/// The runtime owns every long-lived maintenance/listener task it starts. Keeping
+/// joins in the owner until completion also makes a cancelled shutdown safe.
+struct RuntimeTasks {
+    cancel: tokio::sync::watch::Sender<bool>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Default for RuntimeTasks {
+    fn default() -> Self {
+        Self {
+            cancel: tokio::sync::watch::channel(false).0,
+            tasks: Vec::new(),
+        }
+    }
+}
+
+impl RuntimeTasks {
+    fn spawn(&mut self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        self.spawn_until(move |mut cancel| async move {
+            if *cancel.borrow() {
+                return;
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.changed() => {},
+                _ = future => {},
+            }
+        });
+    }
+
+    fn spawn_until<F, Fut>(&mut self, run: F)
+    where
+        F: FnOnce(tokio::sync::watch::Receiver<bool>) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.tasks.push(tokio::spawn(run(self.cancel.subscribe())));
+    }
+
+    async fn shutdown(&mut self) {
+        self.cancel.send_replace(true);
+        // Do not drain/take a handle before awaiting it: dropping this future
+        // must leave every unfinished task available to the owner's Drop.
+        while let Some(task) = self.tasks.last_mut() {
+            let _ = task.await;
+            self.tasks.pop();
+        }
+    }
+}
+
+impl Drop for RuntimeTasks {
+    fn drop(&mut self) {
+        self.cancel.send_replace(true);
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
 }
 
 pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
@@ -699,33 +758,6 @@ pub async fn build_runtime(
         config.history,
     );
     manager.spawn_reaper();
-    if config.seed_ttl_secs > 0 {
-        let seed_registry_reap = seed_registry.clone();
-        let ttl = std::time::Duration::from_secs(config.seed_ttl_secs);
-        tokio::spawn(async move {
-            // Sweep at a fraction of the TTL so an idle entry is reclaimed within ~1.25x the TTL.
-            let interval = (ttl / 4).max(std::time::Duration::from_secs(5));
-            loop {
-                tokio::time::sleep(interval).await;
-                let n = seed_registry_reap.reap(ttl);
-                if n > 0 {
-                    crate::alog!("[seed] reaped {n} idle leech registry entr(y/ies)");
-                }
-            }
-        });
-    }
-    if config.enable_inbound {
-        let rechoke_registry = seed_registry.clone();
-        tokio::spawn(async move {
-            // BitTorrent's classic rechoke cadence is ~10s; rotate the optimistic-unchoke slot on
-            // that beat so newcomers periodically get a turn even on a saturated stream.
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
-            loop {
-                ticker.tick().await;
-                rechoke_registry.rechoke_all();
-            }
-        });
-    }
     let broadcasts = BroadcastState {
         registry: BroadcastRegistry::with_persist_and_options(
             &config.data_dir,
@@ -769,6 +801,36 @@ pub async fn build_runtime(
         );
     }
 
+    // Start maintenance only after fallible runtime construction has succeeded.
+    let mut background = RuntimeTasks::default();
+    if config.seed_ttl_secs > 0 {
+        let seed_registry_reap = seed_registry.clone();
+        let ttl = std::time::Duration::from_secs(config.seed_ttl_secs);
+        background.spawn(async move {
+            // Sweep at a fraction of the TTL so an idle entry is reclaimed within ~1.25x the TTL.
+            let interval = (ttl / 4).max(std::time::Duration::from_secs(5));
+            loop {
+                tokio::time::sleep(interval).await;
+                let n = seed_registry_reap.reap(ttl);
+                if n > 0 {
+                    crate::alog!("[seed] reaped {n} idle leech registry entr(y/ies)");
+                }
+            }
+        });
+    }
+    if config.enable_inbound {
+        let rechoke_registry = seed_registry.clone();
+        background.spawn(async move {
+            // BitTorrent's classic rechoke cadence is ~10s; rotate the optimistic-unchoke slot on
+            // that beat so newcomers periodically get a turn even on a saturated stream.
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                ticker.tick().await;
+                rechoke_registry.rechoke_all();
+            }
+        });
+    }
+
     Ok(EngineRuntime {
         config,
         networks,
@@ -779,6 +841,7 @@ pub async fn build_runtime(
         announce_port_tx,
         identity,
         source_configs,
+        background,
     })
 }
 
@@ -789,12 +852,14 @@ pub async fn serve_http(runtime: EngineRuntime) -> Result<(), Box<dyn std::error
 /// The real serving/cleanup path accepts a shutdown future, allowing controlled local
 /// lifecycle tests without process-global signal/environment mutation.
 pub(crate) async fn serve_http_until(
-    runtime: EngineRuntime,
+    mut runtime: EngineRuntime,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let manager = runtime.manager.clone();
     let broadcasts = runtime.broadcasts.clone();
-    let result = serve_http_inner(runtime, shutdown).await;
+    let mut background = std::mem::take(&mut runtime.background);
+    let result = serve_http_inner(runtime, shutdown, &mut background).await;
+    background.shutdown().await;
     broadcasts.close_admissions();
     let cleanup = broadcasts.shutdown().await;
     // Both listener/startup errors and normal HTTP draining must finish HLS cleanup.
@@ -814,6 +879,7 @@ pub(crate) async fn serve_http_until(
 async fn serve_http_inner(
     runtime: EngineRuntime,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    background: &mut RuntimeTasks,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let EngineRuntime {
         config,
@@ -825,6 +891,7 @@ async fn serve_http_inner(
         announce_port_tx,
         identity,
         source_configs,
+        background: _,
     } = runtime;
     let mut shutdown = Box::pin(shutdown);
 
@@ -871,8 +938,8 @@ async fn serve_http_inner(
         let inbound_admission = inbound_admission_from_config(&config);
         let listener_identity = identity.clone();
         let listener_reachability = reachability.clone();
-        tokio::spawn(async move {
-            ace_swarm::listen::PeerListener::serve_with_policy(
+        background.spawn_until(move |cancel| async move {
+            ace_swarm::listen::PeerListener::serve_with_policy_until(
                 peer_listener,
                 inbound_registry,
                 listener_peer_id,
@@ -880,6 +947,7 @@ async fn serve_http_inner(
                 inbound_admission,
                 listener_identity,
                 listener_reachability,
+                cancel,
             )
             .await;
         });
@@ -908,7 +976,7 @@ async fn serve_http_inner(
             _port_map_handle = ace_swarm::portmap::spawn_port_mapping(pm_cfg);
             if let Some(handle) = &_port_map_handle {
                 let mapped_rx = handle.endpoint_receiver();
-                tokio::spawn(propagate_mapped_announce_port(
+                background.spawn(propagate_mapped_announce_port(
                     mapped_rx,
                     announce_port_tx,
                     config.peer_listen.port(),
@@ -923,7 +991,7 @@ async fn serve_http_inner(
         // mapped-external-IP cross-check that flags double-NAT / CGNAT.
         if let Some(monitor) = reachability.clone() {
             let endpoint_rx = _port_map_handle.as_ref().map(|h| h.endpoint_receiver());
-            tokio::spawn(reachability_status_loop(
+            background.spawn(reachability_status_loop(
                 monitor,
                 endpoint_rx,
                 bound_peer_port,
@@ -954,6 +1022,8 @@ async fn serve_http_inner(
     eprintln!("  Live ids: bare hex or cid: selects a content id; ih: selects a verified infohash");
     eprintln!("  status:  http://{}/streams", config.bind);
     let cancel_rtmp = rtmp.cancel.clone();
+    let cancel_background = background.cancel.clone();
+    let mut background_cancelled = background.cancel.subscribe();
     let draining_broadcasts = broadcasts.clone();
     let draining_manager = state.manager.clone();
     let result: Result<(), Box<dyn std::error::Error>> = async {
@@ -974,10 +1044,22 @@ async fn serve_http_inner(
         }
         axum::serve(listener, router(state))
             .with_graceful_shutdown(async move {
-                shutdown.await;
+                // Axum retains this future in its own task. Dropping the outer
+                // serving future must wake it too, so it releases manager state.
+                tokio::select! {
+                    _ = shutdown => {},
+                    _ = async {
+                        while !*background_cancelled.borrow_and_update() {
+                            if background_cancelled.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    } => {},
+                }
                 // Close/cancel before HTTP graceful drain can wait on a live request body.
                 draining_broadcasts.close_admissions();
                 cancel_rtmp.send_replace(true);
+                cancel_background.send_replace(true);
                 // Continuous provider responses end when their source sender closes. Waiting
                 // for HTTP drain before stopping the manager would keep those bodies alive
                 // indefinitely (or until compatibility authorization expires).

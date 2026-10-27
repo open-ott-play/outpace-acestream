@@ -1,6 +1,18 @@
 name: Release
 
 on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Validate a source release candidate (includes mandatory fuzzing)
+        type: choice
+        options: [rc]
+        default: rc
+        required: true
+      expected_sha:
+        description: Optional exact main commit; fail if the branch moved
+        type: string
+        required: false
   push:
     tags:
       - "v*.*.*"
@@ -21,8 +33,71 @@ env:
   IMAGE_NAME: ghcr.io/open-ott-play/outpace-acestream
 
 jobs:
+  rc-request:
+    name: Validate RC request
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: python3 tools/release/rc_gate.py request
+
+  rc-checks:
+    needs: rc-request
+    uses: ./.github/workflows/ci.yml
+
+  rc-hygiene:
+    needs: rc-request
+    uses: ./.github/workflows/hygiene.yml
+
+  rc-security:
+    needs: rc-request
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    uses: ./.github/workflows/security.yml
+
+  rc-fuzz:
+    needs: rc-request
+    uses: ./.github/workflows/fuzz-candidate.yml
+    with:
+      channel: ${{ inputs.channel }}
+
+  rc-gate:
+    name: RC gate
+    needs: [rc-request, rc-checks, rc-hygiene, rc-security, rc-fuzz]
+    if: always() && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Require every RC stage to succeed
+        env:
+          RC_JOB_RESULTS: ${{ toJSON(needs) }}
+        run: python3 tools/release/rc_gate.py jobs
+      - name: Download fuzz evidence from this run and attempt
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: fuzz-candidate-${{ github.run_attempt }}
+          path: rc-evidence
+      - name: Bind successful RC to its exact source and fuzz targets
+        run: python3 tools/release/rc_gate.py report rc-evidence/fuzz-report.json --output rc-evidence/rc-result.json
+      - name: Retain verified source RC result
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: source-rc-${{ github.run_attempt }}
+          path: rc-evidence/*.json
+          if-no-files-found: error
+          retention-days: 90
+
   release-metadata:
     name: Validate release tag against Cargo metadata
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.release.outputs.version }}

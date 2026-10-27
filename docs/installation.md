@@ -6,9 +6,9 @@ player opens the HTTP or HLS output. Optional HLS audio normalization needs an
 operator-installed FFmpeg; ordinary playback does not automatically install or
 invoke it.
 
-This guide uses the published **v0.8.1** assets. Read the
-[release notes](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.8.1)
-before selecting a different version. Commands below describe a fresh install;
+This guide targets **v0.9.0**. Check the
+[release page](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.0)
+and verify that its assets have been published before installing. Commands below describe a fresh install;
 use [Upgrade and rollback](#upgrade-and-rollback) for an existing service.
 
 - [Choose an architecture](#choose-an-architecture)
@@ -22,7 +22,7 @@ use [Upgrade and rollback](#upgrade-and-rollback) for an existing service.
 
 ## Choose an architecture
 
-These seven binary archives are published for v0.8.1. The target is part of the
+The release workflow builds these seven binary archives. The target is part of the
 filename; it is not a command-line argument.
 
 | Operating system | Architecture | Target | Archive |
@@ -36,7 +36,7 @@ filename; it is not a command-line argument.
 | Windows | ARM64 | `aarch64-pc-windows-msvc` | `.zip` |
 
 For example, the Apple Silicon archive is
-`outpace-0.8.1-aarch64-apple-darwin.tar.gz`. Its top-level directory has the same
+`outpace-0.9.0-aarch64-apple-darwin.tar.gz`. Its top-level directory has the same
 name without `.tar.gz`. The Windows executable is `outpace.exe`; the others are
 `outpace`.
 
@@ -61,7 +61,7 @@ refuses to replace an existing executable or package directory.
 ```sh
 (
   set -eu
-  version=0.8.1
+  version=0.9.0
   target=aarch64-apple-darwin # Change this for your machine.
   case "$target" in
     x86_64-unknown-linux-musl|aarch64-unknown-linux-musl|armv7-unknown-linux-musleabihf|x86_64-apple-darwin|aarch64-apple-darwin) ;;
@@ -121,8 +121,8 @@ only one daemon against that directory. Preserve it when updating the binary.
 
 **v0.8.1 requires an explicit cache path when you relocate the data directory.**
 Setting `OUTPACE_DATA_DIR` alone leaves the old default cache location in that
-release. The examples below set both variables. Main contains a subsequent fix,
-but that does not change the published v0.8.1 executable.
+release. The examples below set both variables. Version 0.9.0 includes the fix,
+but that does not change an existing v0.8.1 executable.
 
 HTTP `6878` and RTMP `1935` are bound to loopback in these examples. The peer
 listener uses TCP `8621` on all interfaces, with automatic router port mapping
@@ -235,7 +235,7 @@ OUTPACE_ENABLE_PORT_MAPPING=0 \
 
 If macOS presents a security alert, verify the selected release and consult
 [Apple's instructions for downloaded apps](https://support.apple.com/en-us/102445).
-The v0.8.1 release does not promise Developer ID notarization. Do not disable
+These packages do not promise Developer ID notarization. Do not disable
 Gatekeeper globally or treat an unexpected alert as proof that the file is safe.
 
 After the foreground health check, stop it with `Ctrl-C`. For a service that runs
@@ -319,7 +319,7 @@ $ErrorActionPreference = 'Stop'
 if ($PSVersionTable.PSVersion -lt [version]'7.5') {
     throw 'Use PowerShell 7.5 or later for this recipe.'
 }
-$Version = '0.8.1'
+$Version = '0.9.0'
 $Target = 'x86_64-pc-windows-msvc' # Use aarch64-pc-windows-msvc on Windows ARM64.
 if ($Target -notin @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')) {
     throw 'Select a Windows target from the architecture table.'
@@ -359,7 +359,7 @@ Copy-Item (Join-Path $Stage 'SHA256SUMS'), (Join-Path $Stage $Archive), (Join-Pa
 These commands use Microsoft's [Get-FileHash](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/get-filehash?view=powershell-7.5)
 and [Expand-Archive](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.archive/expand-archive).
 Retain the full package and complete-source archive, including their notices.
-v0.8.1 does not claim Authenticode signing. Do not disable Windows security
+These packages do not claim Authenticode signing. Do not disable Windows security
 features to make an unexpected or unverified executable run.
 
 Start the daemon in the same PowerShell session:
@@ -466,5 +466,5 @@ also needs its target toolchain; use the existing release workflow and
 For an offline rebuild of a published artifact, extract its matching complete
 source archive and follow its `REBUILD.md`. It carries the exact workspace and
 locked registry sources. Modified builds must provide their own matching source
-bundle and notices; a published v0.8.1 source archive cannot describe later local
+bundle and notices; an earlier release's source archive cannot describe later local
 changes. See the repository's [license and source guidance](../README.md).

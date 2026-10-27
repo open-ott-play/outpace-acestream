@@ -4,10 +4,14 @@ Read the [Kubernetes operator guide](../../docs/kubernetes.md) before applying.
 This directory is a portable starting point, not a copy of a private cluster.
 
 It creates namespace `outpace`, PVC `outpace-data`, one `Recreate` Deployment,
-and a **ClusterIP-only** HTTP Service. It pins the public v0.8.1 multi-platform
+and a **ClusterIP-only** HTTP Service. It targets the v0.9.0 multi-platform
 image, enables the supported Ace HTTP subset, and runs with a read-only root
 filesystem as UID/GID 1000. Outbound peer connections and reciprocal uploads
 are enabled; inbound peer listening and automatic router mapping are disabled.
+
+Verify publication and matching source metadata before installing. For
+production, replace the image tag in `deployment.yaml` with the verified
+v0.9.0 index digest, as described in the operator guide.
 
 Check that your StorageClass supports the required ownership and permissions.
 The default class is selected unless you add `storageClassName` to `pvc.yaml`.

@@ -1,12 +1,12 @@
 # Host-networked outpace for an LXC guest. Install as /opt/outpace/compose.yml with an .env
-# containing OUTPACE_IMAGE=ghcr.io/open-ott-play/outpace-acestream:0.8.1 (prefer an accepted immutable release digest).
+# containing OUTPACE_IMAGE=ghcr.io/open-ott-play/outpace-acestream:0.9.0 (prefer an accepted immutable release digest).
 # Host networking means the listeners bind the guest's own addresses, so WARP and the guest
 # firewall apply to the daemon directly. The peer port is published by the router, not Docker.
 name: outpace
 
 services:
   outpace:
-    image: ${OUTPACE_IMAGE:-ghcr.io/open-ott-play/outpace-acestream:0.8.1}
+    image: ${OUTPACE_IMAGE:-ghcr.io/open-ott-play/outpace-acestream:0.9.0}
     network_mode: host
     restart: unless-stopped
     environment:

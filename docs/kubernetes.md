@@ -3,11 +3,17 @@
 The [checked-in example](../examples/kubernetes/README.md) deploys one Outpace
 instance with a persistent identity and an internal HTTP Service. It is a
 portable baseline for Kubernetes or k3s, not a copy of any private cluster.
-It pins the public **v0.8.1** multi-platform image:
+It targets the **v0.9.0** multi-platform image:
 
 ```text
-ghcr.io/open-ott-play/outpace-acestream@sha256:fd83adbe4286f4d6b6578370d9b8a92bf9fa3f2e79be7ed15d0db439d4c385a6
+ghcr.io/open-ott-play/outpace-acestream:0.9.0
 ```
+
+Verify the [release assets](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.0)
+and source metadata first. For production, replace the example tag in
+`deployment.yaml` with the verified multi-platform index digest before rendering
+or applying. The [container guide](containers.md) shows image inspection;
+do not substitute a digest from an older release.
 
 This index supports Linux `amd64`, `arm64`, and `arm/v7`. The example requires
 a working storage provisioner, cluster DNS, and permitted outbound Internet
@@ -223,7 +229,7 @@ exclusive locking, and atomic replacement semantics. Root-squash and driver
 behavior may require storage-side provisioning rather than a privileged
 init container. The example includes no privileged permission fixer.
 
-For **v0.8.1**, keep both paths explicit:
+The example keeps both paths explicit; this is required for **v0.8.1**:
 
 ```yaml
 - name: OUTPACE_DATA_DIR

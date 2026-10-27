@@ -14,10 +14,11 @@ preserving its history, attribution and **AGPL-3.0-or-later** license. It does n
 require an original closed-source engine at runtime and is not an official Ace
 Stream product. The executable remains `outpace`; configuration uses `OUTPACE_*`.
 
-[Download v0.8.1](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.8.1)
-· [Download v0.9.0-beta.8](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.0-beta.8)
-· [Beta.8 changes](docs/releases/v0.9.0-beta.8.md)
-· [Timeshift beta](docs/timeshift.md)
+[v0.9.0 release](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.0)
+· [0.9.0 changes](docs/releases/v0.9.0.md)
+· [Previous stable v0.8.1](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.8.1)
+· [Beta.8 history](docs/releases/v0.9.0-beta.8.md)
+· [Retained replay](docs/timeshift.md)
 · [Documentation](docs/README.md)
 · [HTTP API](docs/native-api.md)
 · [Troubleshooting](docs/troubleshooting.md)
@@ -45,9 +46,10 @@ assessment does not qualify a product release.
 | Tuning and operations | [Configuration](docs/configuration.md) · [Troubleshooting](docs/troubleshooting.md) |
 | Development and source distribution | [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Licensing](docs/licensing.md) |
 
-The guides pin **v0.8.1** where reproducibility matters. The documentation on
-`main` also describes subsequent source changes and marks relevant differences.
-In particular, set **both `OUTPACE_DATA_DIR` and `OUTPACE_CACHE_DIR`** when moving
+The installation examples target **v0.9.0**; verify its published assets before
+installing, and pin a verified image digest for production containers.
+Historical version differences remain explicit. In particular, set
+**both `OUTPACE_DATA_DIR` and `OUTPACE_CACHE_DIR`** when moving
 v0.8.1 state to a service directory or volume. Its default-cache derivation was
 fixed after that release. Windows currently supports in-memory peer hints, not
 the Unix durable peer-hint backend; follow the Windows-specific recipe.
@@ -62,7 +64,7 @@ the Unix durable peer-hint backend; follow the Windows-specific recipe.
 | Single-file VOD | Verified file pieces, HTTP byte ranges and native VOD HLS. Requires a VOD descriptor. |
 | Broadcast origination | Signed broadcasts from raw HTTP MPEG-TS, RTMP or managed HTTP(S) MPEG-TS input. |
 | Audio conversion | Optional FFmpeg-based conversion of selected supported live-HLS audio to AAC stereo. Video is copied. |
-| Historical playback | 0.9.0 beta: opt-in finite retained-HLS replay with independent viewer generations; experimental exact peer-history acquisition. No UTC programme archive or durable DVR. See [timeshift](docs/timeshift.md). |
+| Historical playback | Opt-in finite retained-HLS replay with independent viewer generations; experimental exact peer-history acquisition. No UTC programme archive or durable DVR. See [timeshift](docs/timeshift.md). |
 
 Channel discovery, playlist curation, EPG and the television interface belong to
 the player or proxy. Codec support still depends on that player. Premium or

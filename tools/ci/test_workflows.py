@@ -71,13 +71,12 @@ class WorkflowContracts(unittest.TestCase):
                         if ref.startswith("actions/checkout@"):
                             self.assertEqual(step["with"]["persist-credentials"], "false")
 
-    def test_candidate_is_explicit_public_default_branch_and_read_only(self):
+    def test_candidate_is_called_by_rc_pipeline_and_remains_read_only(self):
         doc = workflow("fuzz-candidate.yml")
-        self.assertEqual(set(doc["on"]), {"workflow_dispatch"})
-        inputs = doc["on"]["workflow_dispatch"]["inputs"]
+        self.assertEqual(set(doc["on"]), {"workflow_call"})
+        inputs = doc["on"]["workflow_call"]["inputs"]
         self.assertEqual(set(inputs), {"channel"})
-        self.assertEqual(inputs["channel"]["type"], "choice")
-        self.assertEqual(inputs["channel"]["options"], ["rc"])
+        self.assertEqual(inputs["channel"]["type"], "string")
         self.assertEqual(inputs["channel"]["required"], "true")
         self.assertEqual(doc["permissions"], {"contents": "read"})
         self.assertEqual(set(doc["jobs"]), {"fuzz"})
@@ -95,7 +94,7 @@ class WorkflowContracts(unittest.TestCase):
 
     def test_security_scan_is_public_and_separate_from_read_only_fuzz(self):
         doc = workflow("security.yml")
-        self.assertEqual(set(doc["on"]), {"pull_request", "push"})
+        self.assertEqual(set(doc["on"]), {"pull_request", "push", "workflow_call"})
         self.assertEqual(doc["on"]["push"], {"branches": ["main"]})
         self.assertEqual(doc["permissions"], {"contents": "read"})
         job = doc["jobs"]["security"]
@@ -139,8 +138,8 @@ class WorkflowContracts(unittest.TestCase):
 
     def test_stable_and_beta_release_keep_full_source_matrix_and_verifier(self):
         doc = workflow("release.yml")
-        self.assertEqual(doc["on"], {"push": {"tags": ["v*.*.*", "!v*.*.*-*", "v*.*.*-beta.*"]}})
-        self.assertNotIn("fuzz", doc["jobs"])
+        self.assertEqual(doc["on"]["push"], {"tags": ["v*.*.*", "!v*.*.*-*", "v*.*.*-beta.*"]})
+        self.assertEqual(doc["jobs"]["release-metadata"]["if"], "github.event_name == 'push'")
         self.assertIn('tools/release/release_policy.py metadata "$GITHUB_REF_NAME"', steps_text(doc["jobs"]["release-metadata"]))
         self.assertIn('--cargo-version "$cargo_version"', steps_text(doc["jobs"]["release-metadata"]))
         build = doc["jobs"]["build-binaries"]
@@ -161,6 +160,35 @@ class WorkflowContracts(unittest.TestCase):
         self.assertIn('"$GITHUB_SHA"', publish["steps"][verify_index]["run"])
         self.assertIn("SHA256SUMS", publish["steps"][release_index]["with"]["files"])
         self.assertEqual(doc["jobs"]["publish-container"]["needs"], "publish-release")
+
+    def test_release_rc_automatically_requires_checks_and_fuzz_evidence(self):
+        doc = workflow("release.yml")
+        dispatch = doc["on"]["workflow_dispatch"]["inputs"]
+        self.assertEqual(dispatch["channel"]["options"], ["rc"])
+        self.assertEqual(dispatch["channel"]["required"], "true")
+        jobs = doc["jobs"]
+        self.assertEqual(jobs["rc-request"]["if"], "github.event_name == 'workflow_dispatch'")
+        expected = {"rc-checks": "ci.yml", "rc-hygiene": "hygiene.yml",
+                    "rc-security": "security.yml", "rc-fuzz": "fuzz-candidate.yml"}
+        for name, filename in expected.items():
+            job = jobs[name]
+            self.assertEqual(job["needs"], "rc-request")
+            self.assertEqual(job["uses"], f"./.github/workflows/{filename}")
+            self.assertIn("workflow_call", workflow(filename)["on"])
+            self.assertNotIn("continue-on-error", job)
+            self.assertNotIn("if", job)
+        self.assertEqual(jobs["rc-fuzz"]["with"], {"channel": "${{ inputs.channel }}"})
+        gate = jobs["rc-gate"]
+        self.assertEqual(set(gate["needs"]), {"rc-request", *expected})
+        self.assertEqual(gate["if"], "always() && github.event_name == 'workflow_dispatch'")
+        self.assertNotIn("continue-on-error", gate)
+        self.assertIn("rc_gate.py jobs", steps_text(gate))
+        self.assertIn("rc_gate.py report", steps_text(gate))
+        download = next(step for step in gate["steps"]
+                        if step.get("uses", "").startswith("actions/download-artifact@"))
+        self.assertEqual(download["with"]["name"], "fuzz-candidate-${{ github.run_attempt }}")
+        self.assertNotIn("run-id", download["with"])
+        self.assertNotIn("github-token", download["with"])
 
     def test_all_release_assets_are_verified_in_draft_before_serial_publication(self):
         doc = workflow("release.yml")

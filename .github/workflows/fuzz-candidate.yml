@@ -1,20 +1,18 @@
 name: RC fuzz assessment
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       channel:
-        description: Explicit source release-candidate assessment
-        type: choice
-        options: [rc]
-        default: rc
+        description: Channel selected by the calling release workflow
+        type: string
         required: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: rc-fuzz-assessment
+  group: rc-fuzz-assessment-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:

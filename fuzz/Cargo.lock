@@ -4,11 +4,11 @@ version = 4
 
 [[package]]
 name = "ace-media"
-version = "0.9.0"
+version = "0.9.1"
 
 [[package]]
 name = "ace-wire"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "aes",
  "cbc",

@@ -690,15 +690,78 @@ impl PeerListener {
         identity: Arc<Identity>,
         reachability: Option<Arc<ReachabilityMonitor>>,
     ) {
+        Self::serve_loop(
+            listener,
+            registry,
+            our_peer_id,
+            piece_header,
+            admission,
+            identity,
+            reachability,
+            None,
+        )
+        .await;
+    }
+
+    /// Runtime-owned serving: shutdown closes admission and cancels/joins every
+    /// accepted connection before returning. Dropping the serving future aborts
+    /// its connection tasks through the owned JoinSet as a cancellation fallback.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn serve_with_policy_until(
+        listener: TcpListener,
+        registry: SeedRegistry,
+        our_peer_id: [u8; 20],
+        piece_header: [u8; 8],
+        admission: InboundAdmission,
+        identity: Arc<Identity>,
+        reachability: Option<Arc<ReachabilityMonitor>>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        Self::serve_loop(
+            listener,
+            registry,
+            our_peer_id,
+            piece_header,
+            admission,
+            identity,
+            reachability,
+            Some(shutdown),
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_loop(
+        listener: TcpListener,
+        registry: SeedRegistry,
+        our_peer_id: [u8; 20],
+        piece_header: [u8; 8],
+        admission: InboundAdmission,
+        identity: Arc<Identity>,
+        reachability: Option<Arc<ReachabilityMonitor>>,
+        mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    ) {
+        let owned = shutdown.is_some();
+        let mut connections = tokio::task::JoinSet::new();
         loop {
-            let (stream, addr) = match listener.accept().await {
+            let accepted = tokio::select! {
+                biased;
+                _ = listener_shutdown(&mut shutdown) => break,
+                _ = connections.join_next(), if !connections.is_empty() => continue,
+                accepted = listener.accept() => accepted,
+            };
+            let (stream, addr) = match accepted {
                 Ok(pair) => pair,
                 Err(e) => {
                     // A backoff matters here: under fd exhaustion (EMFILE/ENFILE) accept()
                     // fails repeatedly with no natural delay, and a tight retry loop would
                     // busy-spin a core instead of giving the system room to recover.
                     crate::alog!("[seed-listener] accept error: {e}");
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    tokio::select! {
+                        biased;
+                        _ = listener_shutdown(&mut shutdown) => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
+                    }
                     continue;
                 }
             };
@@ -723,12 +786,31 @@ impl PeerListener {
             ) else {
                 continue;
             };
-            tokio::spawn(async move {
+            let serve = async move {
                 crate::alog!("[seed-listener] accepted connection from {addr}");
                 if let Err(e) = connection.await {
                     crate::alog!("[seed-listener] peer error from {addr}: {e:?}");
                 }
-            });
+            };
+            if owned {
+                connections.spawn(serve);
+            } else {
+                tokio::spawn(serve);
+            }
+        }
+        drop(listener);
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+    }
+}
+
+async fn listener_shutdown(shutdown: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    let Some(shutdown) = shutdown else {
+        return std::future::pending().await;
+    };
+    while !*shutdown.borrow_and_update() {
+        if shutdown.changed().await.is_err() {
+            break;
         }
     }
 }
@@ -1024,3 +1106,94 @@ mod tests {
 
 #[cfg(test)]
 mod inbound_policy_tests;
+
+#[cfg(test)]
+mod owned_listener_tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpStream;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn owned_listener_observes_shutdown_before_first_poll() {
+        for sender_closed in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (stop, stopped) = tokio::sync::watch::channel(false);
+            let _keep_sender = if sender_closed {
+                drop(stop);
+                None
+            } else {
+                stop.send_replace(true);
+                Some(stop)
+            };
+            timeout(
+                Duration::from_secs(2),
+                PeerListener::serve_with_policy_until(
+                    listener,
+                    SeedRegistry::new(),
+                    [0; 20],
+                    [0; 8],
+                    InboundPolicy {
+                        max_inbound: 1,
+                        max_per_stream: 1,
+                        max_unchoked: 1,
+                    }
+                    .admission(),
+                    Arc::new(Identity::from_seed([7; 32])),
+                    None,
+                    stopped,
+                ),
+            )
+            .await
+            .expect("preexisting shutdown must be observed without an accept event");
+            assert!(TcpListener::bind(address).await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_listener_shutdown_closes_idle_socket_and_releases_admission() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let admission = InboundPolicy {
+            max_inbound: 1,
+            max_per_stream: 1,
+            max_unchoked: 1,
+        }
+        .admission();
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let serving = tokio::spawn(PeerListener::serve_with_policy_until(
+            listener,
+            SeedRegistry::new(),
+            [0; 20],
+            [0; 8],
+            admission.clone(),
+            Arc::new(Identity::from_seed([7; 32])),
+            None,
+            stopped,
+        ));
+        let mut peer = TcpStream::connect(address).await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            while admission.global.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an idle accepted connection must reserve admission");
+        stop.send_replace(true);
+        timeout(Duration::from_secs(2), serving)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(admission.global.available_permits(), 1);
+        let mut byte = [0];
+        assert_eq!(
+            timeout(Duration::from_secs(2), peer.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert!(TcpListener::bind(address).await.is_ok());
+    }
+}

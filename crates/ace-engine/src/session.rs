@@ -24,15 +24,14 @@ pub struct StreamSession {
     stats: Arc<Mutex<SourceStats>>,
     live_stats: Option<StatsHandle>,
     metadata: StreamMetadata,
-    /// The background pull task; aborted when the session is dropped (last `Arc` gone, e.g.
-    /// the manager's idle reaper or an explicit force-stop) so a live download doesn't keep
-    /// running headless.
+    /// The background pull task; aborted on manager teardown even when a caller retains
+    /// a session handle, and on final drop as a fallback.
     pump: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for StreamSession {
     fn drop(&mut self) {
-        self.pump.abort();
+        self.stop();
     }
 }
 
@@ -62,6 +61,12 @@ impl Subscription {
 }
 
 impl StreamSession {
+    /// End source consumption independently of observational handles. Queued events may
+    /// still drain before receivers see EOF; aborting a finished pump is harmless.
+    pub(crate) fn stop(&self) {
+        self.pump.abort();
+    }
+
     /// Own `source` in a background task and start pulling after the first receiver attaches.
     /// Initial media must not race ahead of that receiver. The pump then runs until the source
     /// ends, including between receivers. `buffer` is the broadcast backlog (how far a

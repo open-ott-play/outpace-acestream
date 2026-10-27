@@ -366,10 +366,31 @@ async fn assemble_piece<S: AsyncRead + AsyncWrite + Unpin>(
     let mut buffer = PieceBuffer::new(len);
     let mut sent = 0usize;
     let mut outstanding = Vec::<(usize, usize)>::with_capacity(REQUESTS);
+    let mut retry_outstanding = false;
     let mut deadline = Instant::now() + timeouts.block_progress;
     loop {
         let unchoked = state.lock().unwrap().unchoked;
         if unchoked {
+            // Choking may discard the peer's request queue. Keep our coverage and sent
+            // offsets for late responses, but reissue unfinished requests on unchoke.
+            // These retain their existing credits and do not extend the progress deadline.
+            if retry_outstanding {
+                for &(start, end) in &outstanding {
+                    write(
+                        session,
+                        &PeerMessage::Request {
+                            index: piece as u32,
+                            begin: start as u32,
+                            length: (end - start) as u32,
+                        },
+                        timeouts
+                            .write
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    )
+                    .await?;
+                }
+                retry_outstanding = false;
+            }
             while outstanding.len() < REQUESTS && sent < len {
                 let length = (info.chunk_length as usize).min(len - sent);
                 write(
@@ -416,10 +437,15 @@ async fn assemble_piece<S: AsyncRead + AsyncWrite + Unpin>(
                     deadline = Instant::now() + timeouts.block_progress;
                 }
             }
-            _ => state
-                .lock()
-                .unwrap()
-                .control(&message, info.piece_count())?,
+            _ => {
+                state
+                    .lock()
+                    .unwrap()
+                    .control(&message, info.piece_count())?;
+                if matches!(message, PeerMessage::Choke) {
+                    retry_outstanding = true;
+                }
+            }
         }
     }
 }

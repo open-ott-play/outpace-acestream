@@ -19,6 +19,7 @@ mod compat_hls;
 mod native;
 mod server_api;
 mod source;
+mod startup;
 mod timeshift;
 mod vod;
 

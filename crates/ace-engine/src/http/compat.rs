@@ -100,6 +100,18 @@ pub(super) async fn ace_manifest(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
+    hls_startup_response(
+        s.manager.hls_startup_timeout(),
+        ace_manifest_response(s, headers, params),
+    )
+    .await
+}
+
+async fn ace_manifest_response(
+    s: AppState,
+    headers: HeaderMap,
+    params: HashMap<String, String>,
+) -> Response {
     let format = params
         .get("format")
         .map(String::as_str)
@@ -132,6 +144,13 @@ pub(super) async fn ace_manifest(
     let token = s
         .ace_sessions
         .mint_hls(selection.playback_id.clone(), selection.session_key, pin);
+    // JSON status collection can yield. Cancellation must revoke a lease that
+    // has not yet been returned to its viewer.
+    let mut unpublished = UnpublishedHlsLease {
+        sessions: &s.ace_sessions,
+        id: &selection.playback_id,
+        token: Some(&token),
+    };
     if !s
         .ace_sessions
         .bind_generation(&selection.playback_id, &token, &session, Some(&pkg))
@@ -141,8 +160,8 @@ pub(super) async fn ace_manifest(
     let base = request_base(&headers);
     let playback_url = format!("{base}/ace/m/{}/{}.m3u8", selection.playback_id, token);
 
-    if format == "json" {
-        return Json(json!({
+    let response = if format == "json" {
+        Json(json!({
             "response": {
                 "playback_url": playback_url,
                 "stat_url": format!("{base}/ace/stat/{}/{token}", selection.playback_id),
@@ -157,19 +176,60 @@ pub(super) async fn ace_manifest(
             },
             "error": null
         }))
-        .into_response();
-    }
-
-    // The documented engine default is a redirect. This also gives media players a stable URL
-    // to reload, avoiding a fresh lease on every HLS playlist refresh.
-    (
-        StatusCode::FOUND,
-        [
-            (header::LOCATION, playback_url),
-            (header::CACHE_CONTROL, "no-store".into()),
-        ],
-    )
         .into_response()
+    } else {
+        // The documented engine default is a redirect. This also gives media players a stable URL
+        // to reload, avoiding a fresh lease on every HLS playlist refresh.
+        (
+            StatusCode::FOUND,
+            [
+                (header::LOCATION, playback_url),
+                (header::CACHE_CONTROL, "no-store".into()),
+            ],
+        )
+            .into_response()
+    };
+    unpublished.token = None;
+    response
+}
+
+struct UnpublishedHlsLease<'a> {
+    sessions: &'a AceSessionStore,
+    id: &'a str,
+    token: Option<&'a str>,
+}
+
+impl Drop for UnpublishedHlsLease<'_> {
+    fn drop(&mut self) {
+        if let Some(token) = self.token {
+            self.sessions.remove_owned(self.id, token);
+        }
+    }
+}
+
+#[cfg(test)]
+mod unpublished_lease_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_timeout_revokes_only_unpublished_lease() {
+        let sessions = AceSessionStore::default();
+        let published = sessions.mint("pending".into(), "pending".into());
+        let token = sessions.mint("pending".into(), "pending".into());
+        let guard = UnpublishedHlsLease {
+            sessions: &sessions,
+            id: "pending",
+            token: Some(&token),
+        };
+        let response = hls_startup_response(Duration::from_secs(1), async move {
+            let _guard = guard;
+            std::future::pending::<Response>().await
+        })
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(sessions.validate("pending", &token).is_none());
+        assert!(sessions.validate("pending", &published).is_some());
+    }
 }
 
 /// Tokenized HLS playlist returned by `/ace/manifest.m3u8` JSON/redirect modes.

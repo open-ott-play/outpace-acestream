@@ -779,9 +779,9 @@ impl StreamManager {
             .map(|entry| entry.media.clone())
     }
 
-    /// Force-stop a session: remove it (and any HLS packager) so the shared download is torn
-    /// down — the session's `Drop` aborts its background pull task. Returns `true` if a session
-    /// for `(network, id)` existed. Connected clients see the stream end.
+    /// Force-stop a session: cancel its source and remove it (and any HLS packager), even if
+    /// callers retain session handles. Returns `true` if a session for `(network, id)` existed.
+    /// Connected clients see the stream end after draining any queued events.
     pub async fn stop(&self, network: &str, id: &str) -> bool {
         let key = (network.to_string(), id.to_string());
         let (entry, existed) = {
@@ -804,7 +804,11 @@ impl StreamManager {
                 entry.media.stop();
                 entry.control.cancel();
             }
-            let existed = self.sessions.lock().await.remove(&key).is_some();
+            let removed = self.sessions.lock().await.remove(&key);
+            if let Some(session) = &removed {
+                session.stop();
+            }
+            let existed = removed.is_some();
             (entry, existed)
         };
         if let Some(entry) = entry {
@@ -931,7 +935,12 @@ impl StreamManager {
                 entry.control.cancel();
             }
             controls.extend(entries.drain().map(|(_, entry)| entry.control));
-            self.sessions.lock().await.clear();
+            let mut sessions = self.sessions.lock().await;
+            for session in sessions.values() {
+                session.stop();
+            }
+            sessions.clear();
+            drop(sessions);
             self.vod_cache.lock().await.clear();
         }
         for control in controls {
@@ -944,6 +953,9 @@ impl StreamManager {
 impl Drop for StreamManager {
     fn drop(&mut self) {
         self.shutdown_signal.send_replace(true);
+        for session in self.sessions.get_mut().values() {
+            session.stop();
+        }
         if let Some(reaper) = self.reaper.get_mut().unwrap().as_ref() {
             reaper.cancel();
         }

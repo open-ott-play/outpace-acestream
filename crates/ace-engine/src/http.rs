@@ -85,6 +85,22 @@ async fn await_hls_playlist(
     ))
 }
 
+/// Bound the entire cold HLS request, including provider discovery and waiting
+/// behind another opener. A readiness timeout alone starts too late to do that.
+async fn hls_startup_response(
+    timeout: Duration,
+    response: impl std::future::Future<Output = Response>,
+) -> Response {
+    match tokio::time::timeout(timeout, response).await {
+        Ok(response) => response,
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "1")],
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub manager: Arc<StreamManager>,

@@ -53,6 +53,12 @@ session, losing a source, or replacing an HLS packager changes its lifetime.
 Compatibility playback tokens bind to the source and packager generation, so
 stale requests cannot silently control a replacement session.
 
+The manager explicitly cancels its live sources when it stops a session, shuts down,
+or is dropped, even if a caller retains a session handle. Already queued data may
+drain before a receiver observes the closed source. Idle removal retains the existing
+ownership handoff: a caller that has just acquired a session can still attach its
+receiver before releasing that handle.
+
 The HLS playlist describes a moving window. A segment can disappear after its
 retention and grace periods, even if a player still remembers the URL. This is a
 bounded live service, not an unlimited media history. Independent compatibility

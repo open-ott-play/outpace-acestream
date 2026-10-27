@@ -97,12 +97,17 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_HLS_STARTUP_SEGMENTS` - completed segments retained before a new HLS playlist request
   becomes ready, default `6`. `0` is accepted as a compatibility setting and behaves as `1`.
   The effective count `max(1, OUTPACE_HLS_STARTUP_SEGMENTS)` must not exceed
-  `OUTPACE_HLS_WINDOW_SEGMENTS`; an inconsistent configuration fails startup.
+  `OUTPACE_HLS_WINDOW_SEGMENTS`; an inconsistent configuration fails startup. If a source ends
+  cleanly before reaching this count, complete segments from its current generation may still
+  form a finite playlist once initial source catch-up is complete. An incomplete segment,
+  startup deadline failure, explicit stop or failed generation is not promoted this way.
 - `OUTPACE_HLS_STARTUP_TIMEOUT_MS` - maximum HLS playlist startup wait, default `45000`; must be
-  at least `OUTPACE_HLS_SEGMENT_DURATION_MS`. If the startup segment count is not reached, the
-  request returns a retryable HTTP `503` at the deadline. This wait begins after
-  stream/packager acquisition; it does not bound earlier descriptor resolution
-  or the total HTTP request duration.
+  at least `OUTPACE_HLS_SEGMENT_DURATION_MS`. Native `.m3u8` requests and compatibility
+  `/ace/manifest.m3u8` requests use one deadline for acquisition and response preparation,
+  including descriptor resolution on the compatibility route and waiting for a shared source
+  to start. The request returns retryable HTTP `503` with `Retry-After: 1` if this budget expires.
+  Waiting for completed segments does not restart the request budget. This setting does not
+  impose a new deadline on continuous MPEG-TS, VOD or existing replay requests.
 - `OUTPACE_HLS_IDLE_TIMEOUT_MS` - compatibility-HLS client idle lease, default `60000`,
   range `1..=21600000`. Successful manifest/media requests renew their client's
   lease; status polling does not. A pending manifest request protects startup.

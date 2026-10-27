@@ -279,7 +279,8 @@ impl HlsPackager {
         recovering: bool,
     ) {
         let mut st = self.state.lock().unwrap();
-        if matches!(st.status, HlsStatus::Stopped | HlsStatus::Failed(_))
+        if st.ended
+            || matches!(st.status, HlsStatus::Stopped | HlsStatus::Failed(_))
             || generation <= st.generation
         {
             return;
@@ -414,12 +415,22 @@ impl HlsPackager {
     /// Preserve completed media as a final playlist; never publish an incomplete EOF tail.
     pub(crate) fn finish(&self) {
         let mut st = self.state.lock().unwrap();
+        self.expire(&mut st);
         st.ended = true;
         Self::reset_partial(&mut st, false);
+        // EOF is terminal, so the assembly allocation cannot be reused.
+        st.cur = Vec::new();
         // EOF cleanup must not hide an already reported worker failure or undo
         // an explicit stop that won the race with the source ending.
         if matches!(st.status, HlsStatus::Starting | HlsStatus::Recovering) {
-            st.status = HlsStatus::Stopped;
+            // A finite source cannot fill its remaining startup cushion. Its complete
+            // media is still playable, but old recovery generations and an unfinished
+            // source catch-up batch must not satisfy this final readiness gate.
+            st.status = if st.startup_complete && st.generation_segments != 0 {
+                HlsStatus::Ready
+            } else {
+                HlsStatus::Stopped
+            };
         }
         self.ready.notify_waiters();
     }
@@ -498,7 +509,7 @@ impl HlsPackager {
 
     fn feed_locked(&self, st: &mut HlsState, data: &[u8]) {
         self.expire(st);
-        if matches!(st.status, HlsStatus::Stopped | HlsStatus::Failed(_)) {
+        if st.ended || matches!(st.status, HlsStatus::Stopped | HlsStatus::Failed(_)) {
             return;
         }
         let mut remaining = data;
@@ -4064,6 +4075,143 @@ mod tests {
         assert_eq!(playlist.matches("#EXTINF:").count(), 8);
         p.receiver_lag();
         assert!(p.is_ready());
+    }
+
+    #[tokio::test]
+    async fn native_eof_publishes_short_completed_media_without_partial_tail() {
+        let p = HlsPackager::new(HlsConfig::default(), None);
+        p.state.lock().unwrap().startup_complete = false;
+        let (source, rx) = tokio::sync::broadcast::channel(2);
+        let (_cancel, cancel_rx) = tokio::sync::watch::channel(false);
+        let mut data = clean_startup_batch(0, 2).to_vec();
+        data.extend_from_slice(&video_access_packet(VIDEO_PID, 1_620_000)[..31]);
+        source.send(StreamEvent::Data(Bytes::from(data))).unwrap();
+        drop(source);
+
+        let mut waiting = Box::pin(p.wait_available(Duration::from_secs(60)));
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        tokio::time::timeout(Duration::from_secs(1), p.clone().run_native(rx, cancel_rx))
+            .await
+            .expect("finite source must complete without a startup timeout");
+        assert_eq!(waiting.await, HlsStatus::Ready);
+
+        let playlist = p.playlist_snapshot("/synthetic", false).unwrap();
+        assert_eq!(playlist.matches("#EXTINF:").count(), 2);
+        assert!(playlist.ends_with("#EXT-X-ENDLIST\n"));
+        assert!(
+            p.segment(2).is_none(),
+            "EOF cannot publish the partial tail"
+        );
+        for seq in 0..2 {
+            let segment = p.segment(seq).unwrap();
+            assert_eq!(segment.len(), 3 * TS_PACKET);
+            assert_eq!(
+                &segment[2 * TS_PACKET..],
+                video_access_packet(VIDEO_PID, seq * 540_000)
+            );
+        }
+        let state = p.state.lock().unwrap();
+        assert!(state.cur.is_empty());
+        assert_eq!(state.cur.capacity(), 0);
+        assert!(state.input.is_empty());
+    }
+
+    #[test]
+    fn eof_publishes_current_recovery_media_and_fences_further_output() {
+        let p = HlsPackager::new(
+            HlsConfig {
+                segment_duration_ms: 1000,
+                startup_segments: 3,
+                ..HlsConfig::default()
+            },
+            None,
+        );
+        feed_clean_run(&p, 0, 3);
+        p.begin_generation(
+            GenerationId(1),
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            true,
+        );
+        feed_clean_run_generation(&p, GenerationId(1), 2_000_000, 1);
+        assert_eq!(p.status(), HlsStatus::Recovering);
+        p.finish();
+
+        let playlist = p.playlist_snapshot("/synthetic", false).unwrap();
+        assert_eq!(playlist.matches("#EXTINF:").count(), 4);
+        assert_eq!(playlist.matches("#EXT-X-DISCONTINUITY\n").count(), 1);
+        assert!(playlist.ends_with("#EXT-X-ENDLIST\n"));
+        let final_segment = p.segment(3).unwrap();
+
+        // Neither late output nor a replacement generation can extend an ENDLIST.
+        feed_clean_run_generation(&p, GenerationId(1), 4_000_000, 2);
+        p.begin_generation(
+            GenerationId(2),
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            true,
+        );
+        feed_clean_run_generation(&p, GenerationId(2), 6_000_000, 2);
+        feed_clean_run(&p, 8_000_000, 2);
+        p.finish();
+        assert_eq!(p.state.lock().unwrap().generation, GenerationId(1));
+        assert_eq!(p.playlist_snapshot("/synthetic", false).unwrap(), playlist);
+        assert_eq!(p.segment(3).unwrap(), final_segment);
+        assert!(p.segment(4).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eof_preserves_startup_generation_deadline_and_terminal_fences() {
+        for case in [
+            "old generation",
+            "catch-up",
+            "deadline",
+            "failed",
+            "stopped",
+        ] {
+            let p = HlsPackager::new(
+                HlsConfig {
+                    segment_duration_ms: 1000,
+                    startup_segments: 3,
+                    ..HlsConfig::default()
+                },
+                None,
+            );
+            feed_clean_run(&p, 0, 3);
+            p.begin_generation(
+                GenerationId(1),
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                true,
+            );
+            if case != "old generation" {
+                feed_clean_run_generation(&p, GenerationId(1), 2_000_000, 1);
+            }
+            let expected = match case {
+                "catch-up" => {
+                    p.state.lock().unwrap().startup_complete = false;
+                    HlsStatus::Stopped
+                }
+                "deadline" => {
+                    tokio::time::advance(Duration::from_secs(5)).await;
+                    HlsStatus::Failed(HlsFailure::Deadline)
+                }
+                "failed" => {
+                    p.fail_generation(GenerationId(1), HlsFailure::ChildExit);
+                    HlsStatus::Failed(HlsFailure::ChildExit)
+                }
+                "stopped" => {
+                    p.stop();
+                    HlsStatus::Stopped
+                }
+                _ => HlsStatus::Stopped,
+            };
+            p.finish();
+            assert_eq!(p.status(), expected, "{case}");
+            assert_eq!(
+                p.playlist_snapshot("/synthetic", false),
+                Err(expected),
+                "{case}"
+            );
+            assert!(p.state.lock().unwrap().cur.is_empty(), "{case}");
+        }
     }
 
     #[tokio::test]

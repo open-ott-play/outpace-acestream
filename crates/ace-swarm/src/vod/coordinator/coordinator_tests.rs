@@ -402,6 +402,100 @@ async fn conflicting_partial_overlap_fails_piece_hash_verification() {
     ));
 }
 
+#[tokio::test(start_paused = true)]
+async fn unchoke_reissues_only_unfinished_requests_once() {
+    const CHUNK: usize = 16;
+    let (content, mut info) = test_info(1, CHUNK * 3);
+    info.chunk_length = CHUNK as u64;
+    let (client, server) = duplex(4096);
+    let mut session = PeerSession::new(client);
+    let state = Mutex::new(Availability {
+        unchoked: true,
+        bits: None,
+    });
+    let server_content = content.clone();
+    let peer = async move {
+        let mut peer = PeerSession::new(server);
+        for begin in [0, 16, 32] {
+            assert_eq!(
+                peer.read_message().await.unwrap(),
+                PeerMessage::Request {
+                    index: 0,
+                    begin,
+                    length: CHUNK as u32,
+                }
+            );
+        }
+        // A choked peer may discard its request queue. Responses already in flight can
+        // still complete one request and partially cover another before it unchokes us.
+        peer.send(&PeerMessage::Choke).await.unwrap();
+        peer.send(&PeerMessage::Piece {
+            index: 0,
+            begin: 0,
+            block: server_content[..CHUNK].to_vec(),
+        })
+        .await
+        .unwrap();
+        peer.send(&PeerMessage::Piece {
+            index: 0,
+            begin: CHUNK as u32,
+            block: server_content[CHUNK..CHUNK + 8].to_vec(),
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), peer.read_message())
+                .await
+                .is_err(),
+            "no request may be sent while choked"
+        );
+        peer.send(&PeerMessage::Unchoke).await.unwrap();
+        peer.send(&PeerMessage::Unchoke).await.unwrap();
+        for begin in [16, 32] {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_millis(100), peer.read_message())
+                    .await
+                    .expect("unchoke must recover requests discarded by the peer")
+                    .unwrap(),
+                PeerMessage::Request {
+                    index: 0,
+                    begin,
+                    length: CHUNK as u32,
+                }
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), peer.read_message())
+                .await
+                .is_err(),
+            "redundant unchoke must not duplicate requests or re-fetch completed blocks"
+        );
+        for begin in [16, 32] {
+            peer.send(&PeerMessage::Piece {
+                index: 0,
+                begin,
+                block: server_content[begin as usize..begin as usize + CHUNK].to_vec(),
+            })
+            .await
+            .unwrap();
+        }
+    };
+    let (result, ()) = tokio::join!(
+        fetch_piece(
+            &mut session,
+            &info,
+            0,
+            &state,
+            test_timeouts(Duration::from_secs(2)),
+        ),
+        peer,
+    );
+    match result {
+        Ok(bytes) => assert_eq!(bytes.as_ref(), content),
+        Err(_) => panic!("the resumed request queue must complete on the same connection"),
+    }
+}
+
 #[tokio::test]
 async fn cancelling_production_request_writer_drops_backpressured_session() {
     let (_content, mut info) = test_info(1, 32 * 100);

@@ -28,6 +28,109 @@ fn pending_manager() -> (Arc<StreamManager>, mpsc::UnboundedReceiver<&'static st
     (StreamManager::new(registry), events)
 }
 
+struct RetainedSessionProvider {
+    reads: Arc<Notify>,
+    drops: Arc<AtomicUsize>,
+}
+
+struct RetainedSessionSource {
+    reads: Arc<Notify>,
+    drops: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl crate::provider::StreamProvider for RetainedSessionProvider {
+    fn network(&self) -> &'static str {
+        "retained"
+    }
+
+    async fn open(&self, _: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+        Ok(Box::new(RetainedSessionSource {
+            reads: self.reads.clone(),
+            drops: self.drops.clone(),
+        }))
+    }
+}
+
+#[async_trait]
+impl TsSource for RetainedSessionSource {
+    async fn next(&mut self) -> Option<bytes::Bytes> {
+        self.reads.notify_one();
+        std::future::pending().await
+    }
+
+    fn stats(&self) -> crate::provider::SourceStats {
+        Default::default()
+    }
+}
+
+impl Drop for RetainedSessionSource {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn teardown_ends_source_even_when_session_handle_survives() {
+    for action in ["stop", "shutdown", "drop"] {
+        let reads = Arc::new(Notify::new());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut registry = ProviderRegistry::new();
+        registry.register(Arc::new(RetainedSessionProvider {
+            reads: reads.clone(),
+            drops: drops.clone(),
+        }));
+        let manager = StreamManager::new(registry);
+        let session = manager.get_or_start("retained", "pending").await.unwrap();
+        // A retained handle and an internal receiver do not constitute a viewer.
+        // Neither may prevent an explicit stop or manager teardown.
+        let mut receiver = session.raw_receiver();
+        timeout(Duration::from_secs(1), reads.notified())
+            .await
+            .expect("source should be waiting for media");
+        match action {
+            "stop" => assert!(manager.stop("retained", "pending").await),
+            "shutdown" => manager.shutdown().await,
+            "drop" => drop(manager),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            timeout(Duration::from_secs(1), receiver.recv()).await,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)),
+            "{action} must close the source without waiting for the last session handle"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "{action}");
+        assert!(session.is_finished(), "{action}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_reap_preserves_the_acquisition_to_subscription_handoff() {
+    let reads = Arc::new(Notify::new());
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(RetainedSessionProvider {
+        reads: reads.clone(),
+        drops: drops.clone(),
+    }));
+    let manager = StreamManager::new(registry);
+    let session = manager.get_or_start("retained", "handoff").await.unwrap();
+    // The reaper can run on another executor thread between acquisition and subscribe.
+    // An owned handle must still be usable even if the idle map entry was removed.
+    manager.reap_idle_at(Instant::now()).await;
+    let mut subscription = session.subscribe();
+    timeout(Duration::from_secs(1), reads.notified())
+        .await
+        .expect("the acquired source must still start when its receiver attaches");
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(session);
+    assert_eq!(
+        timeout(Duration::from_secs(1), subscription.rx.recv()).await,
+        Ok(Err(tokio::sync::broadcast::error::RecvError::Closed))
+    );
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn shutdown_cancels_live_open_and_same_key_waiters() {
     for hls in [false, true] {

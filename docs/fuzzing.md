@@ -43,10 +43,11 @@ and evidence artifacts. Production parser bounds remain active. The media
 target limits its own segmentation parameter; it does not invent an untrusted
 caller-controlled allocation size.
 
-Random mutation is reserved for explicitly requested RC assessments on the
-public default branch. Pushes, PRs, ordinary betas and scheduled checks replay
-fixed inputs only. See [CI/CD](ci-cd.md) for the shared workflow, trigger and
-release-evidence contract. A parser assessment by itself is not a claim of
+Random mutation runs automatically as a required stage of every `Release`
+workflow request with `channel=rc` on the public default branch. There is no
+separate fuzz dispatch. Ordinary pushes and PRs replay fixed inputs; stable and
+beta tag publication do not start mutation campaigns. See [CI/CD](ci-cd.md) for
+the shared workflow, trigger and source-evidence contract. A parser assessment by itself is not a claim of
 live-stream, device, release-binary or deployment acceptance.
 
 ## Reproduce fixed regressions
@@ -109,5 +110,5 @@ pass its local path to the relevant executable, for example:
    the production parser. Never add private captures, real identifiers or stream
    names to code, fixtures, logs or documentation.
 4. Run deterministic checks and the normal workspace tests, then request a new
-   RC assessment for the reviewed fix. Record actual measured results; a badge
+   `Release` run with `channel=rc` for the reviewed fix. Record actual measured results; a badge
    or successful older commit cannot establish coverage of a later commit.

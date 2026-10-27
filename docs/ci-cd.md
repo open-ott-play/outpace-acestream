@@ -48,43 +48,47 @@ needed in the checkout and are not exempted from secret scanning.
 Only the CodeQL-capable caller grants `security-events: write`; the source fuzz
 assessment retains `contents: read` and receives no secrets.
 
-## RC source assessment
+## RC source pipeline
 
-The manual RC workflow is accepted only for a **public** repository, from the
-**default branch**, with the explicit `channel=rc` input. It checks the exact
-commit selected by that dispatch. The shared runner and its checkout use the
-same reviewed, immutable toolkit revision. Target commands, corpora, limits and
-invariants are documented in [fuzzing](fuzzing.md).
-
-This is a source assessment, not a product RC publication. Its schema-3 candidate
-report binds the results to the repository, source SHA, workflow run and run
-attempt. Failed targets retain diagnostics and make the run fail. A successful
-report remains an Actions artifact; it neither creates a version tag nor
-publishes a GitHub Release or container. It must not be used as release
-qualification or substituted for the source and archive acceptance described in
-[releasing](releasing.md).
-
-Run the assessment after the reviewed change is on the default branch:
+Start the main **Release** workflow with `channel=rc`. As in the shared release
+pipeline, fuzzing is an automatic, mandatory RC stage. The request must come
+from the public repository's default branch. No separate fuzz command or opt-in
+flag is needed. The old `fuzz-candidate.yml` entry point is now reusable only.
 
 ```sh
-gh workflow run fuzz-candidate.yml --ref main -f channel=rc
-gh run list --workflow fuzz-candidate.yml --event workflow_dispatch --limit 5
+gh workflow run release.yml --ref main -f channel=rc -f expected_sha="$(git rev-parse HEAD)"
+gh run list --workflow release.yml --event workflow_dispatch --limit 5
 gh run view RUN_ID
-gh run download RUN_ID --name fuzz-candidate-ATTEMPT --dir rc-evidence
+gh run download RUN_ID --name source-rc-ATTEMPT --dir rc-evidence
 ```
 
-Use the selected run ID and its current attempt number in the last commands.
-Confirm the run succeeded and inspect `fuzz-report.json`: the repository, source
-SHA and attempt must identify the intended run, each configured target must
-report successful execution, and the report must remain candidate evidence.
-When a target fails, inspect the separate `fuzz-diagnostics-ATTEMPT` artifact;
-no successful candidate report is published for that failed campaign.
+Run this from the clean, current `main` checkout. The optional `expected_sha`
+input makes a moved branch fail validation rather than testing an unintended
+revision. Use the selected run ID and its current attempt number when reading
+evidence. This request does not publish a tag, binary, GitHub Release or image.
+Stable and beta tags retain their existing publication path.
 
-To evaluate a new source revision, dispatch another RC assessment after its
-reviewed changes reach the default branch. A green report for an older commit
-does not establish results for newer code. Keep discovered crash inputs
-synthetic and identifier-free, fix the production bug, add a deterministic
-regression test, then repeat the assessment on the new commit.
+The pipeline runs normal Rust and Python checks, decoded replay, identifier
+hygiene, shared security analysis and all four bounded fuzz targets against the
+same source commit. Its `RC gate` requires every stage to succeed; failed,
+cancelled, missing or skipped stages cannot produce an accepted result. The
+shared fuzz runner and checkout use the same reviewed immutable toolkit pin.
+
+The gate downloads the fuzz artifact from the same run and attempt. It verifies
+the report's repository, commit, run, attempt, source-candidate mode, manifest
+digest and exact target inventory, including successful exits and positive
+execution counts. Accepted `source-rc-ATTEMPT` artifacts contain both
+`fuzz-report.json` and `rc-result.json`; the latter records the former's SHA-256.
+Failed campaigns retain `fuzz-diagnostics-ATTEMPT` without a successful result.
+
+For a retry, **re-run all jobs**, not only failed jobs: the gate deliberately
+rejects evidence from an older attempt. A green report from an older commit is
+also insufficient. Fix findings with synthetic deterministic regressions and
+start a new RC for the reviewed source.
+
+This is a source RC, not installable product RC packaging. The candidate report
+does not substitute for the seven-platform archive verification or runtime
+acceptance documented in [releasing](releasing.md).
 
 ## Renovate
 

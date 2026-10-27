@@ -1,6 +1,7 @@
 name: Security analysis
 
 on:
+  workflow_call:
   pull_request:
   push:
     branches: [main]
@@ -9,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: security-${{ github.event.pull_request.number || github.ref }}
+  group: security-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

@@ -13,12 +13,14 @@ requirements as stable. GitHub marks it as a prerelease and explicitly excludes
 it from Latest. For example, `v0.9.0-beta.1` requires Cargo version
 `0.9.0-beta.1`; the next correction uses a new numbered beta.
 
-The RC source assessment in [CI/CD](ci-cd.md) is a separate manual fuzz campaign.
-It produces source-bound evidence without publishing a product version. Passing
-that campaign does not claim a complete product RC, runtime acceptance or release
-qualification. In particular, its schema-3 candidate report is not a substitute
-for any product release's archive checks. Creating a beta tag does not trigger
-that separate campaign or turn its source assessment into runtime evidence.
+The same workflow accepts a manual `channel=rc` request on the public default
+branch. That source RC automatically runs normal checks, security analysis and
+fuzzing, then requires source-bound evidence in the `RC gate`. See the
+[RC source pipeline](ci-cd.md#rc-source-pipeline) for the single entry point and
+retry instructions. The source RC produces evidence artifacts; it does not
+create a product tag or publish binaries. Its report does not replace archive
+verification or runtime acceptance. Stable and beta tag publication remain
+separate and do not launch mutation campaigns.
 
 ## Exact source for every binary
 

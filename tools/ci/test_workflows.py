@@ -98,6 +98,7 @@ class WorkflowContracts(unittest.TestCase):
         self.assertEqual(doc["on"]["push"], {"branches": ["main"]})
         self.assertEqual(doc["permissions"], {"contents": "read"})
         job = doc["jobs"]["security"]
+        self.assertIn("${{ github.workflow }}", doc["concurrency"]["group"])
         self.assertEqual(job["if"], "github.event.repository.private == false")
         self.assertEqual(job["with"]["languages"], "rust,python,actions")
         self.assertNotIn("secrets", job)

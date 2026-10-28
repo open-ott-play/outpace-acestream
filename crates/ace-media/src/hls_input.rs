@@ -47,6 +47,7 @@ pub struct Playlist {
     text: String,
     references: Vec<Reference>,
     media_timeline: Option<(u64, Option<u64>)>,
+    discontinuity_sequence: Option<u64>,
     retention: Duration,
 }
 
@@ -57,6 +58,11 @@ impl Playlist {
     }
     pub fn media_timeline(&self) -> Option<(u64, Option<u64>)> {
         self.media_timeline
+    }
+    /// Declared discontinuity base, or the RFC 8216 default zero for media playlists.
+    /// The count of inline discontinuity tags is not included in this value.
+    pub fn discontinuity_sequence(&self) -> Option<u64> {
+        self.discontinuity_sequence
     }
     pub fn retention(&self) -> Duration {
         self.retention
@@ -78,6 +84,9 @@ impl Playlist {
         let mut previous_range: Option<(usize, u64)> = None;
         let mut first_sequence = 0_u64;
         let mut sequence_seen = false;
+        let mut discontinuity_sequence = 0_u64;
+        let mut discontinuity_sequence_seen = false;
+        let mut discontinuities = 0_u64;
         let mut segment_count = 0_u64;
         let mut next_duration = None;
         let mut duration_sum = 0_f64;
@@ -143,6 +152,16 @@ impl Playlist {
                         None
                     };
                 }
+            } else if line == "#EXT-X-DISCONTINUITY" {
+                media = true;
+                discontinuities = discontinuities
+                    .checked_add(1)
+                    .ok_or(PlaylistError::Invalid)?;
+                discontinuity_sequence
+                    .checked_add(discontinuities)
+                    .ok_or(PlaylistError::Invalid)?;
+            } else if line == "#EXT-X-DISCONTINUITY-SEQUENCE" {
+                return Err(PlaylistError::Invalid);
             } else if let Some((tag, attributes)) = line.split_once(':') {
                 match tag {
                     "#EXT-X-STREAM-INF" => {
@@ -243,6 +262,22 @@ impl Playlist {
                         first_sequence = attributes.parse().map_err(|_| PlaylistError::Invalid)?;
                         sequence_seen = true;
                     }
+                    "#EXT-X-DISCONTINUITY-SEQUENCE" => {
+                        media = true;
+                        if discontinuity_sequence_seen
+                            || discontinuities != 0
+                            || segment_count != 0
+                            || attributes.is_empty()
+                            || attributes.len() > 20
+                            || !attributes.bytes().all(|byte| byte.is_ascii_digit())
+                        {
+                            return Err(PlaylistError::Invalid);
+                        }
+                        discontinuity_sequence =
+                            attributes.parse().map_err(|_| PlaylistError::Invalid)?;
+                        discontinuity_sequence_seen = true;
+                    }
+                    "#EXT-X-DISCONTINUITY" => return Err(PlaylistError::Invalid),
                     "#EXTINF" => {
                         media = true;
                         let duration = attributes.split(',').next().unwrap_or_default();
@@ -279,7 +314,6 @@ impl Playlist {
                         }
                     }
                     "#EXT-X-TARGETDURATION"
-                    | "#EXT-X-DISCONTINUITY-SEQUENCE"
                     | "#EXT-X-PROGRAM-DATE-TIME"
                     | "#EXT-X-PLAYLIST-TYPE" => {
                         media = true;
@@ -314,6 +348,7 @@ impl Playlist {
             text: text.to_owned(),
             references,
             retention,
+            discontinuity_sequence: media.then_some(discontinuity_sequence),
             media_timeline: if media {
                 Some((
                     first_sequence,
@@ -522,6 +557,63 @@ mod tests {
             "#EXTM3U\n#EXTINF:1,\n#EXTINF:1,\na.ts\n",
             "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:18446744073709551615\n#EXTINF:1,\na.ts\n#EXTINF:1,\nb.ts\n",
         ] { assert!(parse(source.as_bytes()).is_err(), "{source}"); }
+    }
+
+    #[test]
+    fn discontinuity_sequence_is_bounded_unique_and_before_segments_or_discontinuities() {
+        for tag in [
+            "#EXT-X-DISCONTINUITY-SEQUENCE",
+            "#EXT-X-DISCONTINUITY-SEQUENCE:",
+            "#EXT-X-DISCONTINUITY-SEQUENCE:-1",
+            "#EXT-X-DISCONTINUITY-SEQUENCE:+1",
+            "#EXT-X-DISCONTINUITY-SEQUENCE:1.0",
+            "#EXT-X-DISCONTINUITY-SEQUENCE: 1",
+            "#EXT-X-DISCONTINUITY-SEQUENCE:one",
+            "#EXT-X-DISCONTINUITY-SEQUENCE:18446744073709551616",
+            "#EXT-X-DISCONTINUITY-SEQUENCE:000000000000000000000",
+            "#EXT-X-DISCONTINUITY-SEQUENCE:1\n#EXT-X-DISCONTINUITY-SEQUENCE:1",
+            "#EXT-X-DISCONTINUITY\n#EXT-X-DISCONTINUITY-SEQUENCE:1",
+            "#EXTINF:1,\nprevious.ts\n#EXT-X-DISCONTINUITY-SEQUENCE:1",
+            "#EXT-X-DISCONTINUITY-SEQUENCE:18446744073709551615\n#EXT-X-DISCONTINUITY",
+            "#EXT-X-DISCONTINUITY-SEQUENCE:18446744073709551614\n#EXT-X-DISCONTINUITY\n#EXT-X-DISCONTINUITY",
+            "#EXT-X-DISCONTINUITY:1",
+        ] {
+            let source = format!("#EXTM3U\n{tag}\n#EXTINF:1,\nmedia.ts\n");
+            assert_eq!(parse(source.as_bytes()), Err(PlaylistError::Invalid), "{tag}");
+        }
+    }
+
+    #[test]
+    fn discontinuity_base_defaults_to_zero_and_rewriting_preserves_exact_tags() {
+        let default = parse(b"#EXTM3U\n#EXT-X-DISCONTINUITY\n#EXTINF:1,\nmedia.ts\n").unwrap();
+        assert_eq!(default.discontinuity_sequence(), Some(0));
+        let master = parse(b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nvideo.m3u8\n").unwrap();
+        assert_eq!(master.discontinuity_sequence(), None);
+        for prefix in ["#EXTINF:1,\n", "#EXTINF:1,\n#EXT-X-BYTERANGE:4@0\n"] {
+            let source = format!("#EXTM3U\n{prefix}#EXT-X-DISCONTINUITY-SEQUENCE:1\nmedia.ts\n");
+            let parsed = parse(source.as_bytes()).unwrap();
+            assert_eq!(parsed.discontinuity_sequence(), Some(1));
+            assert_eq!(parsed.render(&["media.ts".into()]).unwrap(), source);
+        }
+        for (base, inline) in [
+            (0, "#EXT-X-DISCONTINUITY\r\n"),
+            (u64::MAX, ""),
+            (u64::MAX - 1, "#EXT-X-DISCONTINUITY\r\n"),
+        ] {
+            let source = format!("#EXTM3U\r\n#EXT-X-DISCONTINUITY-SEQUENCE:{base}\r\n{inline}#EXTINF:1,\r\nmedia.ts\r\n");
+            let parsed = parse(source.as_bytes()).unwrap();
+            assert_eq!(parsed.discontinuity_sequence(), Some(base));
+            assert_eq!(parsed.clone().render(&["media.ts".into()]).unwrap(), source);
+            let rendered = parsed.render(&["/local/1.ts".into()]).unwrap();
+            assert_eq!(
+                rendered,
+                source.replace("\r\nmedia.ts\r\n", "\r\n/local/1.ts\r\n")
+            );
+            assert_eq!(
+                parse(rendered.as_bytes()).unwrap().discontinuity_sequence(),
+                Some(base)
+            );
+        }
     }
 
     #[test]

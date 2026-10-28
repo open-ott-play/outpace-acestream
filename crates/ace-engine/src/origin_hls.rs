@@ -169,6 +169,7 @@ struct MediaOwner {
 struct PlaylistState {
     first_sequence: Option<u64>,
     last_sequence: Option<u64>,
+    discontinuity_sequence: Option<u64>,
     epoch: u64,
     refresh: u64,
     fingerprint: Option<[u8; 32]>,
@@ -615,6 +616,7 @@ impl OriginHls {
         }
         let mut epoch = parent.playlist.epoch;
         let timeline = playlist.media_timeline();
+        let discontinuity_sequence = playlist.discontinuity_sequence();
         if let Some((first, last)) = timeline {
             if parent
                 .playlist
@@ -623,6 +625,9 @@ impl OriginHls {
                 || last
                     .zip(parent.playlist.last_sequence)
                     .is_some_and(|(last, old)| last < old)
+                || discontinuity_sequence
+                    .zip(parent.playlist.discontinuity_sequence)
+                    .is_some_and(|(current, old)| current < old)
             {
                 epoch = epoch.checked_add(1).ok_or(OriginError::TooLarge)?;
             }
@@ -637,7 +642,8 @@ impl OriginHls {
         };
         // URI identity remains stable for normal reloads and sliding overlap, including
         // repeated ranged segments and MAPs on the same resource. Cache generations
-        // change separately. An observed sequence rollback starts a new resource epoch.
+        // change separately. A rollback of either media or discontinuity sequence
+        // starts a new resource epoch; normal discontinuity window slides do not.
         let mut selected: HashMap<(FetchUrl, ResourceKind), (u64, &'static str)> = HashMap::new();
         let mut required = HashSet::from([0, parent_id]);
         for (id, resource) in &inner.resources {
@@ -803,6 +809,7 @@ impl OriginHls {
             parent.playlist.first_sequence = Some(first);
             parent.playlist.last_sequence = last;
         }
+        parent.playlist.discontinuity_sequence = discontinuity_sequence;
         parent.playlist.epoch = epoch;
         parent.playlist.refresh = refresh;
         parent.playlist.fingerprint = Some(fingerprint);

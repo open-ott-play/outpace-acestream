@@ -37,6 +37,7 @@ fn positive_controls_reach_accepted_paths() {
     for seed in [
         include_bytes!("../corpus/hls_playlist/master").as_slice(),
         include_bytes!("../corpus/hls_playlist/fmp4-ranges").as_slice(),
+        include_bytes!("../corpus/hls_playlist/discontinuity-sequence").as_slice(),
     ] {
         let playlist = ace_media::hls_input::Playlist::parse(
             seed,

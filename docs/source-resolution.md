@@ -64,9 +64,10 @@ hours, even if active. At most sixty-four playbacks coexist.
 Only media with explicit fresh origin cache permission is cached, up to 16 MiB
 and 1,024 entries globally, for at most thirty seconds. Age, Date, max-age and
 s-maxage reduce freshness; private/no-cache/no-store, Vary, Set-Cookie and ranges
-prevent reuse. Media URLs stay stable across identical and sliding playlist reloads. An observed
-sequence rollback creates a new epoch; it is an explicit restart boundary, not a
-claim of seamless origin recovery. Cache generations are separate from URL identity,
+prevent reuse. Media URLs stay stable across identical and sliding playlist reloads.
+An observed media- or discontinuity-sequence rollback creates a new epoch; it is
+an explicit restart boundary, not a claim of seamless origin recovery.
+Cache generations are separate from URL identity,
 and an older in-flight body cannot repopulate a newer generation.
 Master/rendition references and each rendition's current media references remain
 pinned. Removed media/map references have a grace interval derived conservatively

@@ -30,6 +30,7 @@ pub fn hls_playlist(data: &[u8]) {
         assert!(count <= MAX_REFERENCES);
         assert!(playlist.retention() <= cap);
         let timeline = playlist.media_timeline();
+        let discontinuity_sequence = playlist.discontinuity_sequence();
         let retention = playlist.retention();
         let unchanged: Vec<_> = playlist
             .references()
@@ -48,6 +49,7 @@ pub fn hls_playlist(data: &[u8]) {
         let reparsed = Playlist::parse(rewritten.as_bytes(), cap).unwrap();
         assert_eq!(reparsed.references().len(), count);
         assert_eq!(reparsed.media_timeline(), timeline);
+        assert_eq!(reparsed.discontinuity_sequence(), discontinuity_sequence);
         assert_eq!(reparsed.retention(), retention);
         assert!(reparsed.references().iter().all(|r| r.uri == "x"));
 

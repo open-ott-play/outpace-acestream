@@ -1058,8 +1058,8 @@ fn apply_transport_resolution(
     }
 }
 
-/// HLS descriptors refer to an existing origin. Do not mint fake swarm/control leases or
-/// relabel an HLS manifest as MPEG-TS. The player follows the original URL and owns buffering.
+/// HLS descriptors refer to an existing origin. Dispatch to a managed origin lease
+/// when enabled, otherwise preserve the external handoff without fake swarm controls.
 async fn selected_origin_hls_response(
     state: &AppState,
     headers: &HeaderMap,
@@ -1084,6 +1084,7 @@ async fn selected_origin_hls_response(
             "response": {
                 "playback_url": format!("{base}{}", playback.playback_url),
                 "stop_url": format!("{base}{}", playback.stop_url),
+                "command_url": format!("{base}{}", playback.command_url),
                 "is_direct": true,
                 "managed_origin": true,
                 "content_id": selection.content_id,
@@ -1144,8 +1145,20 @@ fn checked_source_query(
 ) -> Result<HashMap<String, String>, &'static str> {
     let mut unique = HashMap::new();
     for (key, value) in params {
-        if unique.insert(key, value).is_some() {
-            return Err("duplicate query parameter");
+        if let Some(previous) = unique.get(&key) {
+            // The public Android client (3798163) appends its descriptor query twice
+            // when starting GET playback. Only equal decoded descriptor fields may
+            // repeat; options and commands keep their stricter admission rules.
+            if previous != &value
+                || !matches!(
+                    key.as_str(),
+                    "content_id" | "infohash" | "url" | "magnet" | "transport_file_cache_key"
+                )
+            {
+                return Err("duplicate query parameter");
+            }
+        } else {
+            unique.insert(key, value);
         }
     }
     crate::source_options::validate(unique.iter().map(|(k, v)| (k.as_str(), v.as_str())), false)?;
@@ -1247,7 +1260,7 @@ fn ace_network(s: &AppState) -> Option<String> {
     }
 }
 
-fn request_base(headers: &HeaderMap) -> String {
+pub(super) fn request_base(headers: &HeaderMap) -> String {
     let host = headers
         .get(header::HOST)
         .and_then(|h| h.to_str().ok())
@@ -1656,7 +1669,11 @@ mod origin_tests {
         .unwrap();
         assert_eq!(json["response"]["managed_origin"], true);
         assert!(accepts_client_playback_contract(&json["response"]));
-        for field in ["stat_url", "command_url", "timeshift", "infohash"] {
+        assert_eq!(
+            json["response"]["command_url"],
+            format!("{}/cmd", json["response"]["stop_url"].as_str().unwrap())
+        );
+        for field in ["stat_url", "timeshift", "infohash"] {
             assert!(json["response"].get(field).is_none(), "invented {field}");
         }
         let path = json["response"]["playback_url"]

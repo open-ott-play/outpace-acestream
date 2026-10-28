@@ -54,6 +54,24 @@ class WorkflowContracts(unittest.TestCase):
         self.assertIn("cargo test --manifest-path fuzz/Cargo.toml --locked", steps_text(jobs["test"]))
         self.assertNotRegex("\n".join(steps_text(job) for job in jobs.values()), r"cargo(?:\s+\+\S+)?\s+fuzz\s+run")
 
+    def test_origin_archive_decode_is_mandatory_with_generated_media_tools(self):
+        steps = workflow("ci.yml")["jobs"]["hls-audio-synthetic"]["steps"]
+        target = "origin_hls::tests::generated_origin_ts_archive_decodes_after_origin_removal"
+        matching = [(index, step) for index, step in enumerate(steps)
+                    if target in step.get("run", "")]
+        self.assertEqual(len(matching), 1)
+        index, step = matching[0]
+        self.assertEqual(step["run"],
+                         "cargo test -p ace-engine --lib --locked " + target
+                         + " -- --ignored --exact --nocapture")
+        self.assertNotIn("if", step)
+        self.assertNotIn("continue-on-error", step)
+        self.assertTrue(any("apt-get install" in previous.get("run", "")
+                            and "ffmpeg" in previous["run"]
+                            for previous in steps[:index]))
+        source = (ROOT / "crates/ace-engine/src/origin_hls/tests.rs").read_text()
+        self.assertIn("async fn " + target.rsplit("::", 1)[1] + "()", source)
+
     def test_remote_actions_are_immutable_and_vouched_for(self):
         allowed = {
             line.split()[0] for line in (ROOT / "tools/hygiene/allowed-identifiers.txt").read_text().splitlines()

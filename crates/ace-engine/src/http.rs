@@ -31,6 +31,7 @@ use tokio::sync::broadcast::error::RecvError;
 mod broadcast;
 mod broadcast_source;
 mod compat;
+mod origin_history;
 mod origin_hls;
 mod streams;
 mod vod;
@@ -38,6 +39,7 @@ mod vod;
 use broadcast::*;
 use broadcast_source::*;
 use compat::*;
+use origin_history::*;
 use origin_hls::*;
 use streams::*;
 use vod::*;
@@ -267,6 +269,11 @@ pub fn router(state: AppState) -> Router {
         .route("/license", get(crate::source::license))
         .route("/healthz", get(|| async { "ok" }))
         .route("/origin-hls/status", get(origin_hls_status))
+        .route("/origin-hls/{token}/cmd", get(origin_history_command))
+        .route(
+            "/origin-hls/{token}/replay/{generation}/{resource}",
+            get(origin_history_resource),
+        )
         .route("/origin-hls/{token}/{id}", get(origin_hls_resource))
         .route(
             "/origin-hls/{token}",
@@ -298,6 +305,7 @@ pub fn router(state: AppState) -> Router {
         );
     if compat {
         let ace = Router::new()
+            .route("/hls/manifest.m3u8", get(ace_origin_hls_gateway))
             .route("/ace/getstream", get(ace_getstream))
             .route("/ace/r/{id}/{token}", get(ace_playback))
             .route("/ace/manifest.m3u8", get(ace_manifest))

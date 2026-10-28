@@ -2395,6 +2395,30 @@ fn reset_probe_test_counts() {
 }
 
 #[cfg(test)]
+fn test_directory_at(prefix: &str, nanos: u128) -> PathBuf {
+    static NEXT_DIRECTORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = NEXT_DIRECTORY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "{prefix}-{}-{nanos}-{sequence}",
+        std::process::id()
+    ));
+    // Never adopt another test's directory, even if the wall clock repeats.
+    std::fs::create_dir(&path).unwrap();
+    path
+}
+
+#[cfg(test)]
+fn test_directory(prefix: &str) -> PathBuf {
+    test_directory_at(
+        prefix,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    )
+}
+
+#[cfg(test)]
 mod task4_preflight_tests {
     use super::*;
     use test_support::{fake_prepared_child, process_test_lock, ChildMode};
@@ -2403,19 +2427,11 @@ mod task4_preflight_tests {
     async fn preflight_path_resolution_is_canonical_and_survives_path_mutation() {
         let _serial = process_test_lock().await;
         let old_path = std::env::var_os("PATH");
-        let unique = format!(
-            "outpace-hls-path-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let root = std::env::temp_dir().join(unique);
+        let root = test_directory("outpace-hls-path");
         let first = root.join("first");
         let second = root.join("second");
-        std::fs::create_dir_all(&first).unwrap();
-        std::fs::create_dir_all(&second).unwrap();
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
         let executable = first.join("ffmpeg-test");
         std::fs::write(&executable, b"synthetic executable placeholder").unwrap();
         #[cfg(unix)]
@@ -2621,17 +2637,26 @@ mod executable_resolution_tests {
     use super::*;
 
     fn temp_dir() -> PathBuf {
-        let unique = format!(
-            "outpace-executable-resolution-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let path = std::env::temp_dir().join(unique);
-        std::fs::create_dir_all(&path).unwrap();
-        path
+        test_directory("outpace-executable-resolution")
+    }
+
+    #[test]
+    fn temporary_roots_are_distinct_when_parallel_calls_share_a_timestamp() {
+        let roots = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..16)
+                .map(|_| scope.spawn(|| test_directory_at("outpace-temp-collision", 0)))
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let unique: std::collections::HashSet<_> = roots.iter().collect();
+        assert_eq!(unique.len(), roots.len());
+        for root in roots {
+            assert!(root.is_dir());
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     fn make_executable(path: &std::path::Path) {

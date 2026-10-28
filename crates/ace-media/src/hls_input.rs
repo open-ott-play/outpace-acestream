@@ -42,6 +42,15 @@ pub struct Reference {
     span: Range<usize>,
 }
 
+/// Metadata for a complete segment URI, without changing the source representation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaSegment {
+    pub reference_index: usize,
+    pub sequence: u64,
+    pub duration: Duration,
+    pub discontinuity_sequence: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Playlist {
     text: String,
@@ -49,6 +58,8 @@ pub struct Playlist {
     media_timeline: Option<(u64, Option<u64>)>,
     discontinuity_sequence: Option<u64>,
     retention: Duration,
+    segments: Vec<MediaSegment>,
+    simple_replay: bool,
 }
 
 impl Playlist {
@@ -66,6 +77,14 @@ impl Playlist {
     }
     pub fn retention(&self) -> Duration {
         self.retention
+    }
+    pub fn segments(&self) -> &[MediaSegment] {
+        &self.segments
+    }
+    /// Only self-contained, declared-independent media segments are replay candidates.
+    /// The consumer must still validate TS bytes, URI uniqueness and complete responses.
+    pub fn supports_simple_replay(&self) -> bool {
+        self.simple_replay
     }
     pub fn parse(body: &[u8], retention_cap: Duration) -> Result<Self, PlaylistError> {
         if body.len() > MAX_PLAYLIST_BYTES {
@@ -91,6 +110,9 @@ impl Playlist {
         let mut next_duration = None;
         let mut duration_sum = 0_f64;
         let mut max_duration = 0_f64;
+        let mut segments = Vec::new();
+        let mut independent = false;
+        let mut replay_excluded = false;
         for raw in text.split_inclusive('\n') {
             let line = raw.strip_suffix('\n').unwrap_or(raw);
             let line = line.strip_suffix('\r').unwrap_or(line);
@@ -127,6 +149,21 @@ impl Playlist {
                 push(line, kind, 0..line.len())?;
                 if kind == ResourceKind::Media {
                     let duration = next_duration.take().ok_or(PlaylistError::Invalid)?;
+                    let parsed_duration = Duration::try_from_secs_f64(duration);
+                    if let Ok(duration) = parsed_duration {
+                        segments.push(MediaSegment {
+                            reference_index: references.len() - 1,
+                            sequence: first_sequence
+                                .checked_add(segment_count)
+                                .ok_or(PlaylistError::Invalid)?,
+                            duration,
+                            discontinuity_sequence: discontinuity_sequence
+                                .checked_add(discontinuities)
+                                .ok_or(PlaylistError::Invalid)?,
+                        });
+                    } else {
+                        replay_excluded = true;
+                    }
                     duration_sum += duration;
                     max_duration = max_duration.max(duration);
                     if !duration_sum.is_finite() {
@@ -152,6 +189,13 @@ impl Playlist {
                         None
                     };
                 }
+            } else if line == "#EXT-X-INDEPENDENT-SEGMENTS" {
+                if independent {
+                    return Err(PlaylistError::Invalid);
+                }
+                independent = true;
+            } else if line == "#EXT-X-GAP" || line == "#EXT-X-I-FRAMES-ONLY" {
+                replay_excluded = true;
             } else if line == "#EXT-X-DISCONTINUITY" {
                 media = true;
                 discontinuities = discontinuities
@@ -195,6 +239,7 @@ impl Playlist {
                         }
                     }
                     "#EXT-X-MAP" => {
+                        replay_excluded = true;
                         media = true;
                         let attrs = parse_attributes(attributes)?;
                         let uri = attrs
@@ -244,6 +289,7 @@ impl Playlist {
                         return Err(PlaylistError::Unsupported);
                     }
                     "#EXT-X-BYTERANGE" => {
+                        replay_excluded = true;
                         media = true;
                         if pending_range.is_some() {
                             return Err(PlaylistError::Invalid);
@@ -348,6 +394,8 @@ impl Playlist {
             text: text.to_owned(),
             references,
             retention,
+            segments,
+            simple_replay: media && !master && independent && !replay_excluded,
             discontinuity_sequence: media.then_some(discontinuity_sequence),
             media_timeline: if media {
                 Some((
@@ -684,5 +732,46 @@ mod tests {
             parse(b"#EXTM3U\n#EXT-X-MAP:URI=\"file.mp4\",BYTERANGE=\"4\"\n#EXTINF:1,\nfile.mp4\n"),
             Err(PlaylistError::Unsupported)
         );
+    }
+
+    #[test]
+    fn retained_replay_metadata_preserves_sequences_durations_and_discontinuities() {
+        let source = "#EXTM3U\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MEDIA-SEQUENCE:12\n#EXT-X-DISCONTINUITY-SEQUENCE:7\n#EXTINF:1.25,\na.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:2,\nb.ts\n";
+        let parsed = parse(source.as_bytes()).unwrap();
+        assert!(parsed.supports_simple_replay());
+        assert_eq!(
+            parsed.segments(),
+            &[
+                MediaSegment {
+                    reference_index: 0,
+                    sequence: 12,
+                    duration: Duration::from_millis(1250),
+                    discontinuity_sequence: 7
+                },
+                MediaSegment {
+                    reference_index: 1,
+                    sequence: 13,
+                    duration: Duration::from_secs(2),
+                    discontinuity_sequence: 8
+                },
+            ]
+        );
+        assert!(!parse(
+            source
+                .replace("#EXT-X-INDEPENDENT-SEGMENTS\n", "")
+                .as_bytes()
+        )
+        .unwrap()
+        .supports_simple_replay());
+        for tag in [
+            "#EXT-X-MAP:URI=\"init.mp4\"",
+            "#EXT-X-BYTERANGE:4@0",
+            "#EXT-X-GAP",
+            "#EXT-X-I-FRAMES-ONLY",
+        ] {
+            let source =
+                format!("#EXTM3U\n#EXT-X-INDEPENDENT-SEGMENTS\n{tag}\n#EXTINF:1,\nmedia.ts\n");
+            assert!(!parse(source.as_bytes()).unwrap().supports_simple_replay());
+        }
     }
 }

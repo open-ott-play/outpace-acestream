@@ -3,6 +3,34 @@ use super::*;
 use crate::origin_hls::OriginError;
 use axum::extract::RawQuery;
 
+/// Documented direct-manifest gateway. It has no descriptor or swarm identity.
+pub(super) async fn ace_origin_hls_gateway(
+    State(state): State<AppState>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    // This route accepts exactly one source. Validate the complete query before
+    // admitting a viewer, including duplicate or otherwise unsupported options.
+    let [(key, manifest_url)] = params.as_slice() else {
+        return (StatusCode::BAD_REQUEST, "expected one manifest_url").into_response();
+    };
+    if key != "manifest_url" || manifest_url.is_empty() {
+        return (StatusCode::BAD_REQUEST, "expected one manifest_url").into_response();
+    }
+    let Some(relay) = state.origin_hls else {
+        return (StatusCode::NOT_IMPLEMENTED, "managed HLS is disabled").into_response();
+    };
+    // start() applies the relay's bounded HTTP(S) URL policy before admission and
+    // performs no remote fetch. The returned playlist is validated when requested.
+    match relay.start(manifest_url).await {
+        Ok(playback) => (
+            StatusCode::FOUND,
+            [(header::LOCATION, playback.playback_url)],
+        )
+            .into_response(),
+        Err(error) => origin_hls_error(error),
+    }
+}
+
 pub(super) async fn origin_hls_resource(
     State(state): State<AppState>,
     Path((token, id)): Path<(String, String)>,

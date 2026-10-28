@@ -60,6 +60,26 @@ fn relay() -> Arc<OriginHls> {
         allow_non_global: true,
     })
 }
+fn history_relay() -> Arc<OriginHls> {
+    let config = HlsHistoryConfig {
+        max_seconds: 60,
+        max_bytes: 2 * 1024 * 1024,
+        global_max_bytes: 4 * 1024 * 1024,
+    };
+    OriginHls::new_with_history(
+        FetchPolicy {
+            allow_non_global: true,
+        },
+        config,
+        HistoryBudget::new(config.global_max_bytes),
+    )
+}
+fn recorded_ts() -> Bytes {
+    Bytes::from_static(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/vectors/media/h264-keyframes.ts"
+    )))
+}
 fn token(playback: &OriginPlayback) -> &str {
     playback.stop_url.rsplit('/').next().unwrap()
 }
@@ -1412,6 +1432,155 @@ fn cache_bounds_entries_and_memory_including_zero_length_resources() {
     assert_eq!(cache.bytes, MAX_CACHE_BYTES);
 }
 
+#[tokio::test]
+async fn retained_origin_replay_survives_removal_without_origin_reads_or_moving_another_viewer() {
+    let removed = Arc::new(AtomicBool::new(false));
+    let gone = removed.clone();
+    let origin = Fixture::new(move |path, _| match path {
+        "/record.m3u8" => manifest("#EXTM3U\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MEDIA-SEQUENCE:10\n#EXTINF:2,\na.ts\n#EXTINF:2,\nb.ts\n"),
+        "/live.m3u8" => manifest("#EXTM3U\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXTINF:2,\nlive.ts\n"),
+        "/live.ts" => recorded_ts().into_response(),
+        "/a.ts" | "/b.ts" if !gone.load(Ordering::SeqCst) => ([(axum::http::header::CACHE_CONTROL,"no-store")],recorded_ts()).into_response(),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }).await;
+    let relay = history_relay();
+    let first = relay.start(&origin.url("/record.m3u8")).await.unwrap();
+    let other = relay.start(&origin.url("/live.m3u8")).await.unwrap();
+    let sources = uris(&relay.resource(token(&first), "0", None).await.unwrap().body);
+    let (a, b) = tokio::join!(
+        relay.resource(token(&first), resource_id(&sources[0]), None),
+        relay.resource(token(&first), resource_id(&sources[1]), Some("bytes=0-"))
+    );
+    assert_eq!(a.unwrap().body, recorded_ts());
+    assert_eq!(b.unwrap().body, recorded_ts());
+    assert!(
+        relay.cache.lock().unwrap().entries.is_empty(),
+        "recording no-store media must not enable ordinary HTTP caching"
+    );
+    let view = relay
+        .seek(
+            token(&first),
+            OriginSeekTarget::Back(Duration::from_secs(3)),
+            Some(0),
+        )
+        .unwrap();
+    removed.store(true, Ordering::SeqCst);
+    let before = origin.calls.lock().unwrap().len();
+    let playlist = relay
+        .replay_resource(token(&first), view.generation, "index.m3u8")
+        .await
+        .unwrap();
+    let replay = uris(&playlist.body);
+    drop(playlist);
+    for url in replay {
+        assert_eq!(
+            relay
+                .replay_resource(token(&first), view.generation, resource_id(&url))
+                .await
+                .unwrap()
+                .body,
+            recorded_ts()
+        );
+    }
+    assert_eq!(origin.calls.lock().unwrap().len(), before);
+    assert_eq!(
+        relay.history_status(token(&other)).unwrap().view.generation,
+        0
+    );
+    let live = uris(&relay.resource(token(&other), "0", None).await.unwrap().body);
+    assert_eq!(
+        relay
+            .resource(token(&other), resource_id(&live[0]), None)
+            .await
+            .unwrap()
+            .body,
+        recorded_ts()
+    );
+    let response = relay
+        .replay_resource(token(&first), view.generation, "10.ts")
+        .await
+        .unwrap();
+    relay.live(token(&first), Some(view.generation)).unwrap();
+    use futures::StreamExt;
+    let stream = response.into_stream();
+    futures::pin_mut!(stream);
+    assert!(stream.next().await.unwrap().is_err());
+    assert!(relay.stop(token(&first)));
+    assert!(matches!(
+        relay.history_status(token(&first)),
+        Err(OriginError::NotFound)
+    ));
+    assert!(relay.history_status(token(&other)).unwrap().supported);
+}
+
+#[tokio::test]
+async fn origin_recording_rejects_late_body_after_source_epoch_reset() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let notify = started.clone();
+    let unblock = release.clone();
+    let requests = AtomicUsize::new(0);
+    let media_requests = AtomicUsize::new(0);
+    let origin=Fixture::new(move|path,_| {
+        if path=="/index" { return if requests.fetch_add(1,Ordering::SeqCst)==0 {
+            manifest("#EXTM3U\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MEDIA-SEQUENCE:10\n#EXT-X-DISCONTINUITY-SEQUENCE:7\n#EXTINF:2,\na.ts\n")
+        } else { manifest("#EXTM3U\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MEDIA-SEQUENCE:11\n#EXT-X-DISCONTINUITY-SEQUENCE:0\n#EXTINF:2,\na.ts\n") }; }
+        if media_requests.fetch_add(1,Ordering::SeqCst)==0 {
+            notify.notify_one(); let unblock=unblock.clone();
+            return Body::from_stream(futures::stream::once(async move { unblock.notified().await; Ok::<_,std::io::Error>(recorded_ts()) })).into_response();
+        }
+        recorded_ts().into_response()
+    }).await;
+    let relay = history_relay();
+    let playback = relay.start(&origin.url("/index")).await.unwrap();
+    let old = uris(
+        &relay
+            .resource(token(&playback), "0", None)
+            .await
+            .unwrap()
+            .body,
+    )
+    .remove(0);
+    let worker = relay.clone();
+    let viewer = token(&playback).to_owned();
+    let task = tokio::spawn(async move { worker.resource(&viewer, resource_id(&old), None).await });
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    let new = uris(
+        &relay
+            .resource(token(&playback), "0", None)
+            .await
+            .unwrap()
+            .body,
+    )
+    .remove(0);
+    release.notify_one();
+    assert_eq!(task.await.unwrap().unwrap().body, recorded_ts());
+    assert_eq!(
+        relay
+            .history_status(token(&playback))
+            .unwrap()
+            .history
+            .retained_bytes,
+        0
+    );
+    drop(
+        relay
+            .resource(token(&playback), resource_id(&new), None)
+            .await
+            .unwrap(),
+    );
+    assert!(
+        relay
+            .history_status(token(&playback))
+            .unwrap()
+            .history
+            .retained_bytes
+            > 0
+    );
+}
+
 struct TempMedia(std::path::PathBuf);
 impl TempMedia {
     fn new() -> Self {
@@ -1594,4 +1763,194 @@ async fn generated_origin_hls_ts_and_fmp4_decode() {
         assert!(relay.sessions.lock().unwrap().is_empty());
         eprintln!("managed origin HLS {container}: {frames} decoded frames");
     }
+}
+
+#[tokio::test]
+#[ignore = "requires FFmpeg; generates and decodes retained TS after origin removal"]
+async fn generated_origin_ts_archive_decodes_after_origin_removal() {
+    use crate::http::{router, AceSessionStore, AppState};
+    use crate::manager::StreamManager;
+    use crate::provider::ProviderRegistry;
+    let files = TempMedia::new();
+    let output = files.0.join("index.m3u8");
+    let segments = files.0.join("segment%03d.ts");
+    let mut args: Vec<String> = [
+        "-hide_banner",
+        "-v",
+        "error",
+        "-nostdin",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=160x90:rate=10",
+        "-t",
+        "3",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        "-g",
+        "10",
+        "-keyint_min",
+        "10",
+        "-sc_threshold",
+        "0",
+        "-f",
+        "hls",
+        "-hls_time",
+        "1",
+        "-hls_playlist_type",
+        "vod",
+        "-hls_flags",
+        "independent_segments",
+        "-hls_segment_filename",
+    ]
+    .iter()
+    .map(|s| (*s).into())
+    .collect();
+    args.push(segments.to_str().unwrap().into());
+    args.push(output.to_str().unwrap().into());
+    ffmpeg(&args).await;
+    let resources: HashMap<_, _> = std::fs::read_dir(&files.0)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                format!("/{}", entry.file_name().to_str().unwrap()),
+                Bytes::from(std::fs::read(entry.path()).unwrap()),
+            )
+        })
+        .collect();
+    let removed = Arc::new(AtomicBool::new(false));
+    let gone = removed.clone();
+    let origin = Fixture::new(move |path, _| {
+        let archive = path.starts_with("/record/");
+        let path = path
+            .strip_prefix("/record")
+            .or_else(|| path.strip_prefix("/live"))
+            .unwrap_or(path);
+        if archive && gone.load(Ordering::SeqCst) && path.ends_with(".ts") {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        match resources.get(path) {
+            Some(bytes) => (
+                [
+                    (
+                        axum::http::header::CONTENT_TYPE,
+                        if path.ends_with(".m3u8") {
+                            "application/vnd.apple.mpegurl"
+                        } else {
+                            "video/mp2t"
+                        },
+                    ),
+                    (axum::http::header::CACHE_CONTROL, "no-store"),
+                ],
+                bytes.clone(),
+            )
+                .into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
+    })
+    .await;
+    let relay = history_relay();
+    let recorded = relay
+        .start(&origin.url("/record/index.m3u8"))
+        .await
+        .unwrap();
+    let other = relay.start(&origin.url("/live/index.m3u8")).await.unwrap();
+    let urls = uris(
+        &relay
+            .resource(token(&recorded), "0", None)
+            .await
+            .unwrap()
+            .body,
+    );
+    for uri in urls.iter().rev() {
+        drop(
+            relay
+                .resource(token(&recorded), resource_id(uri), None)
+                .await
+                .unwrap(),
+        );
+    }
+    let status = relay.history_status(token(&recorded)).unwrap();
+    assert_eq!(status.history.first_seq, Some(0));
+    assert_eq!(status.history.last_seq, Some(2));
+    let view = relay
+        .seek(token(&recorded), OriginSeekTarget::PositionMs(0), Some(0))
+        .unwrap();
+    removed.store(true, Ordering::SeqCst);
+    let calls = origin.calls.lock().unwrap().len();
+    let state = AppState {
+        manager: StreamManager::new(ProviderRegistry::new()),
+        networks: vec![],
+        resolve_content_ids_in_getstream: false,
+        ace_sessions: Arc::new(AceSessionStore::default()),
+        experimental_ace_compat: false,
+        broadcasts: None,
+        origin_hls: Some(relay.clone()),
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+    struct Abort(tokio::task::AbortHandle);
+    impl Drop for Abort {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _server = Abort(task.abort_handle());
+    for (mode, path) in [
+        ("retained", view.playback_url),
+        ("independent-live", other.playback_url.clone()),
+    ] {
+        let input = format!("http://{address}{path}");
+        let decode: Vec<String> = [
+            "-hide_banner",
+            "-v",
+            "error",
+            "-nostdin",
+            "-i",
+            &input,
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            "30",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            "-f",
+            "null",
+            "-",
+        ]
+        .iter()
+        .map(|s| (*s).into())
+        .collect();
+        let result = ffmpeg(&decode).await;
+        let progress = String::from_utf8(result.stdout).unwrap();
+        let frames = progress
+            .lines()
+            .filter_map(|line| line.strip_prefix("frame=")?.trim().parse::<u32>().ok())
+            .max()
+            .unwrap_or(0);
+        assert_eq!(frames, 30, "{mode} decodes all generated frames");
+        if mode == "retained" {
+            assert_eq!(
+                origin.calls.lock().unwrap().len(),
+                calls,
+                "replay must not fetch the deleted origin"
+            );
+        }
+        eprintln!("origin TS {mode}: {frames} decoded frames");
+    }
+    assert_eq!(
+        relay.history_status(token(&other)).unwrap().view.generation,
+        0
+    );
+    assert!(relay.stop(token(&recorded)));
+    assert!(relay.stop(token(&other)));
 }

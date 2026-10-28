@@ -85,11 +85,12 @@ impl TransportDescriptor {
             .map(|i| i as u64)
     }
 
-    /// Whether this descriptor advertises a multi-file layout (`files` list). Multi-file VOD is
-    /// intentionally unsupported; callers reject it. This checks the historical synthetic
-    /// root schema (see [`Self::vod_total_length`]), not an original-engine multi-file schema.
+    /// Whether this descriptor advertises a multi-file layout (`files` key). Multi-file VOD is
+    /// intentionally unsupported; callers reject even a malformed value rather than treating
+    /// it as single-file or live. This checks the historical synthetic root schema (see
+    /// [`Self::vod_total_length`]), not an original-engine multi-file schema.
     pub fn is_multifile(&self) -> bool {
-        matches!(self.raw.get(b"files"), Some(Bencode::List(_)))
+        self.raw.get(b"files").is_some()
     }
 }
 
@@ -249,10 +250,11 @@ pub fn decode_transport_source_with_key(
 
     // 7. VOD pieces: concatenated 20-byte SHA-1 hashes; absent on live streams.
     let pieces: Vec<[u8; 20]> = match raw.get(b"pieces") {
+        None => Vec::new(),
         Some(Bencode::Bytes(p)) if p.len().is_multiple_of(20) && !p.is_empty() => {
             p.as_chunks::<20>().0.to_vec()
         }
-        _ => Vec::new(),
+        Some(_) => return Err(WireError::Invalid("invalid VOD pieces")),
     };
     let is_live = pieces.is_empty();
 
@@ -387,6 +389,42 @@ mod tests {
         assert_eq!(d.piece_length, 131072);
         assert_eq!(d.chunk_length, 16384);
         assert_eq!(d.name, "hi");
+    }
+
+    #[test]
+    fn present_invalid_vod_pieces_never_become_live() {
+        for pieces in [
+            Bencode::Bytes(vec![]),
+            Bencode::Bytes(vec![0; 19]),
+            Bencode::Bytes(vec![0; 21]),
+            Bencode::Int(1),
+            Bencode::List(vec![]),
+            Bencode::Dict(Default::default()),
+        ] {
+            let descriptor = Bencode::Dict(std::collections::BTreeMap::from([
+                (b"piece_length".to_vec(), Bencode::Int(16_384)),
+                (b"chunk_length".to_vec(), Bencode::Int(16_384)),
+                (b"pieces".to_vec(), pieces),
+            ]));
+            assert!(matches!(
+                decode_transport_source(&encode_transport(&descriptor)),
+                Err(WireError::Invalid("invalid VOD pieces"))
+            ));
+        }
+    }
+
+    #[test]
+    fn absent_pieces_stay_live_and_valid_pieces_stay_vod() {
+        let mut descriptor = std::collections::BTreeMap::from([
+            (b"piece_length".to_vec(), Bencode::Int(16_384)),
+            (b"chunk_length".to_vec(), Bencode::Int(16_384)),
+        ]);
+        let live = decode_transport(&encode_transport(&Bencode::Dict(descriptor.clone()))).unwrap();
+        assert!(live.is_live);
+        descriptor.insert(b"pieces".to_vec(), Bencode::Bytes(vec![0xa5; 40]));
+        let vod = decode_transport(&encode_transport(&Bencode::Dict(descriptor))).unwrap();
+        assert!(!vod.is_live);
+        assert_eq!(vod.pieces, vec![[0xa5; 20]; 2]);
     }
 
     #[test]

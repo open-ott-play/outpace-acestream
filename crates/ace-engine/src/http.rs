@@ -31,12 +31,14 @@ use tokio::sync::broadcast::error::RecvError;
 mod broadcast;
 mod broadcast_source;
 mod compat;
+mod origin_hls;
 mod streams;
 mod vod;
 
 use broadcast::*;
 use broadcast_source::*;
 use compat::*;
+use origin_hls::*;
 use streams::*;
 use vod::*;
 
@@ -115,6 +117,8 @@ pub struct AppState {
     /// Supported, opt-in Acestream HTTP subset. Native `/streams` and
     /// `/broadcast` routes remain available regardless of this flag.
     pub experimental_ace_compat: bool,
+    /// Independent origin relay leases; None preserves direct origin handoff.
+    pub origin_hls: Option<Arc<crate::origin_hls::OriginHls>>,
     /// B1: origination state. `None` disables `PUT /broadcast/{name}` (404) — e.g. in tests
     /// that don't need it.
     pub broadcasts: Option<BroadcastState>,
@@ -262,6 +266,12 @@ pub fn router(state: AppState) -> Router {
         .route("/source.json", get(crate::source::metadata))
         .route("/license", get(crate::source::license))
         .route("/healthz", get(|| async { "ok" }))
+        .route("/origin-hls/status", get(origin_hls_status))
+        .route("/origin-hls/{token}/{id}", get(origin_hls_resource))
+        .route(
+            "/origin-hls/{token}",
+            axum::routing::delete(origin_hls_stop),
+        )
         .route("/debug/memstats", get(debug_memstats))
         .route("/networks", get(networks))
         .route("/streams", get(list_streams))

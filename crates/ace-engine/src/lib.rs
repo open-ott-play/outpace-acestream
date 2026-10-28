@@ -36,6 +36,7 @@ pub mod http;
 mod live_stats;
 pub mod magnet;
 pub mod manager;
+pub mod origin_hls;
 pub mod provider;
 pub mod routes;
 pub mod rtmp;
@@ -47,3 +48,5 @@ pub mod source;
 pub mod startup_buffer;
 pub mod testprovider;
 pub mod transport_url;
+
+pub(crate) mod source_options;

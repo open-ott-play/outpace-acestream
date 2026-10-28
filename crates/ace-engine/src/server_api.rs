@@ -108,6 +108,8 @@ pub enum ResolvedContent {
         infohash: String,
         content_id: Option<String>,
         is_live: bool,
+        /// Only a verified single-file VOD descriptor establishes a finite size.
+        total_length: Option<u64>,
     },
     Hls {
         content_id: Option<String>,
@@ -123,11 +125,13 @@ impl ResolvedContent {
                 infohash: infohash_hex(&info.infohash),
                 content_id,
                 is_live: true,
+                total_length: None,
             },
             ResolvedTransport::Vod(info) => Self::Swarm {
                 infohash: infohash_hex(&info.infohash),
                 content_id,
                 is_live: false,
+                total_length: Some(info.total_length),
             },
             ResolvedTransport::Hls {
                 manifest_url,
@@ -210,6 +214,7 @@ pub fn analyze_result(c: &ResolvedContent) -> Value {
             infohash,
             content_id,
             is_live,
+            ..
         } => json!({
             "infohash": infohash,
             "content_id": content_id,
@@ -256,8 +261,10 @@ pub fn content_id_result(content_id: &str) -> Value {
     json!({ "content_id": content_id })
 }
 
-/// `get_media_files` result: outpace transports are single-file, so this reports one media file
-/// keyed by the infohash. `dump_transport_file` is intentionally unsupported (see the matrix).
+/// `get_media_files` result: a classified single-file swarm reports its known type and finite
+/// VOD size. Descriptors do not establish a media MIME or filename, so neither is invented.
+/// Unresolved identities and HLS descriptors do not establish a file list.
+/// `dump_transport_file` is intentionally unsupported (see the matrix).
 pub fn media_files_result(c: &ResolvedContent) -> Value {
     match c {
         ResolvedContent::Unresolved { infohash } => json!({
@@ -265,15 +272,23 @@ pub fn media_files_result(c: &ResolvedContent) -> Value {
             "is_encrypted": -1, "files": [],
         }),
         ResolvedContent::Swarm {
-            infohash, is_live, ..
-        } => json!({
-            "infohash": infohash,
-            "files": [{
+            infohash,
+            is_live,
+            total_length,
+            ..
+        } => {
+            let mut file = json!({
                 "infohash": infohash,
                 "index": 0,
                 "is_live": bool_flag(*is_live),
-            }],
-        }),
+                // The public Android SDK MediaFile reads `type`, not `is_live`.
+                "type": if *is_live { "live" } else { "vod" },
+            });
+            if let Some(length) = total_length {
+                file["size"] = json!(length);
+            }
+            json!({ "infohash": infohash, "files": [file] })
+        }
         ResolvedContent::Hls {
             content_id,
             manifest_url,
@@ -405,6 +420,7 @@ mod tests {
             infohash: "aa".repeat(20),
             content_id: Some("cid".to_string()),
             is_live: true,
+            total_length: None,
         };
         let v = analyze_result(&c);
         assert_eq!(v["infohash"], "aa".repeat(20));
@@ -419,11 +435,16 @@ mod tests {
             infohash: "bb".repeat(20),
             content_id: None,
             is_live: false,
+            total_length: Some(123_456),
         };
         let v = media_files_result(&c);
         assert_eq!(v["infohash"], "bb".repeat(20));
         assert_eq!(v["files"][0]["infohash"], "bb".repeat(20));
         assert_eq!(v["files"][0]["is_live"], 0);
+        assert_eq!(v["files"][0]["type"], "vod");
+        assert_eq!(v["files"][0]["size"], 123_456);
+        assert!(v["files"][0].get("mime").is_none());
+        assert!(v["files"][0].get("filename").is_none());
     }
 
     #[test]
@@ -435,6 +456,37 @@ mod tests {
 #[cfg(test)]
 mod transport_contract_tests {
     use super::*;
+
+    // Source-derived DTO subset from the public Android SDK (65a6e53): its MediaFile
+    // uses type="live"/"vod" and a numeric size; this is not an original-engine capture.
+    #[derive(serde::Deserialize)]
+    struct ClientMediaFile {
+        index: u32,
+        #[serde(rename = "type")]
+        content_type: String,
+        size: Option<u64>,
+        mime: Option<String>,
+        filename: Option<String>,
+    }
+
+    #[test]
+    fn classified_live_file_supplies_client_type_without_fabricating_size_or_mime() {
+        let source = ace_swarm::resolve::playback_from_transport(include_bytes!(
+            "../../../tests/vectors/transport/synthetic-live-512k.bin"
+        ))
+        .unwrap();
+        assert!(matches!(source, ResolvedTransport::Swarm(_)));
+        let content = ResolvedContent::from_transport(source, None);
+        let result = media_files_result(&content);
+        assert_eq!(result["files"].as_array().unwrap().len(), 1);
+        let file: ClientMediaFile = serde_json::from_value(result["files"][0].clone()).unwrap();
+        assert_eq!(file.index, 0);
+        assert_eq!(file.content_type, "live");
+        assert!(file.size.is_none());
+        assert!(file.mime.is_none());
+        assert!(file.filename.is_none());
+        assert_eq!(result["files"][0]["is_live"], 1);
+    }
 
     #[test]
     fn hls_analysis_has_no_fabricated_hash_files_or_live_encryption_state() {
@@ -458,6 +510,9 @@ mod transport_contract_tests {
             assert!(result.get("infohash").is_none());
             assert!(result.get("stat_url").is_none());
             assert!(result.get("command_url").is_none());
+            assert!(result.get("type").is_none());
+            assert!(result.get("mime").is_none());
+            assert!(result.get("size").is_none());
         }
         assert_eq!(media_files_result(&content)["files"], json!([]));
     }
@@ -468,8 +523,20 @@ mod transport_contract_tests {
             "../../../tests/vectors/metainfo/single-file-unsorted.torrent"
         ))
         .unwrap();
+        let ResolvedTransport::Vod(info) = &source else {
+            panic!("synthetic fixture must resolve as a single-file VOD");
+        };
+        let length = info.total_length;
         let content = ResolvedContent::from_transport(source, None);
         assert_eq!(analyze_result(&content)["is_live"], 0);
-        assert_eq!(media_files_result(&content)["files"][0]["is_live"], 0);
+        let result = media_files_result(&content);
+        assert_eq!(result["files"].as_array().unwrap().len(), 1);
+        assert_eq!(result["files"][0]["is_live"], 0);
+        let file: ClientMediaFile = serde_json::from_value(result["files"][0].clone()).unwrap();
+        assert_eq!(file.index, 0);
+        assert_eq!(file.content_type, "vod");
+        assert_eq!(file.size, Some(length));
+        assert!(file.mime.is_none());
+        assert!(file.filename.is_none());
     }
 }

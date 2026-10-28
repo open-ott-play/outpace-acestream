@@ -52,7 +52,7 @@ For live peer sources, omitting `format` or setting it empty returns MPEG-TS
 directly (`video/mp2t`). Keep URLs shell-quoted, including their ampersands. To
 package a live peer source as HLS, open `/ace/manifest.m3u8` with the same selector;
 its default response redirects to a stable leased playlist. If the descriptor
-already points to an HLS origin, **both endpoints redirect to that origin** instead.
+already points to an HLS origin, **both endpoints redirect to that origin** by default (or the opt-in managed relay).
 Media availability and player decoding are separate from accepting the request.
 
 ## Quickstart: a JSON session client
@@ -118,6 +118,22 @@ starts the peer source/packager **before** minting URLs. HLS clients must consum
 returned playlist and its segment URLs, rather than treating the playlist as TS.
 
 ## Origin HLS handoff
+
+With `OUTPACE_MANAGED_HLS=1`, playback starts instead return an engine-owned
+`/origin-hls/<token>/0.m3u8` URL. JSON retains `is_direct: true` and adds
+`managed_origin: true` and `stop_url`; `DELETE stop_url` returns 204 once and 404
+for an absent/revoked token. `GET /origin-hls/<token>/<resource>` serves rewritten
+playlists or finite media (200/206), `no-store`. There are no invented swarm
+controls or replay history. Expired/unknown resources return 404, invalid ranges
+400, exhausted admission 503, acquisition deadlines 504, unsupported HLS 415 and
+other invalid/failed origin resources 502. Query-based playlist extensions and
+If-Range are unsupported. Valid playlist probe ranges receive a complete 200
+rewritten manifest; media range responses retain validated Content-Range.
+`GET /origin-hls/status` returns `enabled` and an aggregate `active_sessions` count,
+including lazy starts, without tokens or origin URLs.
+See [relay limits and ownership](../source-resolution.md#managed-origin-hls-opt-in).
+
+The remainder of this section describes the default direct-handoff mode.
 
 A resolved HLS transport descriptor takes precedence over the requested output
 route. `/ace/getstream` does not relabel its manifest as TS, and
@@ -241,7 +257,7 @@ Both aliases use `{"result": <value>, "error": null}` on success and
 | `get_network_connection_status` | `status`, boolean `connected`, and `networks` reflect registered provider networks, not measured Internet or peer reachability. |
 | `analyze_content` | Resolved live/VOD descriptors return `infohash`, nullable `content_id`, integer `is_live`/`is_encrypted`, and `status: "complete"`. HLS returns `transport: "hls"`, `playback_url`, `is_direct: true`, descriptor metadata, and unknown `is_live: -1` / `is_encrypted: -1`, without an invented infohash. Bare infohash/magnet parsing remains offline, reports unknown flags (`-1`), and does not qualify the transport. |
 | `get_content_id` | **Echo only:** returns a nonempty caller `content_id`/`query` unchanged, even malformed strings, without 40-hex validation or catalog lookup. Cannot derive a content id from an infohash/URL/magnet. |
-| `get_media_files` | Resolved live/VOD descriptors report `infohash` and one `files[]` entry with `index: 0` and `is_live`. HLS reports the direct-origin fields above and `files: []`: the manifest has not been fetched, so no file/variant list is fabricated. Unresolved bare infohash/magnet selectors also return `files: []`. No multi-file or selection contract; `dump_transport_file` does not produce a raw dump. |
+| `get_media_files` | Resolved live/VOD descriptors report `infohash` and one `files[]` entry with `index: 0`, `is_live`, and classified `type: live` or `type: vod`; VOD also carries verified `size`. Unknown filename/MIME remain absent. HLS reports the direct-origin fields above and `files: []`: the manifest has not been fetched, so no file/variant list is fabricated. Unresolved bare infohash/magnet selectors also return `files: []`. Only default HTTP `_idx=0` and the no-selection `stream_id=-1` sentinel are admitted; other file/stream/playlist selection is explicitly unsupported; `dump_transport_file` does not produce a raw dump. |
 
 ## Lease ownership and live HLS
 

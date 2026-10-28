@@ -401,6 +401,8 @@ config_with_root_redaction! {
     /// the deprecated `OUTPACE_EXPERIMENTAL_ACE_COMPAT` alias. The field name is retained
     /// for Rust and serialized configuration compatibility; native APIs remain primary.
     pub experimental_ace_compat: bool,
+    /// Opt-in bounded local relay; false preserves direct origin handoff.
+    pub managed_hls: bool,
     /// Compatibility HLS inactivity timeout; pending manifest requests remain protected.
     pub ace_hls_idle_timeout_ms: u64,
     /// Allow the outpace raw-transport-hash BEP-9 content-id fallback. Defaults off.
@@ -448,6 +450,7 @@ impl Default for Config {
             port_map_backend: ace_swarm::portmap::PortMapBackend::Auto,
             port_map_external_port: None,
             experimental_ace_compat: false,
+            managed_hls: false,
             ace_hls_idle_timeout_ms: 60_000,
             bep9_content_id_fallback: false,
             broadcast_options: BTreeMap::new(),
@@ -735,6 +738,7 @@ mod tests {
             c.enable_inbound,
             "inbound serving is on by default, matching the Acestream engine"
         );
+        assert!(!c.managed_hls, "managed origin HLS must remain opt-in");
         assert!(
             !c.experimental_ace_compat,
             "Acestream HTTP compatibility must be opt-in"

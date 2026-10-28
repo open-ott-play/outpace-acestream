@@ -206,6 +206,9 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Some(v) = bool_from_env("OUTPACE_HLS_AUDIO_NORMALIZE")? {
         config.hls_audio.normalize = v;
     }
+    if let Some(v) = bool_from_env("OUTPACE_MANAGED_HLS")? {
+        config.managed_hls = v;
+    }
     if let Some(v) = std::env::var_os("OUTPACE_FFMPEG_PATH") {
         config.hls_audio.ffmpeg_path = v.into();
     }
@@ -914,6 +917,9 @@ async fn serve_http_inner(
             config.ace_hls_idle_timeout()?,
         )),
         experimental_ace_compat: config.experimental_ace_compat,
+        origin_hls: config
+            .managed_hls
+            .then(|| crate::origin_hls::OriginHls::new(FetchPolicy::default())),
         broadcasts: Some(broadcasts.clone()),
     };
 
@@ -1415,6 +1421,9 @@ mod tests {
             resolve_content_ids_in_getstream: false,
             ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
             experimental_ace_compat: config.experimental_ace_compat,
+            origin_hls: config
+                .managed_hls
+                .then(|| crate::origin_hls::OriginHls::new(FetchPolicy::default())),
             broadcasts: None,
         });
         drop(_restore);
@@ -1811,6 +1820,31 @@ mod tests {
         std::env::remove_var("OUTPACE_ENABLE_PORT_MAPPING");
         std::env::remove_var("OUTPACE_PORT_MAP_BACKEND");
         std::env::remove_var("OUTPACE_PORT_MAP_EXTERNAL_PORT");
+    }
+
+    #[test]
+    fn managed_hls_is_opt_in_and_rejects_malformed_environment() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os("OUTPACE_MANAGED_HLS");
+        let result = std::panic::catch_unwind(|| {
+            std::env::remove_var("OUTPACE_MANAGED_HLS");
+            assert!(!config_from_env().unwrap().managed_hls);
+            for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+                std::env::set_var("OUTPACE_MANAGED_HLS", value);
+                assert_eq!(config_from_env().unwrap().managed_hls, expected);
+            }
+            std::env::set_var("OUTPACE_MANAGED_HLS", "ture");
+            assert!(config_from_env()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("OUTPACE_MANAGED_HLS"));
+        });
+        match old {
+            Some(value) => std::env::set_var("OUTPACE_MANAGED_HLS", value),
+            None => std::env::remove_var("OUTPACE_MANAGED_HLS"),
+        }
+        result.unwrap();
     }
 
     #[test]

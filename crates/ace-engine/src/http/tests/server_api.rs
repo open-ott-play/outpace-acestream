@@ -120,15 +120,50 @@ async fn server_api_get_content_id_errors_when_it_cannot_be_derived() {
 #[tokio::test]
 async fn server_api_get_media_files_does_not_invent_files_for_an_unresolved_infohash() {
     let ih = "aa".repeat(20);
-    let (_, json) = server_api_json(
+    for path in ["/server/api", "/webui/api/service"] {
+        let (_, json) = control_api_json(
+            ace_compat_state(0),
+            path,
+            &format!("method=get_media_files&infohash={ih}&mode=full&expand_wrapper=1"),
+        )
+        .await;
+        assert_eq!(json["error"], serde_json::Value::Null);
+        assert_eq!(json["result"]["infohash"], ih);
+        assert_eq!(json["result"]["files"], serde_json::json!([]));
+        assert_eq!(json["result"]["is_live"], -1);
+        assert_eq!(json["result"]["is_encrypted"], -1);
+        for unknown in ["type", "mime", "size", "wrapper_data"] {
+            assert!(json["result"].get(unknown).is_none(), "{path}: {unknown}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn pinned_sdk_default_selection_allows_a_json_playback_request() {
+    // Android SDK PlaybackData (65a6e53) initializes streamIndex=-1. The Android
+    // engine client (3798163) emits both _idx and stream_id even without a variant.
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    let (status, json) = control_api_json(
         ace_compat_state(0),
-        &format!("method=get_media_files&infohash={ih}"),
+        "/ace/getstream",
+        &format!("format=json&sid=synthetic-player&_idx=0&stream_id=-1&infohash={id}"),
     )
     .await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(json["error"], serde_json::Value::Null);
-    assert_eq!(json["result"]["infohash"], ih);
-    assert_eq!(json["result"]["files"], serde_json::json!([]));
-    assert_eq!(json["result"]["is_live"], -1);
+    assert!(json["response"]["playback_url"].is_string());
+    assert!(json["response"]["command_url"].is_string());
+
+    for selection in ["_idx=1&stream_id=-1", "_idx=0&stream_id=0"] {
+        let (_, json) = control_api_json(
+            ace_compat_state(0),
+            "/ace/getstream",
+            &format!("format=json&sid=synthetic-player&{selection}&infohash={id}"),
+        )
+        .await;
+        assert!(json["error"].is_string());
+        assert_eq!(json["response"], serde_json::Value::Null);
+    }
 }
 
 #[tokio::test]

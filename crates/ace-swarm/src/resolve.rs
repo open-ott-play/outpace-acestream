@@ -120,6 +120,11 @@ fn stream_info_from_descriptor(d: TransportDescriptor) -> Result<StreamInfo, Res
             "VOD descriptor is not a live stream",
         ));
     }
+    if d.is_multifile() {
+        return Err(ResolveError::Transport(
+            "multi-file descriptor is not a live stream",
+        ));
+    }
     validate_geometry(d.piece_length, d.chunk_length)?;
     // A valid RSA pubkey => pieces carry a modulus-length signature tail to strip *and* a key
     // to verify each piece's in-band signature against (issue #10); no parseable pubkey =>
@@ -192,6 +197,11 @@ fn vod_info_from_descriptor(d: TransportDescriptor) -> Result<VodInfo, ResolveEr
     let total_length = d
         .vod_total_length()
         .ok_or(ResolveError::Transport("VOD descriptor missing length"))?;
+    if d.pieces.len() as u64 != total_length.div_ceil(d.piece_length) {
+        return Err(ResolveError::Transport(
+            "VOD piece count does not match length",
+        ));
+    }
     Ok(VodInfo {
         infohash: infohash_of_descriptor(&d.raw)
             .map_err(|_| ResolveError::Transport("infohash failed"))?,
@@ -1212,12 +1222,100 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_vod_requires_exact_piece_count_for_its_length() {
+        for length in [1, 131_071, 131_072, 131_073, 262_144, 262_145, i64::MAX] {
+            for count in 1..=3 {
+                let bytes = vod_transport(count * 20, Some(length), false);
+                let expected = count as u64 == (length as u64).div_ceil(131_072);
+                let vod = vod_info_from_transport(&bytes);
+                assert_eq!(vod.is_ok(), expected, "length={length}, pieces={count}");
+                let playback = playback_from_transport(&bytes);
+                assert_eq!(
+                    matches!(playback, Ok(ResolvedTransport::Vod(_))),
+                    expected,
+                    "typed length={length}, pieces={count}"
+                );
+                if !expected {
+                    assert!(matches!(
+                        vod,
+                        Err(ResolveError::Transport(
+                            "VOD piece count does not match length"
+                        ))
+                    ));
+                    assert!(playback.is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_wrapped_pieces_are_terminal_not_live() {
+        use ace_wire::bencode::Bencode;
+        for value in [
+            Bencode::Bytes(vec![]),
+            Bencode::Bytes(vec![0; 19]),
+            Bencode::Bytes(vec![0; 21]),
+            Bencode::Int(0),
+            Bencode::List(vec![]),
+        ] {
+            let Bencode::Dict(mut raw) = decode_transport(&vod_transport(20, Some(16_384), false))
+                .unwrap()
+                .raw
+            else {
+                unreachable!()
+            };
+            raw.insert(b"pieces".to_vec(), value);
+            let bytes = ace_wire::transport::encode_transport(&Bencode::Dict(raw));
+            assert!(matches!(
+                playback_from_transport(&bytes),
+                Err(ResolveError::Transport(_))
+            ));
+            assert!(vod_info_from_transport(&bytes).is_err());
+            assert!(stream_info_from_transport(&bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn any_multifile_marker_is_rejected_without_live_or_single_file_fallback() {
+        use ace_wire::bencode::Bencode;
+        for value in [
+            Bencode::List(vec![]),
+            Bencode::Int(0),
+            Bencode::Bytes(vec![]),
+            Bencode::Dict(Default::default()),
+        ] {
+            for with_pieces in [false, true] {
+                let Bencode::Dict(mut raw) =
+                    decode_transport(&vod_transport(20, Some(16_384), false))
+                        .unwrap()
+                        .raw
+                else {
+                    unreachable!()
+                };
+                if !with_pieces {
+                    raw.remove(b"pieces".as_slice());
+                }
+                raw.insert(b"files".to_vec(), value.clone());
+                let bytes = ace_wire::transport::encode_transport(&Bencode::Dict(raw));
+                assert!(matches!(
+                    playback_from_transport(&bytes),
+                    Err(ResolveError::Transport(_))
+                ));
+                assert!(vod_info_from_transport(&bytes).is_err());
+                assert!(stream_info_from_transport(&bytes).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn vod_info_rejects_missing_length() {
-        let tf = vod_transport(20, None, false);
-        assert!(matches!(
-            vod_info_from_transport(&tf),
-            Err(ResolveError::Transport(_))
-        ));
+        for length in [None, Some(0), Some(-1)] {
+            let tf = vod_transport(20, length, false);
+            assert!(matches!(
+                vod_info_from_transport(&tf),
+                Err(ResolveError::Transport(_))
+            ));
+        }
     }
 
     #[test]

@@ -92,6 +92,12 @@ Environment variables parsed by the daemon include:
   memory-safety bound, not the primary cut mechanism: segments normally cut on a keyframe once
   the target duration elapses, so the ceiling must comfortably hold one target-duration segment
   of a peaky high-bitrate stream (a 2160p HEVC GOP can burst well past its average).
+- `OUTPACE_MANAGED_HLS` - opt-in bounded HTTP origin-HLS relay, default `false`.
+  Accepts `1`/`true` and `0`/`false`; invalid values fail startup. Applies after
+  descriptor resolution on native/compatibility playback routes. It does not add
+  peer transport, native audio conversion or replay to origin HLS. See
+  [managed origin HLS](source-resolution.md#managed-origin-hls-opt-in) for fixed
+  memory, duration, URL and format limits.
 - `OUTPACE_HLS_WINDOW_SEGMENTS` - retained HLS live window size, default `8`.
 - `OUTPACE_HLS_SEGMENT_DURATION_MS` - requested PCR-timed HLS segment duration, default `5000`.
 - `OUTPACE_HLS_STARTUP_SEGMENTS` - completed segments retained before a new HLS playlist request

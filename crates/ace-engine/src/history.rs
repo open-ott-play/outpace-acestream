@@ -330,20 +330,52 @@ impl HistoryStore {
         if back_ms == 0 {
             return Err(HlsHistoryError::InvalidTarget);
         }
+        let last = self.current_head()?;
+        let target = last
+            .end_ms
+            .checked_sub(back_ms)
+            .ok_or(HlsHistoryError::Unavailable)?;
+        self.snapshot_at(target, last)
+    }
+
+    /// Capture from an absolute position on this packager's media-duration timeline.
+    /// The target is not a wall-clock timestamp and does not move with the live head.
+    pub(crate) fn prepare_at(
+        &mut self,
+        position_ms: u64,
+        now: Instant,
+    ) -> Result<HlsHistorySnapshot, HlsHistoryError> {
+        if self.config.max_seconds == 0 {
+            return Err(HlsHistoryError::Disabled);
+        }
+        self.prune(now);
+        let last = self.current_head()?;
+        // The completed head is an exclusive boundary: no media exists at/after it.
+        if position_ms >= last.end_ms {
+            return Err(HlsHistoryError::Unavailable);
+        }
+        self.snapshot_at(position_ms, last)
+    }
+
+    fn current_head(&self) -> Result<&Segment, HlsHistoryError> {
         let last = self.segments.back().ok_or(HlsHistoryError::NotReady)?;
         // If growth was refused, the old retained tail is not the live edge.
         if Some(last.seq) != self.previous_seq {
             return Err(HlsHistoryError::Unavailable);
         }
-        let target = last
-            .end_ms
-            .checked_sub(back_ms)
-            .ok_or(HlsHistoryError::Unavailable)?;
+        Ok(last)
+    }
+
+    fn snapshot_at(
+        &self,
+        position_ms: u64,
+        last: &Segment,
+    ) -> Result<HlsHistorySnapshot, HlsHistoryError> {
         let first = self
             .segments
             .iter()
             .rev()
-            .find(|s| s.start_ms <= target && s.independent)
+            .find(|s| s.start_ms <= position_ms && s.independent)
             .ok_or(HlsHistoryError::Unavailable)?;
         let snapshot = HlsHistorySnapshot {
             first_seq: first.seq,
@@ -471,6 +503,77 @@ mod tests {
         assert!(before.ends_with("#EXT-X-ENDLIST\n"));
         assert!(before.contains("#EXT-X-START:TIME-OFFSET=0.000"));
         assert_eq!(store.segment(&view, 3, now), Err(HlsHistoryError::Gone));
+    }
+
+    #[test]
+    fn absolute_position_stays_stable_as_the_completed_head_advances() {
+        let now = Instant::now();
+        let mut store = HistoryStore::new(config(), HistoryBudget::new(2048));
+        push(&mut store, 0, true, now);
+        push(&mut store, 1, false, now);
+        push(&mut store, 2, true, now);
+        let view = store.prepare_at(7500, now).unwrap();
+        assert_eq!(
+            (view.first_seq, view.last_seq, view.start_ms, view.end_ms),
+            (0, 2, 0, 15000)
+        );
+        let playlist = store.playlist(&view, "/synthetic", now).unwrap();
+
+        push(&mut store, 3, true, now);
+        let later = store.prepare_at(7500, now).unwrap();
+        assert_eq!(
+            (
+                later.first_seq,
+                later.last_seq,
+                later.start_ms,
+                later.end_ms
+            ),
+            (0, 3, 0, 20000)
+        );
+        assert_eq!(
+            store
+                .prepare(Duration::from_millis(7500), now)
+                .unwrap()
+                .first_seq,
+            2
+        );
+        assert_eq!(store.playlist(&view, "/synthetic", now).unwrap(), playlist);
+        assert_eq!(store.prepare_at(0, now).unwrap().first_seq, 0);
+        assert_eq!(store.prepare_at(19_999, now).unwrap().first_seq, 3);
+        for position in [20_000, 20_001, u64::MAX] {
+            assert_eq!(
+                store.prepare_at(position, now),
+                Err(HlsHistoryError::Unavailable)
+            );
+        }
+    }
+
+    #[test]
+    fn absolute_position_rejects_expiry_holes_and_unretained_head() {
+        let now = Instant::now();
+        let mut store = HistoryStore::new(config(), HistoryBudget::new(2048));
+        assert_eq!(store.prepare_at(0, now), Err(HlsHistoryError::NotReady));
+        push(&mut store, 0, true, now);
+        push(&mut store, 2, true, now);
+        assert_eq!(
+            store.prepare_at(1000, now),
+            Err(HlsHistoryError::Unavailable)
+        );
+        let view = store.prepare_at(5000, now).unwrap();
+        assert_eq!(view.first_seq, 2);
+        store.push(3, Bytes::from_static(b"tiny"), 1025, 5.0, false, true, now);
+        assert_eq!(
+            store.prepare_at(5000, now),
+            Err(HlsHistoryError::Unavailable)
+        );
+        assert!(store.playlist(&view, "/synthetic", now).is_ok());
+        assert_eq!(
+            store.prepare_at(5000, now + Duration::from_secs(61)),
+            Err(HlsHistoryError::NotReady)
+        );
+
+        let mut disabled = HistoryStore::new(HlsHistoryConfig::default(), HistoryBudget::new(2048));
+        assert_eq!(disabled.prepare_at(0, now), Err(HlsHistoryError::Disabled));
     }
     #[test]
     fn holes_unavailable_and_expired_views_are_never_truncated() {

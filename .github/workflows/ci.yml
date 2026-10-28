@@ -143,3 +143,6 @@ jobs:
 
       - name: Retained replay with decoded media and independent viewers
         run: cargo test -p ace-engine --test media_history --locked generated_media_rewinds_decodes_and_returns_live_without_moving_another_viewer -- --ignored --exact --nocapture
+
+      - name: Managed origin HLS with decoded TS and fMP4 media
+        run: cargo test -p ace-engine --lib --locked origin_hls::tests::generated_origin_hls_ts_and_fmp4_decode -- --ignored --exact --nocapture

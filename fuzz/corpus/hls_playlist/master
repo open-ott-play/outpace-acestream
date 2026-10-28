@@ -1,0 +1,4 @@
+#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="Audio",URI="audio.m3u8?token=synthetic"
+#EXT-X-STREAM-INF:BANDWIDTH=123456,AUDIO="a"
+video.m3u8

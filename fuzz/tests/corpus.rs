@@ -4,11 +4,12 @@ type Target = (&'static str, fn(&[u8]));
 
 #[test]
 fn replay_committed_synthetic_inputs() {
-    let targets: [Target; 4] = [
+    let targets: [Target; 5] = [
         ("metadata", outpace_fuzz::metadata),
         ("peer_frames", outpace_fuzz::peer_frames),
         ("peer_extensions", outpace_fuzz::peer_extensions),
         ("media_resync", outpace_fuzz::media_resync),
+        ("hls_playlist", outpace_fuzz::hls_playlist),
     ];
     for (name, target) in targets {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -33,6 +34,19 @@ fn replay_committed_synthetic_inputs() {
 fn positive_controls_reach_accepted_paths() {
     use ace_wire::bencode::Bencode;
     use ace_wire::message::PeerMessage;
+    for seed in [
+        include_bytes!("../corpus/hls_playlist/master").as_slice(),
+        include_bytes!("../corpus/hls_playlist/fmp4-ranges").as_slice(),
+        include_bytes!("../corpus/hls_playlist/discontinuity-sequence").as_slice(),
+    ] {
+        let playlist = ace_media::hls_input::Playlist::parse(
+            seed,
+            std::time::Duration::from_secs(6 * 60 * 60),
+        )
+        .unwrap();
+        assert!(!playlist.references().is_empty());
+        outpace_fuzz::hls_playlist(seed);
+    }
     let metadata = include_bytes!("../corpus/metadata/single-piece");
     assert!(ace_wire::metainfo::decode_metainfo(metadata).is_ok());
     assert!(Bencode::parse(metadata).is_ok());

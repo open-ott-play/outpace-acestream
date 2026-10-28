@@ -24,6 +24,11 @@
       "name": "media-resync", "engine": "libfuzzer",
       "command": [".fuzz-build/bin/media_resync", "-max_len=16384"],
       "seconds": 60, "corpus": "fuzz/corpus/media_resync"
+    },
+    {
+      "name": "hls-playlist", "engine": "libfuzzer",
+      "command": [".fuzz-build/bin/hls_playlist", "-max_len=16384"],
+      "seconds": 60, "corpus": "fuzz/corpus/hls_playlist"
     }
   ]
 }

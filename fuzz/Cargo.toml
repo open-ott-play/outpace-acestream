@@ -51,3 +51,11 @@ test = false
 doc = false
 bench = false
 required-features = ["fuzzing"]
+
+[[bin]]
+name = "hls_playlist"
+path = "fuzz_targets/hls_playlist.rs"
+test = false
+doc = false
+bench = false
+required-features = ["fuzzing"]

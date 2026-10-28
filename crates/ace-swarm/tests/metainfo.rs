@@ -58,11 +58,23 @@ fn raw_metainfo_is_vod_input_and_not_live_input() {
     assert_eq!(vod.piece_length, 16_384);
     assert_eq!(vod.total_length, 16_385);
     assert_eq!(vod.piece_hashes, vec![[0xA5; 20], [0x5A; 20]]);
+    assert_eq!(vod.filename.as_deref(), Some("synthetic"));
     assert_eq!(
         vod.peer_protocol,
         ace_wire::handshake::HandshakeProtocol::BitTorrent
     );
     assert!(stream_info_from_transport(RAW).is_err());
+}
+
+#[test]
+fn disk_envelope_preserves_the_same_advisory_filename_and_piece_identity() {
+    let raw = vod_info_from_transport(RAW).unwrap();
+    let disk = vod_info_from_transport(include_bytes!(
+        "../../../tests/vectors/metainfo/disk-envelope-unsorted.acestream"
+    ))
+    .unwrap();
+    assert_eq!(disk, raw);
+    assert_eq!(disk.filename.as_deref(), Some("synthetic"));
 }
 
 #[test]
@@ -97,6 +109,7 @@ fn legacy_encrypted_live_and_vod_transports_keep_their_classification() {
     let wrapped_vod = encrypted_transport(&vod);
     let vod_info = vod_info_from_transport(&wrapped_vod).unwrap();
     assert_eq!(vod_info.total_length, 16_385);
+    assert_eq!(vod_info.filename, None, "legacy titles are not filenames");
     assert_eq!(
         vod_info.peer_protocol,
         ace_wire::handshake::HandshakeProtocol::AceStream

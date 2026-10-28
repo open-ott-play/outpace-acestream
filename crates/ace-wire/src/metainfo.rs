@@ -16,11 +16,15 @@ const BLOCK_LENGTH: u64 = 16_384;
 const MAX_PIECE_LENGTH: u64 = 8 * 1_048_576;
 const MAX_TRACKERS: usize = 128;
 const MAX_TRACKER_BYTES: usize = 2_048;
+const MAX_FILENAME_BYTES: usize = 4_096;
 
 /// Validated geometry, piece integrity and discovery data for a single-file VOD.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Metainfo {
     pub infohash: [u8; 20],
+    /// Advisory single-file `info.name`, when it is bounded, nonempty UTF-8 text.
+    /// This is display metadata, not a local filesystem path or a MIME guarantee.
+    pub filename: Option<String>,
     pub piece_length: u64,
     pub total_length: u64,
     pub piece_hashes: Vec<[u8; 20]>,
@@ -74,11 +78,26 @@ pub fn decode_metainfo(bytes: &[u8]) -> Result<Metainfo> {
         .ok_or(WireError::Invalid("metainfo missing info span"))?;
     Ok(Metainfo {
         infohash: Sha1::digest(&bytes[span]).into(),
+        filename: advisory_filename(info),
         piece_length,
         total_length,
         piece_hashes: pieces.as_chunks::<20>().0.to_vec(),
         trackers: trackers(&root)?,
     })
+}
+
+fn advisory_filename(info: &Bencode) -> Option<String> {
+    let bytes = info.get(b"name")?.as_bytes()?;
+    if bytes.is_empty() || bytes.len() > MAX_FILENAME_BYTES {
+        return None;
+    }
+    let name = std::str::from_utf8(bytes).ok()?;
+    if name.chars().any(char::is_control) {
+        return None;
+    }
+    // Never repair or normalize advisory metadata: its absence does not invalidate
+    // otherwise usable geometry, and identity always covers the original info bytes.
+    Some(name.to_owned())
 }
 
 fn positive(info: &Bencode, key: &[u8]) -> Result<u64> {

@@ -67,10 +67,47 @@ fn decodes_binary_piece_hashes_and_hashes_the_original_unsorted_info_span() {
 
     assert_eq!(metainfo.infohash, expected);
     assert_ne!(metainfo.infohash, reencoded_hash);
+    assert_eq!(metainfo.filename.as_deref(), Some("synthetic"));
     assert_eq!(metainfo.piece_length, 16_384);
     assert_eq!(metainfo.total_length, 16_385);
     assert_eq!(metainfo.piece_hashes, vec![[0xA5; 20], [0x5A; 20]]);
     assert_eq!(metainfo.trackers, vec!["https://tracker.invalid/announce"]);
+}
+
+#[test]
+fn advisory_filename_is_exact_bounded_utf8_without_affecting_identity_or_geometry() {
+    let at_limit = "я".repeat(2_048);
+    for (name, expected) in [
+        (
+            Some(bstr("  Synthetic — проверка.mp4  ".as_bytes())),
+            Some("  Synthetic — проверка.mp4  ".to_owned()),
+        ),
+        (Some(bstr(at_limit.as_bytes())), Some(at_limit)),
+        (None, None),
+        (Some(int(1)), None),
+        (Some(bstr(b"")), None),
+        (Some(bstr(&[0xff])), None),
+        (Some(bstr(b"synthetic\0.ts")), None),
+        (Some(bstr(b"synthetic\n.ts")), None),
+        (Some(bstr("я".repeat(2_049).as_bytes())), None),
+    ] {
+        let mut entries: Vec<(&[u8], Vec<u8>)> = vec![
+            (b"length", int(1)),
+            (b"piece length", int(16_384)),
+            (b"pieces", bstr(&[0x11; 20])),
+        ];
+        if let Some(name) = name {
+            entries.push((b"name", name));
+        }
+        let raw_info = dict(&entries);
+        let expected_hash: [u8; 20] = Sha1::digest(&raw_info).into();
+        let decoded = decode_metainfo(&dict(&[(b"info", raw_info)])).unwrap();
+        assert_eq!(decoded.filename, expected);
+        assert_eq!(decoded.infohash, expected_hash);
+        assert_eq!(decoded.total_length, 1);
+        assert_eq!(decoded.piece_length, 16_384);
+        assert_eq!(decoded.piece_hashes, vec![[0x11; 20]]);
+    }
 }
 
 #[test]

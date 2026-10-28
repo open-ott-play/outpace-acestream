@@ -16,6 +16,7 @@ Stream product. The executable remains `outpace`; configuration uses `OUTPACE_*`
 
 [v0.9.0 release](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.0)
 · [0.9.0 changes](docs/releases/v0.9.0.md)
+· [0.9.1-beta.5 changes](docs/releases/v0.9.1-beta.5.md)
 · [Previous stable v0.8.1](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.8.1)
 · [Beta.8 history](docs/releases/v0.9.0-beta.8.md)
 · [Retained replay](docs/timeshift.md)
@@ -30,7 +31,7 @@ for working navigation and diagrams. The matching source archives contain the
 documentation for the build they accompany.
 
 Every `Release` workflow run with `channel=rc` automatically runs the normal
-checks and fuzzes four production parser boundaries. The RC gate requires all
+checks and fuzzes five production parser boundaries. The RC gate requires all
 stages and matching fuzz evidence to pass. See the [RC workflow](docs/ci-cd.md#rc-source-pipeline)
 and [targets, evidence and limits](docs/fuzzing.md); source RC checks do not replace
 product archive or runtime acceptance.

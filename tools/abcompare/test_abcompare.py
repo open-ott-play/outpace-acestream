@@ -316,7 +316,7 @@ class CaptureTests(unittest.TestCase):
                     return {'status': 'playing'}
                 clock[0] = .31
                 client.timeout(maximum)
-                self.fail('the elapsed capture deadline must cancel the request')
+                raise AssertionError('the elapsed capture deadline must cancel the request')
 
             client.get_json = get_json
             client.poller('x', {'stat_url': 'http://127.0.0.1/status'})

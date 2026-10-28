@@ -296,14 +296,27 @@ async fn identical_reload_and_sliding_overlap_preserve_media_and_map_urls() {
 
 #[tokio::test]
 async fn refresh_prevents_older_inflight_body_from_repopulating_the_cache() {
+    inflight_body_during_refresh(true).await;
+}
+
+#[tokio::test]
+async fn identical_refresh_preserves_inflight_body_cache_publication() {
+    inflight_body_during_refresh(false).await;
+}
+
+async fn inflight_body_during_refresh(changed: bool) {
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let reads = Arc::new(AtomicUsize::new(0));
     let notify = started.clone();
     let unblock = release.clone();
     let count = reads.clone();
+    let playlists = AtomicUsize::new(0);
     let origin = Fixture::new(move |path, _| {
         if path == "/playlist" {
+            if playlists.fetch_add(1, Ordering::SeqCst) != 0 && changed {
+                return manifest("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:2\n#EXTINF:1,\nsegment.ts\n");
+            }
             return manifest("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:1,\nsegment.ts\n");
         }
         if count.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -337,16 +350,167 @@ async fn refresh_prevents_older_inflight_body_from_repopulating_the_cache() {
     drop(refreshed);
     release.notify_one();
     assert_eq!(old.await.unwrap().unwrap().body, "old");
-    assert!(relay.cache.lock().unwrap().entries.is_empty());
+    assert_eq!(relay.cache.lock().unwrap().entries.is_empty(), changed);
     assert_eq!(
         relay
             .resource(token(&playback), resource_id(&segment), None)
             .await
             .unwrap()
             .body,
-        "new"
+        if changed { "new" } else { "old" }
     );
-    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    assert_eq!(reads.load(Ordering::SeqCst), if changed { 2 } else { 1 });
+}
+
+#[tokio::test]
+async fn identical_reload_reuses_fresh_media_without_extending_its_cache_ttl() {
+    let changed = Arc::new(AtomicBool::new(false));
+    let state = changed.clone();
+    let origin = Fixture::new(move |path, _| match path {
+        "/playlist" if state.load(Ordering::SeqCst) => {
+            manifest("#EXTM3U\n# changed metadata\n#EXTINF:1,\nsegment.ts\n")
+        }
+        "/playlist" => manifest("#EXTM3U\n#EXTINF:1,\nsegment.ts\n"),
+        _ => media(b"cacheable", "max-age=30"),
+    })
+    .await;
+    let relay = relay();
+    let playback = relay.start(&origin.url("/playlist")).await.unwrap();
+    let playlist = relay.resource(token(&playback), "0", None).await.unwrap();
+    let segment = uris(&playlist.body).remove(0);
+    drop(playlist);
+    drop(
+        relay
+            .resource(token(&playback), resource_id(&segment), None)
+            .await
+            .unwrap(),
+    );
+    let key = CacheKey {
+        token: token(&playback).into(),
+        id: numeric_id(&segment),
+        range: None,
+    };
+    let expires = relay.cache.lock().unwrap().entries[&key].expires;
+    for _ in 0..3 {
+        let playlist = relay.resource(token(&playback), "0", None).await.unwrap();
+        assert_eq!(uris(&playlist.body)[0], segment);
+        drop(playlist);
+        drop(
+            relay
+                .resource(token(&playback), resource_id(&segment), None)
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(origin.count("/segment.ts"), 1);
+    assert_eq!(relay.cache.lock().unwrap().entries[&key].expires, expires);
+    changed.store(true, Ordering::SeqCst);
+    let playlist = relay.resource(token(&playback), "0", None).await.unwrap();
+    assert_eq!(uris(&playlist.body)[0], segment);
+    drop(playlist);
+    assert!(relay.cache.lock().unwrap().entries.is_empty());
+    drop(
+        relay
+            .resource(token(&playback), resource_id(&segment), None)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(origin.count("/segment.ts"), 2);
+}
+
+#[tokio::test]
+async fn identical_manifest_at_a_changed_redirect_base_has_distinct_cached_resources() {
+    let calls = AtomicUsize::new(0);
+    let origin = Fixture::new(move |path, _| match path {
+        "/entry" => {
+            let target = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                "/a/playlist"
+            } else {
+                "/b/playlist"
+            };
+            (StatusCode::FOUND, [(axum::http::header::LOCATION, target)]).into_response()
+        }
+        "/a/playlist" | "/b/playlist" => manifest("#EXTM3U\n#EXTINF:1,\nsegment.ts\n"),
+        "/a/segment.ts" => media(b"first", "max-age=30"),
+        "/b/segment.ts" => media(b"second", "max-age=30"),
+        _ => StatusCode::NOT_FOUND.into_response(),
+    })
+    .await;
+    let relay = relay();
+    let playback = relay.start(&origin.url("/entry")).await.unwrap();
+    let first = relay.resource(token(&playback), "0", None).await.unwrap();
+    let old_uri = uris(&first.body).remove(0);
+    drop(first);
+    assert_eq!(
+        relay
+            .resource(token(&playback), resource_id(&old_uri), None)
+            .await
+            .unwrap()
+            .body,
+        "first"
+    );
+    let second = relay.resource(token(&playback), "0", None).await.unwrap();
+    let new_uri = uris(&second.body).remove(0);
+    drop(second);
+    assert_ne!(old_uri, new_uri);
+    assert_eq!(
+        relay
+            .resource(token(&playback), resource_id(&new_uri), None)
+            .await
+            .unwrap()
+            .body,
+        "second"
+    );
+    assert_eq!(origin.count("/a/segment.ts"), 1);
+    assert_eq!(origin.count("/b/segment.ts"), 1);
+}
+
+#[tokio::test]
+async fn unsupported_daterange_does_not_change_managed_registry_or_generation() {
+    let relay = relay();
+    let playback = relay
+        .start("https://example.invalid/playlist")
+        .await
+        .unwrap();
+    let session = relay
+        .sessions
+        .lock()
+        .unwrap()
+        .get(token(&playback))
+        .cloned()
+        .unwrap();
+    let base = FetchUrl::parse_source("https://example.invalid/playlist", relay.policy).unwrap();
+    relay
+        .rewrite(
+            token(&playback),
+            &session,
+            0,
+            &base,
+            b"#EXTM3U\n#EXTINF:1,\na.ts\n",
+        )
+        .unwrap();
+    let before = {
+        let inner = session.inner.lock().unwrap();
+        (
+            inner.next_id,
+            inner.resources[&0].playlist.refresh,
+            inner.resources[&0].playlist.fingerprint,
+        )
+    };
+    let source = b"#EXTM3U\n#EXT-X-DATERANGE:ID=\"event\",START-DATE=\"2026-01-01T00:00:00Z\",X-ASSET-LIST=\"https://example.invalid/list.json\"\n#EXTINF:1,\nb.ts\n";
+    assert!(matches!(
+        relay.rewrite(token(&playback), &session, 0, &base, source),
+        Err(OriginError::UnsupportedPlaylist)
+    ));
+    let after = {
+        let inner = session.inner.lock().unwrap();
+        (
+            inner.next_id,
+            inner.resources[&0].playlist.refresh,
+            inner.resources[&0].playlist.fingerprint,
+        )
+    };
+    assert_eq!(before, after);
 }
 
 #[tokio::test]

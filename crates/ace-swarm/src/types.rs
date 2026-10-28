@@ -47,6 +47,9 @@ impl StreamInfo {
 pub struct VodInfo {
     /// 20-byte BitTorrent infohash of the VOD swarm.
     pub infohash: [u8; 20],
+    /// Advisory filename established by standard single-file metainfo, if present.
+    /// Legacy descriptor titles and media MIME types are not inferred from it.
+    pub filename: Option<String>,
     /// Peer handshake selected by the descriptor format, never by retrying a failed exchange.
     pub peer_protocol: ace_wire::handshake::HandshakeProtocol,
     /// Bytes per piece (e.g. 131_072).

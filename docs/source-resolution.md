@@ -77,6 +77,11 @@ media stored indefinitely; the origin must still supply requested bytes.
 Stop and expiry cancel
 pending work and make its URLs unavailable.
 
+Identical playlist reloads preserve fresh media cache entries. A fingerprint of
+the playlist bytes and rewritten resource identities still invalidates the cache
+when a playlist or resolved origin changes. This does not renew media freshness:
+the original response headers and thirty-second ceiling continue to apply.
+
 Local playlists use `.m3u8`; supported media filename suffixes are retained as
 validated hints for normal FFmpeg extension checks. Unknown or extensionless origin
 media remains opaque and is not qualified for players requiring filename extensions.
@@ -86,6 +91,8 @@ admissions; operational idle checks must examine it as well as `/streams`.
 
 Encrypted keys, content steering, variable substitution and low-latency HLS parts,
 preload hints, delta updates and server controls are explicitly unsupported.
+Ordinary date ranges are preserved, but resource-bearing interstitial date ranges
+are rejected rather than exposing unmanaged asset URLs to the player.
 This is an HTTP origin relay, not Ace's hybrid HLS-over-P2P transport. Its limits
 and errors are described in the [HTTP compatibility contract](protocol/compat-matrix.md).
 
@@ -101,8 +108,13 @@ accepted for ordinary supported descriptors. Malformed legacy `pieces` and
 multi-file descriptors cannot fall through as live. Single-file VOD piece counts
 must agree with the verified length and geometry.
 
-`get_media_files` now carries `type: live` or `type: vod` only after classification,
-and verified single-file VOD `size`. Unknown filenames and MIME are omitted. HLS
+`get_media_files` carries `type: live` or `type: vod` only after classification,
+and verified single-file VOD `size`. Standard single-file metainfo can also supply
+its advisory `info.name` as `filename`: nonempty UTF-8, at most 4,096 bytes, without
+control characters. Invalid or missing names are omitted without changing the
+original infohash or piece geometry. The name is display metadata, not a trusted
+filesystem path. Legacy live titles are not filenames, and MIME is not inferred
+from an extension. Unknown filenames and MIME remain omitted. HLS
 and unresolved identities still have no invented file table. Consequently, an
 Android discovery-first flow that requires a nonempty HLS file list, or an external
 player path that requires MIME, remains unqualified. A successful direct playback

@@ -13,6 +13,52 @@ use ace_wire::ut_metadata::{self, MetadataMessage};
 
 pub const MAX_INPUT: usize = 16 * 1024;
 
+/// Exercise the same bounded parser and byte-span rewriting used by the origin relay.
+/// No URL is resolved or fetched, and replacement text cannot enlarge an input line.
+pub fn hls_playlist(data: &[u8]) {
+    use ace_media::hls_input::{Playlist, MAX_REFERENCES};
+    use std::time::Duration;
+
+    if data.len() > MAX_INPUT {
+        return;
+    }
+    let cap = Duration::from_secs(6 * 60 * 60);
+    let parsed = Playlist::parse(data, cap);
+    assert_eq!(parsed, Playlist::parse(data, cap));
+    if let Ok(playlist) = parsed {
+        let count = playlist.references().len();
+        assert!(count <= MAX_REFERENCES);
+        assert!(playlist.retention() <= cap);
+        let timeline = playlist.media_timeline();
+        let retention = playlist.retention();
+        let unchanged: Vec<_> = playlist
+            .references()
+            .iter()
+            .map(|r| r.uri.clone())
+            .collect();
+        let original = playlist.render(&unchanged).unwrap();
+        assert_eq!(original.as_bytes(), data);
+
+        let shorter = vec!["x".to_owned(); count];
+        let rewritten = Playlist::parse(data, cap)
+            .unwrap()
+            .render(&shorter)
+            .unwrap();
+        assert!(rewritten.len() <= data.len());
+        let reparsed = Playlist::parse(rewritten.as_bytes(), cap).unwrap();
+        assert_eq!(reparsed.references().len(), count);
+        assert_eq!(reparsed.media_timeline(), timeline);
+        assert_eq!(reparsed.retention(), retention);
+        assert!(reparsed.references().iter().all(|r| r.uri == "x"));
+
+        let wrong_count = vec!["x".to_owned(); count + 1];
+        assert!(Playlist::parse(data, cap)
+            .unwrap()
+            .render(&wrong_count)
+            .is_err());
+    }
+}
+
 pub fn metadata(data: &[u8]) {
     if data.len() > MAX_INPUT {
         return;
@@ -35,6 +81,10 @@ pub fn metadata(data: &[u8]) {
         );
         assert!(value.piece_hashes.len() <= data.len() / 20);
         assert!(value.trackers.len() <= 128);
+        if let Some(name) = &value.filename {
+            assert!(!name.is_empty() && name.len() <= 4096);
+            assert!(!name.chars().any(char::is_control));
+        }
         // Never allocate from advertised geometry or fetch any tracker.
         assert_eq!(decode_metainfo(data), Ok(value));
     }

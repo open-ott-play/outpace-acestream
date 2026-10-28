@@ -174,6 +174,7 @@ pub fn vod_info_from_transport(bytes: &[u8]) -> Result<VodInfo, ResolveError> {
         validate_geometry(metainfo.piece_length, DEFAULT_CHUNK_LENGTH)?;
         return Ok(VodInfo {
             infohash: metainfo.infohash,
+            filename: metainfo.filename,
             peer_protocol: ace_wire::handshake::HandshakeProtocol::BitTorrent,
             piece_length: metainfo.piece_length,
             chunk_length: DEFAULT_CHUNK_LENGTH,
@@ -205,6 +206,7 @@ fn vod_info_from_descriptor(d: TransportDescriptor) -> Result<VodInfo, ResolveEr
     Ok(VodInfo {
         infohash: infohash_of_descriptor(&d.raw)
             .map_err(|_| ResolveError::Transport("infohash failed"))?,
+        filename: None,
         peer_protocol: ace_wire::handshake::HandshakeProtocol::AceStream,
         piece_length: d.piece_length,
         chunk_length: d.chunk_length,

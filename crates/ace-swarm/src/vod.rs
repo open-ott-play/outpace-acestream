@@ -247,6 +247,7 @@ mod seeder_tests {
         }
         let info = VodInfo {
             infohash: [0x42; 20],
+            filename: None,
             peer_protocol: Default::default(),
             piece_length,
             chunk_length,

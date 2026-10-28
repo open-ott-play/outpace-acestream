@@ -10,6 +10,7 @@
 
 pub mod audio;
 pub mod hls;
+pub mod hls_input;
 pub mod mpegts;
 
 /// Errors from media framing.

@@ -110,6 +110,8 @@ pub enum ResolvedContent {
         is_live: bool,
         /// Only a verified single-file VOD descriptor establishes a finite size.
         total_length: Option<u64>,
+        /// Advisory filename from standard single-file metainfo, when known.
+        filename: Option<String>,
     },
     Hls {
         content_id: Option<String>,
@@ -126,12 +128,14 @@ impl ResolvedContent {
                 content_id,
                 is_live: true,
                 total_length: None,
+                filename: None,
             },
             ResolvedTransport::Vod(info) => Self::Swarm {
                 infohash: infohash_hex(&info.infohash),
                 content_id,
                 is_live: false,
                 total_length: Some(info.total_length),
+                filename: info.filename,
             },
             ResolvedTransport::Hls {
                 manifest_url,
@@ -166,7 +170,7 @@ pub fn resolve_offline(sel: &Selector) -> Option<Result<ResolvedContent, String>
     }
 }
 
-/// `get_version` result: the crate version, a monotonic integer code, and the target OS.
+/// `get_version` result: the crate version, a packed base-version integer code, and the target OS.
 pub fn version_result() -> Value {
     let version = env!("CARGO_PKG_VERSION");
     json!({
@@ -177,13 +181,18 @@ pub fn version_result() -> Value {
 }
 
 /// Encode `MAJOR.MINOR.PATCH` as `MAJOR*10000 + MINOR*100 + PATCH` for clients that gate on an
-/// integer version code. Non-numeric or missing components contribute 0.
+/// integer version code. Prerelease/build suffixes do not change the base version.
+/// Non-numeric or missing components contribute 0; unrepresentable codes saturate.
 fn version_code(version: &str) -> u64 {
-    let mut parts = version.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
+    let core = version.split(['-', '+']).next().unwrap_or("");
+    let mut parts = core.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
     let major = parts.next().unwrap_or(0);
     let minor = parts.next().unwrap_or(0);
     let patch = parts.next().unwrap_or(0);
-    major * 10_000 + minor * 100 + patch
+    major
+        .saturating_mul(10_000)
+        .saturating_add(minor.saturating_mul(100))
+        .saturating_add(patch)
 }
 
 /// `get_status` result: engine liveness plus how many sessions are currently active.
@@ -262,7 +271,7 @@ pub fn content_id_result(content_id: &str) -> Value {
 }
 
 /// `get_media_files` result: a classified single-file swarm reports its known type and finite
-/// VOD size. Descriptors do not establish a media MIME or filename, so neither is invented.
+/// VOD size. Standard metainfo may also supply an advisory filename; MIME is not inferred.
 /// Unresolved identities and HLS descriptors do not establish a file list.
 /// `dump_transport_file` is intentionally unsupported (see the matrix).
 pub fn media_files_result(c: &ResolvedContent) -> Value {
@@ -275,6 +284,7 @@ pub fn media_files_result(c: &ResolvedContent) -> Value {
             infohash,
             is_live,
             total_length,
+            filename,
             ..
         } => {
             let mut file = json!({
@@ -286,6 +296,9 @@ pub fn media_files_result(c: &ResolvedContent) -> Value {
             });
             if let Some(length) = total_length {
                 file["size"] = json!(length);
+            }
+            if let Some(filename) = filename {
+                file["filename"] = json!(filename);
             }
             json!({ "infohash": infohash, "files": [file] })
         }
@@ -395,6 +408,17 @@ mod tests {
         assert_eq!(version_code("0.1.0"), 100);
         assert_eq!(version_code("1.2.3"), 10_203);
         assert_eq!(version_code("2.0"), 20_000);
+        for version in [
+            "0.9.1-beta.4",
+            "0.9.1-rc.1",
+            "0.9.1+build.7",
+            "0.9.1-beta.4+build.7",
+        ] {
+            assert_eq!(version_code(version), 901, "{version}");
+        }
+        assert_eq!(version_code("x.2.z"), 200);
+        assert_eq!(version_code(""), 0);
+        assert_eq!(version_code("18446744073709551615.2.3"), u64::MAX);
     }
 
     #[test]
@@ -421,6 +445,7 @@ mod tests {
             content_id: Some("cid".to_string()),
             is_live: true,
             total_length: None,
+            filename: None,
         };
         let v = analyze_result(&c);
         assert_eq!(v["infohash"], "aa".repeat(20));
@@ -436,6 +461,7 @@ mod tests {
             content_id: None,
             is_live: false,
             total_length: Some(123_456),
+            filename: None,
         };
         let v = media_files_result(&c);
         assert_eq!(v["infohash"], "bb".repeat(20));
@@ -537,6 +563,6 @@ mod transport_contract_tests {
         assert_eq!(file.content_type, "vod");
         assert_eq!(file.size, Some(length));
         assert!(file.mime.is_none());
-        assert!(file.filename.is_none());
+        assert_eq!(file.filename.as_deref(), Some("synthetic"));
     }
 }

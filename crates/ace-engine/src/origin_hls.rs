@@ -4,9 +4,11 @@
 //! in local playlists and excluded from diagnostics and resource selectors. The player owns
 //! rendition selection; this module retrieves and rewrites supported resources.
 
+use ace_media::hls_input::{self as playlist, PlaylistError, ResourceKind};
 use ace_swarm::http_fetch::{self, FetchError, FetchLimits, FetchPolicy, FetchUrl};
 use bytes::{Bytes, BytesMut};
 use futures::Stream;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -14,7 +16,6 @@ use std::time::Duration;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
-mod playlist;
 #[cfg(test)]
 mod tests;
 
@@ -29,11 +30,6 @@ const HARD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const BODY_SLICE: usize = 64 * 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum ResourceKind {
-    Playlist,
-    Media,
-}
 struct RequestedResource {
     url: FetchUrl,
     kind: ResourceKind,
@@ -93,6 +89,15 @@ impl std::fmt::Display for OriginError {
     }
 }
 impl std::error::Error for OriginError {}
+impl From<PlaylistError> for OriginError {
+    fn from(error: PlaylistError) -> Self {
+        match error {
+            PlaylistError::Invalid => Self::InvalidPlaylist,
+            PlaylistError::Unsupported => Self::UnsupportedPlaylist,
+            PlaylistError::TooLarge => Self::TooLarge,
+        }
+    }
+}
 impl From<FetchError> for OriginError {
     fn from(value: FetchError) -> Self {
         Self::Fetch(value)
@@ -166,6 +171,7 @@ struct PlaylistState {
     last_sequence: Option<u64>,
     epoch: u64,
     refresh: u64,
+    fingerprint: Option<[u8; 32]>,
     retention: Duration,
     media: HashSet<u64>,
 }
@@ -580,16 +586,16 @@ impl OriginHls {
         base: &FetchUrl,
         bytes: &[u8],
     ) -> Result<Bytes, OriginError> {
-        let playlist = playlist::Playlist::parse(bytes)?;
-        let mut refs = Vec::with_capacity(playlist.references.len());
-        for reference in &playlist.references {
+        let playlist = playlist::Playlist::parse(bytes, HARD_TIMEOUT)?;
+        let mut refs = Vec::with_capacity(playlist.references().len());
+        for reference in playlist.references() {
             refs.push((
                 base.join_reference(&reference.uri, self.policy)
                     .map_err(|_| OriginError::InvalidSource)?,
                 reference.kind,
             ));
         }
-        for (index, reference) in playlist.references.iter().enumerate() {
+        for (index, reference) in playlist.references().iter().enumerate() {
             if let Some(previous) = reference.implicit_from {
                 if refs[previous].0 != refs[index].0 {
                     return Err(OriginError::InvalidPlaylist);
@@ -608,7 +614,7 @@ impl OriginHls {
             return Err(OriginError::InvalidPlaylist);
         }
         let mut epoch = parent.playlist.epoch;
-        let timeline = playlist.media_timeline;
+        let timeline = playlist.media_timeline();
         if let Some((first, last)) = timeline {
             if parent
                 .playlist
@@ -621,12 +627,9 @@ impl OriginHls {
                 epoch = epoch.checked_add(1).ok_or(OriginError::TooLarge)?;
             }
         }
-        let refresh = parent
-            .playlist
-            .refresh
-            .checked_add(1)
-            .ok_or(OriginError::TooLarge)?;
-        let retention = parent.playlist.retention.max(playlist.retention);
+        let previous_refresh = parent.playlist.refresh;
+        let previous_fingerprint = parent.playlist.fingerprint;
+        let retention = parent.playlist.retention.max(playlist.retention());
         let previous_media = parent.playlist.media.clone();
         let owner = MediaOwner {
             playlist: parent_id,
@@ -690,6 +693,23 @@ impl OriginHls {
             })
             .collect();
         let rendered = playlist.render(&replacements)?;
+        // Fingerprint both the source and the planned local representation. Resolved
+        // URI changes (including a redirected relative base) change local resource IDs;
+        // byte-identical reloads preserve media cache generations and original TTLs.
+        let mut fingerprint = Sha256::new();
+        fingerprint.update((bytes.len() as u64).to_be_bytes());
+        fingerprint.update(bytes);
+        fingerprint.update((rendered.len() as u64).to_be_bytes());
+        fingerprint.update(rendered.as_bytes());
+        let fingerprint: [u8; 32] = fingerprint.finalize().into();
+        let changed = previous_fingerprint != Some(fingerprint);
+        let refresh = if changed {
+            previous_refresh
+                .checked_add(1)
+                .ok_or(OriginError::TooLarge)?
+        } else {
+            previous_refresh
+        };
         // Stage removal deadlines before admission: this update must not evict a
         // just-removed segment before the client's previously served playlist expires.
         let now = Instant::now();
@@ -785,6 +805,7 @@ impl OriginHls {
         }
         parent.playlist.epoch = epoch;
         parent.playlist.refresh = refresh;
+        parent.playlist.fingerprint = Some(fingerprint);
         parent.playlist.retention = retention;
         parent.playlist.media = current_media.clone();
         for id in required {
@@ -792,13 +813,13 @@ impl OriginHls {
                 resource.touched = tick;
             }
         }
-        if !remove.is_empty() || !current_media.is_empty() {
+        if !remove.is_empty() || (changed && !current_media.is_empty()) {
             self.cache.lock().unwrap().retain(|key, _| {
                 key.token != token
-                    || (!remove.contains(&key.id) && !current_media.contains(&key.id))
+                    || (!remove.contains(&key.id) && (!changed || !current_media.contains(&key.id)))
             });
         }
-        Ok(rendered)
+        Ok(Bytes::from(rendered))
     }
     fn purge(&self) {
         let now = Instant::now();

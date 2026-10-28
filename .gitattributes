@@ -3,3 +3,7 @@ LICENSE text eol=lf
 NOTICE text eol=lf
 AUTHORS.md text eol=lf
 tools/source/licenses/*.txt text eol=lf
+
+# Parser corpora preserve exact input bytes, including deliberate CRLF framing.
+fuzz/corpus/** -text
+fuzz/corpus/hls_playlist/discontinuity -diff

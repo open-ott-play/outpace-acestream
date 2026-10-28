@@ -22,12 +22,17 @@ tracker, joins a swarm, starts the daemon or tests a real stream.
   boundaries, ordered loss boundaries, bounded loss accounting, PCR field
   ranges and packet-preserving HLS segmentation.
 
+- **Origin HLS playlists:** the production bounded input parser, deterministic
+  classification, exact identity rewrites, replacement URI spans, timeline and
+  retention preservation. Resource-bearing interstitial tags are rejected; no
+  URI is resolved or fetched.
+
 The same target functions run against the committed corpus in ordinary CI.
 Positive controls ensure valid metainfo, frames, metadata messages, peer records
 and aligned media actually reach successful parse paths. Unexpected panics and
 assertion failures are findings; the harness does not suppress them.
 
-These four targets do not exercise the daemon's viewer leases, shared history
+These five targets do not exercise the daemon's viewer leases, shared history
 budget or runtime shutdown. Those stateful paths have separate deterministic
 `ace-engine` tests, including multi-store retention and listener cleanup after
 startup failure or cancellation. The generated-media integration test checks
@@ -36,7 +41,7 @@ replace these checks or qualify every possible playback sequence.
 
 ## Budgets and execution policy
 
-Each target accepts at most 16 KiB and has a 60-second mutation budget: four
+Each target accepts at most 16 KiB and has a 60-second mutation budget: five
 minutes in total, excluding setup. The shared runner owns the 10-second input
 timeout, 2 GiB RSS limit, process supervision, network isolation, corpus copies
 and evidence artifacts. Production parser bounds remain active. The media

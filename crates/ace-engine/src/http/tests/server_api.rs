@@ -39,6 +39,61 @@ async fn server_api_get_version_returns_the_result_envelope() {
     assert_eq!(json["result"]["platform"], std::env::consts::OS);
 }
 
+#[tokio::test(start_paused = true)]
+async fn server_api_get_status_counts_managed_hls_until_stop_or_expiry() {
+    let mut state = ace_compat_state(0);
+    let relay = crate::origin_hls::OriginHls::new(ace_swarm::http_fetch::FetchPolicy::default());
+    state.origin_hls = Some(relay.clone());
+    let assert_count = async |expected| {
+        for path in ["/server/api", "/webui/api/service"] {
+            let (status, json) = control_api_json(state.clone(), path, "method=get_status").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(json["error"], serde_json::Value::Null);
+            assert_eq!(json["result"]["active_sessions"], expected);
+            assert_eq!(
+                json["result"]["status"],
+                if expected == 0 { "idle" } else { "dl" }
+            );
+        }
+    };
+    assert_count(0).await;
+    // Admission is lazy and does not resolve DNS or fetch this synthetic URL.
+    let playback = relay
+        .start("https://origin.example.test/synthetic.m3u8")
+        .await
+        .unwrap();
+    assert_count(1).await;
+    let response = router(state.clone())
+        .oneshot(
+            Request::delete(playback.stop_url)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_count(0).await;
+    relay
+        .start("https://origin.example.test/synthetic.m3u8")
+        .await
+        .unwrap();
+    assert_count(1).await;
+    tokio::time::advance(std::time::Duration::from_secs(61)).await;
+    assert_count(0).await;
+
+    let _session = state
+        .manager
+        .get_or_start("fix", "synthetic-status")
+        .await
+        .unwrap();
+    assert_count(1).await;
+    relay
+        .start("https://origin.example.test/synthetic.m3u8")
+        .await
+        .unwrap();
+    assert_count(2).await;
+}
+
 #[tokio::test]
 async fn get_version_success_bytes_include_the_healthcheck_spacing_on_both_aliases() {
     for (path, query) in [

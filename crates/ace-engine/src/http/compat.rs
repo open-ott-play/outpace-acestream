@@ -863,7 +863,16 @@ pub(super) async fn server_api(
                 .expect("version JSON is serializable");
             return ([(header::CONTENT_TYPE, "application/json")], body).into_response();
         }
-        api::Method::GetStatus => api::ok(api::status_result(s.manager.list().await.len())),
+        api::Method::GetStatus => {
+            let swarm_sessions = s.manager.list().await.len();
+            let origin_sessions = s
+                .origin_hls
+                .as_ref()
+                .map_or(0, |relay| relay.active_count());
+            api::ok(api::status_result(
+                swarm_sessions.saturating_add(origin_sessions),
+            ))
+        }
         api::Method::GetNetworkConnectionStatus => api::ok(api::network_status_result(&s.networks)),
         // `get_content_id` only echoes an id the caller already gave; it can't derive one from a
         // bare infohash/url, so it never resolves.
@@ -1592,6 +1601,7 @@ mod origin_tests {
         .unwrap();
         let info = ace_swarm::types::VodInfo {
             infohash: [1; 20],
+            filename: None,
             peer_protocol: ace_wire::handshake::HandshakeProtocol::BitTorrent,
             piece_length: 16384,
             chunk_length: 16384,

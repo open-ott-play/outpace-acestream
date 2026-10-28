@@ -42,7 +42,7 @@ pub enum Command {
     Serve(ServeArgs),
     /// Create or resume a named broadcast and run its ingest server.
     Broadcast(BroadcastArgs),
-    /// Write a live MPEG-TS stream (or verified VOD with --vod) to stdout.
+    /// Write live MPEG-TS, verified VOD (--vod), or an origin HLS URL (--resolve) to stdout.
     Play(PlayArgs),
 }
 
@@ -84,6 +84,10 @@ pub struct PlayArgs {
     /// transport's SHA-1 hashes, and write the verified bytes to stdout (instead of a live TS).
     #[arg(long)]
     pub vod: bool,
+    /// Resolve an origin-HLS descriptor and write its exact manifest URL to stdout.
+    /// Does not fetch media or start a local session. Live/VOD swarm sources have no direct URL.
+    #[arg(long, conflicts_with = "vod")]
+    pub resolve: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,6 +273,20 @@ async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("outpace play: {}", args.input);
     eprintln!("outpace play: provider id {}", target.provider_id);
 
+    if args.resolve {
+        let source = provider
+            .resolve_playback(&target.provider_id)
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let url =
+            direct_hls_url(source).map_err(|error| std::io::Error::other(error.to_string()))?;
+        let mut stdout = tokio::io::stdout();
+        stdout.write_all(url.as_bytes()).await?;
+        stdout.write_all(b"\n").await?;
+        stdout.flush().await?;
+        return Ok(());
+    }
+
     if args.vod {
         eprintln!("outpace play: VOD download (verified) to stdout");
         let vod = provider
@@ -301,6 +319,22 @@ async fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
         stdout.flush().await?;
     }
     Ok(())
+}
+
+fn direct_hls_url(
+    source: ace_swarm::resolve::ResolvedTransport,
+) -> Result<String, crate::provider::ProviderError> {
+    use crate::provider::ProviderError;
+    use ace_swarm::resolve::ResolvedTransport;
+    match source {
+        ResolvedTransport::Hls { manifest_url, .. } => Ok(manifest_url),
+        ResolvedTransport::Swarm(_) => Err(ProviderError::Unresolvable(
+            "live swarm source has no direct origin URL; omit --resolve to stream MPEG-TS".into(),
+        )),
+        ResolvedTransport::Vod(_) => Err(ProviderError::Unresolvable(
+            "VOD swarm source has no direct origin URL; use --vod instead of --resolve".into(),
+        )),
+    }
 }
 
 async fn write_vod_output(
@@ -534,7 +568,7 @@ mod tests {
         assert!(help.contains("supported Ace HTTP subset is disabled by default"));
         assert!(help.contains("Run the HTTP API, RTMP ingest listener"));
         assert!(help.contains("Create or resume a named broadcast"));
-        assert!(help.contains("Write a live MPEG-TS stream"));
+        assert!(help.contains("Write live MPEG-TS"));
 
         let play = command
             .find_subcommand_mut("play")
@@ -542,6 +576,8 @@ mod tests {
             .render_long_help()
             .to_string();
         let play_flat = play.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(play_flat.contains("--resolve"));
+        assert!(play_flat.contains("origin-HLS descriptor"));
         assert!(play_flat.contains("acestream://<content-id> URL or HTTP(S) transport-file URL"));
         assert!(play_flat.contains("authenticated catalog"));
         assert!(play_flat.contains("match the requested infohash"));
@@ -804,5 +840,47 @@ mod tests {
     #[test]
     fn invalid_playback_input_is_rejected() {
         assert!(PlaybackTarget::parse("acestream://nothex").is_err());
+    }
+}
+
+#[cfg(test)]
+mod direct_origin_tests {
+    use super::*;
+    use ace_swarm::resolve::ResolvedTransport;
+
+    #[test]
+    fn resolve_option_is_explicit_and_conflicts_with_vod() {
+        let input = "acestream://0123456789abcdef0123456789abcdef01234567";
+        let cli = Cli::try_parse_from(["outpace", "play", "--resolve", input]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Play(PlayArgs {
+                resolve: true,
+                vod: false,
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["outpace", "play", "--resolve", "--vod", input]).is_err());
+    }
+
+    #[test]
+    fn direct_resolve_preserves_origin_url_and_rejects_vod_as_url() {
+        let url = "https://cdn.example.test/a%2Fb/master.m3u8?token=a%2Fb&x=1&x=2";
+        assert_eq!(
+            direct_hls_url(ResolvedTransport::Hls {
+                manifest_url: url.into(),
+                metadata: Default::default(),
+            })
+            .unwrap(),
+            url
+        );
+        let vod = ace_swarm::resolve::playback_from_transport(include_bytes!(
+            "../../../tests/vectors/metainfo/single-file-unsorted.torrent"
+        ))
+        .unwrap();
+        assert!(direct_hls_url(vod)
+            .unwrap_err()
+            .to_string()
+            .contains("--vod"));
     }
 }

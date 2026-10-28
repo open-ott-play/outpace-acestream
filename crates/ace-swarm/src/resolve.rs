@@ -9,6 +9,8 @@
 //! infohash carries no geometry, so it is never turned into a `StreamInfo` by guessing
 //! (issue #164); callers keep descriptors they have verified in an [`InfohashIndex`].
 
+mod catalog_flight;
+
 use crate::http_fetch::{self, FetchError, FetchLimits, FetchPolicy, FetchUrl, GuardedBody};
 #[cfg(test)]
 use crate::http_fetch::{is_private_or_loopback, is_safe_ip};
@@ -69,6 +71,8 @@ const CATALOG_HOSTS: &[(&str, u16)] = &[
     ("163.172.187.185", 8081),
 ];
 const CATALOG_HOST_TIMEOUT: Duration = Duration::from_secs(4);
+const CATALOG_TOTAL_TIMEOUT: Duration =
+    CATALOG_HOST_TIMEOUT.saturating_mul(CATALOG_HOSTS.len() as u32);
 const CATALOG_RESPONSE_LIMIT: usize = 1024 * 1024;
 const CATALOG_SIGNING_SECRET: &[u8] =
     b"H!+:H1NnvvX\\x0bS'(;0/A\\nR{${\\n/3%1\\x0b*[r0o>QzNGKkXT@v\\x0b3DN;gx_66L2 {`F0,\\tKm>XoG~iY(\\x0bu]6E}\\t~07&H;9qE1d?d-A7S(";
@@ -77,7 +81,7 @@ const CATALOG_SIGNING_SECRET: &[u8] =
 // Public protocol interoperability constant, not a private server credential.
 const CATALOG_RESPONSE_KEY: &[u8] = b"CNVU\\\\w5S/HGg\"pSzY&O\"`uGCD18\\x0cfS|h2H4eJBihWumSD7zSv;8,=z2?<\\tl6ka\\n\\x0c*O<3dzOZ|MT11]f0 Xuc| R\"$D;SsYm\\rw*..8h7d4k";
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveError {
     /// A recognized HLS descriptor has no usable manifest.
     Hls(&'static str),
@@ -111,6 +115,11 @@ pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveErr
 }
 
 fn stream_info_from_descriptor(d: TransportDescriptor) -> Result<StreamInfo, ResolveError> {
+    if !d.is_live {
+        return Err(ResolveError::Transport(
+            "VOD descriptor is not a live stream",
+        ));
+    }
     validate_geometry(d.piece_length, d.chunk_length)?;
     // A valid RSA pubkey => pieces carry a modulus-length signature tail to strip *and* a key
     // to verify each piece's in-band signature against (issue #10); no parseable pubkey =>
@@ -169,6 +178,10 @@ pub fn vod_info_from_transport(bytes: &[u8]) -> Result<VodInfo, ResolveError> {
         });
     }
     let d = decode_transport(bytes).map_err(|_| ResolveError::Transport("decode failed"))?;
+    vod_info_from_descriptor(d)
+}
+
+fn vod_info_from_descriptor(d: TransportDescriptor) -> Result<VodInfo, ResolveError> {
     if d.is_live {
         return Err(ResolveError::Transport("not a VOD transport (no pieces)"));
     }
@@ -313,6 +326,7 @@ pub async fn resolve_infohash_via_catalog(infohash: &str) -> Result<StreamInfo, 
 #[derive(Debug)]
 pub enum ResolvedTransport {
     Swarm(StreamInfo),
+    Vod(VodInfo),
     Hls {
         manifest_url: String,
         metadata: StreamMetadata,
@@ -321,13 +335,20 @@ pub enum ResolvedTransport {
 
 /// Resolve either supported descriptor kind without requiring HLS piece geometry.
 pub fn playback_from_transport(bytes: &[u8]) -> Result<ResolvedTransport, ResolveError> {
+    if !ace_wire::infohash::is_transport_file(bytes) {
+        return vod_info_from_transport(bytes).map(ResolvedTransport::Vod);
+    }
     let decoded = decode_transport_source(bytes).map_err(|error| match error {
         ace_wire::WireError::Hls(message) => ResolveError::Hls(message),
         _ => ResolveError::Transport("decode failed"),
     })?;
     match decoded {
         TransportSource::Swarm(descriptor) => {
-            stream_info_from_descriptor(*descriptor).map(ResolvedTransport::Swarm)
+            if descriptor.is_live {
+                stream_info_from_descriptor(*descriptor).map(ResolvedTransport::Swarm)
+            } else {
+                vod_info_from_descriptor(*descriptor).map(ResolvedTransport::Vod)
+            }
         }
         TransportSource::Hls(descriptor) => {
             validate_hls_manifest_url(&descriptor.manifest_url)?;
@@ -386,11 +407,24 @@ pub async fn resolve_playback_from_url(url: &str) -> Result<ResolvedTransport, R
 /// catalog, trying each catalog host in turn. The pure decode half is left to the caller
 /// ([`stream_info_from_transport`] for live, [`vod_info_from_transport`] for VOD).
 pub async fn catalog_transport_bytes(content_id: &str) -> Result<Vec<u8>, ResolveError> {
-    hex20(content_id)?;
-    catalog_transport_bytes_query("pid", content_id).await
+    let normalized = infohash_hex(&hex20(content_id)?);
+    catalog_transport_bytes_query("pid", &normalized).await
 }
 
 async fn catalog_transport_bytes_query(
+    parameter: &str,
+    value: &str,
+) -> Result<Vec<u8>, ResolveError> {
+    catalog_flight::CatalogFlights::global()
+        .resolve(
+            parameter,
+            value,
+            fetch_catalog_transport_hosts(parameter, value),
+        )
+        .await
+}
+
+async fn fetch_catalog_transport_hosts(
     parameter: &str,
     value: &str,
 ) -> Result<Vec<u8>, ResolveError> {
@@ -1844,5 +1878,53 @@ mod tests {
         let index = InfohashIndex::new(8);
         index.put(info.clone());
         assert_eq!(index.get(&info.infohash), Some(info));
+    }
+}
+
+#[cfg(test)]
+mod playback_kind_tests {
+    use super::*;
+
+    #[test]
+    fn metainfo_and_disk_envelope_classify_as_vod_without_live_geometry() {
+        for bytes in [
+            include_bytes!("../../../tests/vectors/metainfo/single-file-unsorted.torrent")
+                .as_slice(),
+            include_bytes!("../../../tests/vectors/metainfo/disk-envelope-unsorted.acestream")
+                .as_slice(),
+        ] {
+            let ResolvedTransport::Vod(info) = playback_from_transport(bytes).unwrap() else {
+                panic!("VOD input must not become live or HLS")
+            };
+            assert_eq!(info.total_length, 16_385);
+            assert_eq!(info.piece_hashes, vec![[0xA5; 20], [0x5A; 20]]);
+            assert!(stream_info_from_transport(bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn wrapped_vod_is_never_accepted_by_live_resolver() {
+        use ace_wire::bencode::Bencode;
+        let descriptor = Bencode::Dict(std::collections::BTreeMap::from([
+            (b"authmethod".to_vec(), Bencode::Bytes(b"None".to_vec())),
+            (b"pubkey".to_vec(), Bencode::Bytes(vec![])),
+            (b"bitrate".to_vec(), Bencode::Int(100_000)),
+            (b"name".to_vec(), Bencode::Bytes(b"Synthetic VOD".to_vec())),
+            (b"piece_length".to_vec(), Bencode::Int(16_384)),
+            (b"chunk_length".to_vec(), Bencode::Int(16_384)),
+            (b"length".to_vec(), Bencode::Int(16_384)),
+            (b"pieces".to_vec(), Bencode::Bytes(vec![0; 20])),
+        ]));
+        let bytes = ace_wire::transport::encode_transport(&descriptor);
+        assert!(matches!(
+            playback_from_transport(&bytes),
+            Ok(ResolvedTransport::Vod(_))
+        ));
+        assert!(matches!(
+            stream_info_from_transport(&bytes),
+            Err(ResolveError::Transport(
+                "VOD descriptor is not a live stream"
+            ))
+        ));
     }
 }

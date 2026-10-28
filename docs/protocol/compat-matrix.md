@@ -2,8 +2,10 @@
 
 This is the canonical operator contract for Outpace's opt-in Acestream HTTP adapter.
 Prefer the [native CLI and HTTP API](../native-api.md) for new integrations. The adapter
-provides a supported subset of public, unencrypted **live** playback and JSON control; it does
-not claim full engine or application parity. Native VOD is a separate `/vod` surface.
+provides a supported subset of public, unencrypted **live** peer playback, direct
+HLS-origin handoff and JSON control; it does not claim full engine or application
+parity. Native VOD is a separate `/vod` surface. An Ace identifier does not imply
+that the resolved source is a live MPEG-TS swarm.
 
 ## Enable and advertise the adapter
 
@@ -27,7 +29,7 @@ change the bind address or add engine access-token authentication. Caller `pid`,
 `token`, `use_api_events`, and unknown query hints are inert; authorization of minted
 playback/control URLs uses Outpace's own path token.
 
-Returned playback, stat, command and HLS segment URLs use `http://` plus the current
+Engine-owned playback, stat, command and HLS segment URLs use `http://` plus the current
 request's `Host` header, falling back to `127.0.0.1:6878` if absent or unusable.
 `Forwarded` and `X-Forwarded-*` are not consulted. There is no advertised HTTPS scheme
 or path-prefix setting here. Behind a proxy, arrange a reachable, matching engine
@@ -46,18 +48,21 @@ CONTENT_ID='0123456789abcdef0123456789abcdef01234567' # replace with your source
 vlc "http://127.0.0.1:6878/ace/getstream?id=${CONTENT_ID}&format="
 ```
 
-Omitting `format` or setting it empty returns MPEG-TS directly (`video/mp2t`). Keep
-URLs shell-quoted, including their ampersands. For live HLS, open
-`/ace/manifest.m3u8` with the same selector; its default response redirects to a
-stable leased playlist. Media availability and player decoding are separate from
-accepting the request.
+For live peer sources, omitting `format` or setting it empty returns MPEG-TS
+directly (`video/mp2t`). Keep URLs shell-quoted, including their ampersands. To
+package a live peer source as HLS, open `/ace/manifest.m3u8` with the same selector;
+its default response redirects to a stable leased playlist. If the descriptor
+already points to an HLS origin, **both endpoints redirect to that origin** instead.
+Media availability and player decoding are separate from accepting the request.
 
 ## Quickstart: a JSON session client
 
 This Python standard-library example checks HTTP status and the in-band `error`,
-opens the **returned** playback URL, samples the returned stat URL, then stops its
-own lease through the returned command URL. It reads a small amount of media rather
-than saving a capture. Replace the placeholder before use.
+branches on `is_direct`, and for engine-owned playback opens the **returned** URL,
+samples the returned stat URL, then stops its own lease through the returned command
+URL. It reads a small amount of media rather than saving a capture. For direct HLS,
+pass the returned `playback_url` to an HLS-capable player. Replace the placeholder
+before use.
 
 ```bash
 CONTENT_ID='0123456789abcdef0123456789abcdef01234567' \
@@ -83,15 +88,18 @@ query = urlencode({'content_id': os.environ['CONTENT_ID'], 'format': 'json'})
 session = None
 try:
     session = ace_json(base + '/ace/getstream?' + query)
-    before = ace_json(session['stat_url'])
-    print('before playback:', before['status'])
-    with urlopen(session['playback_url'], timeout=60) as media:
-        if media.status != 200 or not media.read(188):
-            raise RuntimeError('playback did not return media')
-        stats = ace_json(session['stat_url'])
-        print('status:', stats['status'], 'KiB/s:', stats['speed_down'])
+    if session.get('is_direct', False):
+        print('Direct HLS: open playback_url in an HLS-capable player; no local lease')
+    else:
+        before = ace_json(session['stat_url'])
+        print('before playback:', before['status'])
+        with urlopen(session['playback_url'], timeout=60) as media:
+            if media.status != 200 or not media.read(188):
+                raise RuntimeError('playback did not return media')
+            stats = ace_json(session['stat_url'])
+            print('status:', stats['status'], 'KiB/s:', stats['speed_down'])
 finally:
-    if session is not None:
+    if session is not None and not session.get('is_direct', False):
         command = session['command_url']
         separator = '&' if '?' in command else '?'
         stopped = ace_json(command + separator + urlencode({'method': 'stop'}))
@@ -102,10 +110,45 @@ PY
 
 TS JSON creation mints a lease without opening the media source. Content-id catalog
 resolution may already occur during that request, but successful JSON does **not**
-prove playback will start. A stat-only client stays idle unless another consumer
-holds the same source. In contrast, HLS manifest creation, including `format=json`,
-starts the source/packager **before** minting URLs. HLS clients must consume the
+prove playback will start. Until a live descriptor is validated, its `is_live` and
+`is_encrypted` flags are both `-1` (unknown), rather than invented live/unencrypted
+values. Clients must accept signed integer flags. A stat-only client stays idle unless another consumer
+holds the same source. In contrast, native HLS packaging, including `format=json`,
+starts the peer source/packager **before** minting URLs. HLS clients must consume the
 returned playlist and its segment URLs, rather than treating the playlist as TS.
+
+## Origin HLS handoff
+
+A resolved HLS transport descriptor takes precedence over the requested output
+route. `/ace/getstream` does not relabel its manifest as TS, and
+`/ace/manifest.m3u8` does not repackage it. Default playback returns HTTP 302 with
+the exact descriptor URL in `Location`; JSON mode returns `playback_url`, boolean
+`is_direct: true`, `transport: "hls"`, nullable `content_id` and descriptor metadata.
+Both responses carry `Cache-Control: no-store`. URL escaping, query ordering and
+duplicate query keys are preserved because they may be part of an origin signature.
+A new content-id or transport-URL request resolves its descriptor again rather than
+retaining a potentially expired signed URL indefinitely.
+
+The engine does not fetch the manifest or create a local source, packager or lease
+for this handoff. Consequently `stat_url`, `command_url`, `playback_session_id` and
+`client_session_id` are absent. `is_live` and `is_encrypted` are also absent because
+the manifest has not been inspected; clients must retain the unknown state rather
+than assuming live or unencrypted media. The `is_direct` distinction is required by
+the [public Android client parser](https://github.com/acestream/acestream-engine-android-core/blob/3798163fc053/src/main/java/org/acestream/engine/AceStreamManagerImpl.java#L2935-L2963).
+
+The player owns playlist reloads, variants, audio/subtitle selection, segment
+fetching and buffering against the original origin. Local stop, timeshift, retained
+history and audio normalization do not apply to this external URL. HLS-origin
+handoff does not implement hybrid HLS-over-P2P or qualify any particular player.
+Recognized HLS descriptors with a missing or invalid manifest URL fail explicitly;
+they are never reinterpreted as a peer swarm. A descriptor identified as VOD is
+rejected by the legacy playback endpoints with native `/vod` guidance.
+
+Bare-hash JSON `getstream` remains a lazy session request with unknown media flags. If provider acquisition
+later resolves an HLS origin, following its leased playback URL redirects to that
+origin and revokes the local lease; subsequent local control/playback calls for
+that lease fail. Manifest creation resolves its source before returning JSON and
+can therefore return direct-origin fields immediately on this path.
 
 ## Routes, envelopes and errors
 
@@ -118,9 +161,9 @@ need not be JSON.
 
 | GET route | Supported behavior | Failure context |
 | --- | --- | --- |
-| `/ace/getstream` | Missing/empty `format`: direct TS. `format=json`: new playback/stat/command URLs, session fields and metadata. | Selector/format/no-network errors: HTTP 200, `response: null`. Direct source-start failure: HTTP 404. |
+| `/ace/getstream` | Live peer source: missing/empty `format` returns TS; `format=json` creates playback/stat/command URLs, session fields and metadata. Origin HLS: redirect or direct JSON as above. | Selector/format/no-network errors: HTTP 200, `response: null`. Direct source-start failure: HTTP 404. |
 | `/ace/r/<id>/<token>` | Leased TS; opening it starts or joins the source. | Invalid, wrong-content, stopped, expired or evicted lease: 404. Start failures: 404/422/502 as below. |
-| `/ace/manifest.m3u8` | Missing/empty `format` or `format=redirect`: HTTP 302 to a stable playlist. `format=json`: HLS playback/stat/command URLs and session metadata. | Selector/format/no-network errors: HTTP 200, `response: null`. Source/packager-start failure: 404, including JSON mode. |
+| `/ace/manifest.m3u8` | Live peer source: missing/empty `format` or `format=redirect` returns HTTP 302 to a stable playlist; `format=json` creates HLS playback/stat/command URLs. Origin HLS: redirect or direct JSON as above. | Selector/format/no-network errors: HTTP 200, `response: null`. Source/packager-start failure: 404, including JSON mode. |
 | `/ace/m/<id>/<token>.m3u8` | Token-authenticated live media playlist; absolute segment URLs; `no-store`. | Invalid lease or removed packager: 404. Not ready, stalled/recovering or failed packager: 503 with `Retry-After: 1`; authorization/expiry takes precedence. Stale initial generation after a timeshift transition: 410. |
 | `/ace/c/<token>/<seq>.ts` | Token-authenticated retained native HLS bytes, `video/mp2t`, `no-store`. Does not start a source. | Unknown/revoked token, missing packager, malformed/future/evicted segment: 404. Stale initial generation after a timeshift transition: 410. |
 | `/ace/stat/<id>/<token>` | Stats and metadata under `response`; does not start a source. | Invalid lease: HTTP 200, `response: null`, `error: "invalid or expired playback session"`. No network also gives an in-band error. |
@@ -196,24 +239,28 @@ Both aliases use `{"result": <value>, "error": null}` on success and
 | `get_version` | `version` is Outpace's crate version, `code` is `MAJOR*10000 + MINOR*100 + PATCH`, `platform` is the target OS. Successful JSON on both aliases includes the literal `"error": null` for the sampled healthcheck. It does not identify an official engine build. |
 | `get_status` | `status: "dl"` when the manager has sessions, otherwise `"idle"`; `active_sessions` is that count, not a viewer count. |
 | `get_network_connection_status` | `status`, boolean `connected`, and `networks` reflect registered provider networks, not measured Internet or peer reachability. |
-| `analyze_content` | `infohash`, nullable `content_id`, integer `is_live`/`is_encrypted`, and `status: "complete"`. Bare infohash/magnet parsing is offline; content-id/URL selectors resolve a live descriptor. Flags do not qualify arbitrary encrypted or VOD inputs. |
+| `analyze_content` | Resolved live/VOD descriptors return `infohash`, nullable `content_id`, integer `is_live`/`is_encrypted`, and `status: "complete"`. HLS returns `transport: "hls"`, `playback_url`, `is_direct: true`, descriptor metadata, and unknown `is_live: -1` / `is_encrypted: -1`, without an invented infohash. Bare infohash/magnet parsing remains offline, reports unknown flags (`-1`), and does not qualify the transport. |
 | `get_content_id` | **Echo only:** returns a nonempty caller `content_id`/`query` unchanged, even malformed strings, without 40-hex validation or catalog lookup. Cannot derive a content id from an infohash/URL/magnet. |
-| `get_media_files` | Best-effort `infohash` and one synthetic `files[]` entry with `infohash`, `index: 0`, `is_live`. Same resolution as analysis; no multi-file or selection contract. `dump_transport_file` does not produce a raw dump. |
+| `get_media_files` | Resolved live/VOD descriptors report `infohash` and one `files[]` entry with `index: 0` and `is_live`. HLS reports the direct-origin fields above and `files: []`: the manifest has not been fetched, so no file/variant list is fabricated. Unresolved bare infohash/magnet selectors also return `files: []`. No multi-file or selection contract; `dump_transport_file` does not produce a raw dump. |
 
 ## Lease ownership and live HLS
 
-Each request creating URLs mints a new unpredictable lease, even for the same input
+Each request creating **engine-owned** URLs mints a new unpredictable lease, even for the same input
 or `pid`. Tokens expire **six hours after minting**, with **4096 leases** retained
 at most; capacity evicts the oldest deadline. Playback/stat/playlist/segment reads
 do not renew the deadline. Stop, expiry or eviction revokes authorization and ends
 that lease's active TS responses or HLS pin. A restart loses in-memory leases.
+Direct HLS-origin handoff creates no local lease and has no local expiry guarantee;
+the origin controls URL validity.
 
 A TS body holds a source subscription. Closing a direct response also removes its
 hidden lease; closing a leased TS body leaves its token usable until stop/expiry.
 HLS holds its subscription in the lease, since playlist requests are short-lived.
 Stopping one lease releases only its ownership, not other compatibility clients or
 native consumers of the same source. Sharing is by resolved manager source key;
-clients must not assume all different selector spellings coalesce. Ordinary idle
+a content id keeps its canonical `cid:` key across native and compatibility routes,
+even when the public playback URL uses the resolved hash. Catalog indexing does not
+rename the session. Clients must not assume all other selector spellings coalesce. Ordinary idle
 cleanup applies when no owner remains.
 
 Ordinary HLS serves the shared native packager's retained live window. The 0.9.0

@@ -137,6 +137,14 @@ pub(super) async fn stream_segment(
 /// that text; every other failure keeps the historical bodiless `404`.
 fn stream_start_error(e: ProviderError) -> Response {
     match e {
+        ProviderError::DirectHls { manifest_url } => (
+            StatusCode::FOUND,
+            [
+                (header::LOCATION, manifest_url),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+            ],
+        )
+            .into_response(),
         ProviderError::Unresolvable(reason) => {
             (StatusCode::UNPROCESSABLE_ENTITY, reason).into_response()
         }

@@ -243,8 +243,8 @@ async fn ace_getstream_content_id_returns_a_playback_url_that_streams() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["error"], serde_json::Value::Null);
-    assert_eq!(json["response"]["is_live"], 1);
-    assert_eq!(json["response"]["is_encrypted"], 0);
+    assert_eq!(json["response"]["is_live"], -1);
+    assert_eq!(json["response"]["is_encrypted"], -1);
     assert_eq!(json["response"]["infohash"], content_id);
     assert_eq!(
         json["response"]["metadata"],
@@ -292,8 +292,8 @@ async fn acexy_id_json_handshake_accepts_typed_response_and_returned_lifecycle_u
         playback_session_id: String,
         client_session_id: i32,
         infohash: String,
-        is_live: u32,
-        is_encrypted: u32,
+        is_live: i32,
+        is_encrypted: i32,
     }
 
     #[derive(serde::Deserialize)]
@@ -326,8 +326,8 @@ async fn acexy_id_json_handshake_accepts_typed_response_and_returned_lifecycle_u
     assert!(envelope.error.is_none());
     assert_eq!(envelope.response.infohash, id);
     assert_eq!(envelope.response.client_session_id, -1);
-    assert_eq!(envelope.response.is_live, 1);
-    assert_eq!(envelope.response.is_encrypted, 0);
+    assert_eq!(envelope.response.is_live, -1);
+    assert_eq!(envelope.response.is_encrypted, -1);
     assert!(envelope.response.playback_session_id.len() >= 32);
 
     let playback_path = envelope

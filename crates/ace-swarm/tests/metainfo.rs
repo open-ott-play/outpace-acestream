@@ -1,4 +1,7 @@
-use ace_swarm::resolve::{stream_info_from_transport, vod_info_from_transport};
+use ace_swarm::resolve::{
+    playback_from_transport, stream_info_from_transport, vod_info_from_transport, ResolveError,
+    ResolvedTransport,
+};
 use ace_wire::message::PeerMessage;
 use bytes::Bytes;
 use cbc::cipher::{block_padding::Pkcs7, BlockModeEncrypt, KeyIvInit};
@@ -98,7 +101,17 @@ fn legacy_encrypted_live_and_vod_transports_keep_their_classification() {
         vod_info.peer_protocol,
         ace_wire::handshake::HandshakeProtocol::AceStream
     );
-    assert!(stream_info_from_transport(&wrapped_vod).is_ok());
+    assert!(matches!(
+        stream_info_from_transport(&wrapped_vod),
+        Err(ResolveError::Transport(
+            "VOD descriptor is not a live stream"
+        ))
+    ));
+    let ResolvedTransport::Vod(classified) = playback_from_transport(&wrapped_vod).unwrap() else {
+        panic!("finite descriptor must retain its VOD classification")
+    };
+    assert_eq!(classified.total_length, vod_info.total_length);
+    assert_eq!(classified.piece_hashes, vod_info.piece_hashes);
 }
 
 #[tokio::test]

@@ -1,5 +1,24 @@
 # Upstream integration audit
 
+## Source-contract follow-up
+
+The source-contract beta incorporates the PES-bounded H.264/HEVC access detection
+and synthetic regression cases from [upstream PR 278](https://github.com/jamezrin/outpace/pull/278).
+Optional PES-header bytes and bytes beyond a declared PES length no longer count
+as video NAL units. The existing transport random-access flag remains a separate
+signal. The upstream authorship and project license notices remain intact.
+
+The initial-discovery change follows the bounded retry behavior examined in
+[upstream PR 277](https://github.com/jamezrin/outpace/pull/277), adapted to this
+tree's owned incremental discovery and warm-cache path. A single ten-second
+deadline covers both attempts; successful late-candidate delivery and cancellation
+remain part of the contract. The typed source and shared in-flight catalog work
+preserves this fork's origin-HLS result and provenance boundaries rather than
+replacing them with a swarm-only resolver.
+
+See [source resolution](source-resolution.md) for supported behavior and remaining
+container, managed-HLS and original-seek qualification limits.
+
 This project starts from Outpace 0.8.0 and retains its authorship and AGPL notices.
 The older deployment used Outpace 0.2.0 plus the fifteen ordered patches below.
 Those patches must not be applied mechanically to the newer tree: the live follower

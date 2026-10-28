@@ -247,6 +247,18 @@ impl HlsPackager {
             .prepare(back, Instant::now())
     }
 
+    /// Prepare replay at an absolute retained-media position, not a UTC timestamp.
+    pub fn prepare_history_at(
+        &self,
+        position_ms: u64,
+    ) -> Result<HlsHistorySnapshot, HlsHistoryError> {
+        self.state
+            .lock()
+            .unwrap()
+            .history
+            .prepare_at(position_ms, Instant::now())
+    }
+
     pub fn history_playlist(
         &self,
         view: &HlsHistorySnapshot,

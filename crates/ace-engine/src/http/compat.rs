@@ -6,8 +6,12 @@ use ace_swarm::resolve::{
 pub(super) async fn ace_getstream(
     State(s): State<AppState>,
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
+    let params = match checked_source_query(params) {
+        Ok(params) => params,
+        Err(error) => return Json(json!({ "response": null, "error": error })).into_response(),
+    };
     let mode = match params.get("format").map(String::as_str) {
         None | Some("") => AceGetstreamMode::Direct,
         Some("json") => AceGetstreamMode::Json,
@@ -32,7 +36,13 @@ async fn ace_getstream_selection_response(
     mode: AceGetstreamMode,
 ) -> Response {
     if selection.hls_manifest_url.is_some() {
-        return origin_hls_response(&selection, mode == AceGetstreamMode::Json);
+        return selected_origin_hls_response(
+            &s,
+            &headers,
+            &selection,
+            mode == AceGetstreamMode::Json,
+        )
+        .await;
     }
     let Some(network) = ace_network(&s) else {
         return Json(json!({ "response": null, "error": "no ace network registered" }))
@@ -106,7 +116,7 @@ async fn ace_getstream_selection_response(
             if !s.ace_sessions.revoke(&playback_id, &token) {
                 return StatusCode::NOT_FOUND.into_response();
             }
-            origin_hls_redirect(&manifest_url)
+            resolved_origin_redirect(&s, &manifest_url).await
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
@@ -119,8 +129,12 @@ async fn ace_getstream_selection_response(
 pub(super) async fn ace_manifest(
     State(s): State<AppState>,
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
+    let params = match checked_source_query(params) {
+        Ok(params) => params,
+        Err(error) => return Json(json!({ "response": null, "error": error })).into_response(),
+    };
     hls_startup_response(
         s.manager.hls_startup_timeout(),
         ace_manifest_response(s, headers, params),
@@ -156,7 +170,7 @@ async fn ace_manifest_selection_response(
     json_mode: bool,
 ) -> Response {
     if selection.hls_manifest_url.is_some() {
-        return origin_hls_response(&selection, json_mode);
+        return selected_origin_hls_response(&s, &headers, &selection, json_mode).await;
     }
     let Some(network) = ace_network(&s) else {
         return Json(json!({ "response": null, "error": "no ace network registered" }))
@@ -171,7 +185,7 @@ async fn ace_manifest_selection_response(
         Ok(started) => started,
         Err(ProviderError::DirectHls { manifest_url }) => {
             selection.hls_manifest_url = Some(manifest_url);
-            return origin_hls_response(&selection, json_mode);
+            return selected_origin_hls_response(&s, &headers, &selection, json_mode).await;
         }
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -550,7 +564,7 @@ pub(super) async fn ace_playback(
                     if !s.ace_sessions.revoke(&id, &token) {
                         return StatusCode::NOT_FOUND.into_response();
                     }
-                    return origin_hls_redirect(&manifest_url);
+                    return resolved_origin_redirect(&s, &manifest_url).await;
                 }
             };
             crate::alog!(
@@ -644,8 +658,20 @@ pub(super) async fn ace_command(
     State(s): State<AppState>,
     headers: HeaderMap,
     Path((id, token)): Path<(String, String)>,
-    Query(params): Query<HashMap<String, String>>,
+    Query(pairs): Query<Vec<(String, String)>>,
 ) -> Response {
+    // A map extractor silently keeps one value for duplicate keys. Commands must not
+    // execute a different seek/stop after a proxy or client reorders ambiguous input.
+    let mut params = HashMap::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        if params.insert(key, value).is_some() {
+            return (
+                [(header::CACHE_CONTROL, "no-store")],
+                Json(json!({ "response": null, "error": "duplicate command parameter" })),
+            )
+                .into_response();
+        }
+    }
     (
         [(header::CACHE_CONTROL, "no-store")],
         ace_command_json(s, headers, id, token, params).await,
@@ -703,24 +729,46 @@ async fn ace_command_json(
     // Preparation never changes the existing viewer. In this beta a seek is a finite
     // replay of already-completed, retained segments, not a peer-network archive.
     let history = if method == "timeshift_seek" {
-        let Some(back) = params
-            .get("back")
-            .and_then(|value| value.parse::<f64>().ok())
-        else {
-            return Json(
-                json!({ "response": null, "error": "back must be finite positive seconds" }),
-            );
+        let prepared = match (params.get("back"), params.get("position_ms")) {
+            (Some(back), None) => {
+                let Some(back) = back
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|back| back.is_finite() && *back > 0.0 && *back <= 31_536_000.0)
+                else {
+                    return Json(
+                        json!({ "response": null, "error": "back must be finite positive seconds" }),
+                    );
+                };
+                pkg.prepare_history(Duration::from_secs_f64(back))
+            }
+            (None, Some(position)) => {
+                let Some(position) = (!position.is_empty()
+                    && position.bytes().all(|byte| byte.is_ascii_digit()))
+                .then(|| position.parse::<u64>().ok())
+                .flatten() else {
+                    return Json(
+                        json!({ "response": null, "error": "position_ms must be unsigned integer media milliseconds" }),
+                    );
+                };
+                pkg.prepare_history_at(position)
+            }
+            _ => {
+                return Json(
+                    json!({ "response": null, "error": "specify exactly one of back or position_ms" }),
+                );
+            }
         };
-        if !back.is_finite() || back <= 0.0 || back > 31_536_000.0 {
-            return Json(
-                json!({ "response": null, "error": "back must be finite positive seconds" }),
-            );
-        }
-        match pkg.prepare_history(Duration::from_secs_f64(back)) {
+        match prepared {
             Ok(history) => Some(history),
             Err(error) => return Json(json!({ "response": null, "error": error.to_string() })),
         }
     } else {
+        if params.contains_key("back") || params.contains_key("position_ms") {
+            return Json(
+                json!({ "response": null, "error": "seek targets require timeshift_seek" }),
+            );
+        }
         if pkg.playlist_snapshot("", false).is_err() {
             return Json(json!({ "response": null, "error": "live playback is not ready" }));
         }
@@ -798,8 +846,12 @@ async fn timeshift_status(s: &AppState, id: &str, token: &str) -> serde_json::Va
 /// the methods in [`crate::server_api::Method`] are served; see `docs/protocol/compat-matrix.md`.
 pub(super) async fn server_api(
     State(s): State<AppState>,
-    Query(params): Query<HashMap<String, String>>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
+    let params = match checked_source_query(params) {
+        Ok(params) => params,
+        Err(error) => return Json(crate::server_api::err(error)).into_response(),
+    };
     use crate::server_api as api;
 
     let method = params.get("method").map(String::as_str).unwrap_or("");
@@ -999,6 +1051,52 @@ fn apply_transport_resolution(
 
 /// HLS descriptors refer to an existing origin. Do not mint fake swarm/control leases or
 /// relabel an HLS manifest as MPEG-TS. The player follows the original URL and owns buffering.
+async fn selected_origin_hls_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    selection: &AceStreamSelection,
+    json_mode: bool,
+) -> Response {
+    let Some(relay) = &state.origin_hls else {
+        return origin_hls_response(selection, json_mode);
+    };
+    let url = selection.hls_manifest_url.as_ref().expect("HLS selection");
+    let playback = match relay.start(url).await {
+        Ok(playback) => playback,
+        Err(error) => return origin_hls_error(error),
+    };
+    if !json_mode {
+        return origin_hls_redirect(&playback.playback_url);
+    }
+    let base = request_base(headers);
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "response": {
+                "playback_url": format!("{base}{}", playback.playback_url),
+                "stop_url": format!("{base}{}", playback.stop_url),
+                "is_direct": true,
+                "managed_origin": true,
+                "content_id": selection.content_id,
+                "transport": "hls",
+                "metadata": stream_metadata_json(&selection.metadata),
+            },
+            "error": null
+        })),
+    )
+        .into_response()
+}
+
+pub(super) async fn resolved_origin_redirect(state: &AppState, url: &str) -> Response {
+    match &state.origin_hls {
+        Some(relay) => match relay.start(url).await {
+            Ok(playback) => origin_hls_redirect(&playback.playback_url),
+            Err(error) => origin_hls_error(error),
+        },
+        None => origin_hls_redirect(url),
+    }
+}
+
 fn origin_hls_response(selection: &AceStreamSelection, json_mode: bool) -> Response {
     let url = selection.hls_manifest_url.as_ref().expect("HLS selection");
     if json_mode {
@@ -1032,9 +1130,23 @@ fn origin_hls_redirect(url: &str) -> Response {
         .into_response()
 }
 
+fn checked_source_query(
+    params: Vec<(String, String)>,
+) -> Result<HashMap<String, String>, &'static str> {
+    let mut unique = HashMap::new();
+    for (key, value) in params {
+        if unique.insert(key, value).is_some() {
+            return Err("duplicate query parameter");
+        }
+    }
+    crate::source_options::validate(unique.iter().map(|(k, v)| (k.as_str(), v.as_str())), false)?;
+    Ok(unique)
+}
+
 pub(super) fn ace_selected_stream(
     params: &HashMap<String, String>,
 ) -> Result<AceStreamSelection, &'static str> {
+    crate::source_options::validate(params.iter().map(|(k, v)| (k.as_str(), v.as_str())), false)?;
     if let Some(content_id) = ace_nonempty_param(params, "content_id") {
         let content_id = ace_normalized_hex_id(content_id).ok_or("invalid content_id")?;
         return Ok(AceStreamSelection {
@@ -1186,6 +1298,7 @@ mod origin_tests {
             resolve_content_ids_in_getstream: false,
             ace_sessions: Arc::new(AceSessionStore::default()),
             experimental_ace_compat: true,
+            origin_hls: None,
             broadcasts: None,
         }
     }
@@ -1503,5 +1616,187 @@ mod origin_tests {
             apply_transport_resolution(selection, Err(ResolveError::Hls("missing manifest"))),
             Err("missing manifest")
         );
+    }
+    #[tokio::test]
+    async fn managed_origin_json_http_body_and_stop_share_ownership() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = axum::Router::new()
+            .route("/live/master.m3u8", axum::routing::get(|| async {
+                "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\npart.ts?signature=synthetic\n#EXT-X-ENDLIST\n"
+            }))
+            .route("/live/part.ts", axum::routing::get(|| async { "synthetic segment" }));
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let mut state = empty_state();
+        state.origin_hls = Some(crate::origin_hls::OriginHls::new(
+            ace_swarm::http_fetch::FetchPolicy {
+                allow_non_global: true,
+            },
+        ));
+        let selection =
+            synthetic_hls_selection_with_url(&format!("http://{address}/live/master.m3u8"));
+        let response =
+            selected_origin_hls_response(&state, &HeaderMap::new(), &selection, true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["response"]["managed_origin"], true);
+        assert!(accepts_client_playback_contract(&json["response"]));
+        for field in ["stat_url", "command_url", "timeshift", "infohash"] {
+            assert!(json["response"].get(field).is_none(), "invented {field}");
+        }
+        let path = json["response"]["playback_url"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878")
+            .unwrap();
+        assert!(path.starts_with("/origin-hls/"));
+        let response = request(state.clone(), path).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/vnd.apple.mpegurl"
+        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let bytes = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        let manifest = std::str::from_utf8(&bytes).unwrap();
+        let media = manifest
+            .lines()
+            .find(|s| !s.is_empty() && !s.starts_with('#'))
+            .unwrap();
+        assert!(media.starts_with("/origin-hls/"));
+        assert!(!manifest.contains("signature"));
+        let response = request(state.clone(), media).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap(),
+            "synthetic segment"
+        );
+        let stop = json["response"]["stop_url"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("http://127.0.0.1:6878")
+            .unwrap();
+        let response = router(state.clone())
+            .oneshot(
+                axum::http::Request::delete(stop)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            request(state.clone(), path).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            request(state.clone(), media).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(state.ace_sessions.active_count(), 0);
+        assert!(state.manager.list().await.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn managed_origin_late_resolution_redirects_native_and_compatibility_routes() {
+        for path in [
+            "/ace/getstream?infohash=0123456789abcdef0123456789abcdef01234567",
+            "/ace/manifest.m3u8?infohash=0123456789abcdef0123456789abcdef01234567",
+            "/streams/origin/0123456789abcdef0123456789abcdef01234567.ts",
+            "/streams/origin/0123456789abcdef0123456789abcdef01234567.m3u8",
+        ] {
+            let mut state = late_origin_state();
+            state.origin_hls = Some(crate::origin_hls::OriginHls::new(Default::default()));
+            let response = request(state.clone(), path).await;
+            assert_eq!(response.status(), StatusCode::FOUND, "{path}");
+            assert!(response.headers()[header::LOCATION]
+                .to_str()
+                .unwrap()
+                .starts_with("/origin-hls/"));
+            assert_eq!(state.ace_sessions.active_count(), 0);
+            assert!(state.manager.list().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn source_query_rejects_unsupported_selection_before_starting_anything() {
+        for base in [
+            "/ace/getstream?format=json",
+            "/ace/manifest.m3u8?format=json",
+            "/server/api?method=get_media_files",
+            "/webui/api/service?method=analyze_content",
+        ] {
+            for query in [
+                "_idx=1",
+                "_idx=-1",
+                "_idx=",
+                "_idx=0&%5fidx=1",
+                "index=1",
+                "stream_id=1",
+                "direct_url=https%3A%2F%2Fexample.test%2Fmedia",
+                "playlist_selected_indexes=0",
+                "next_file_indexes=0",
+            ] {
+                let state = late_origin_state();
+                let response = request(
+                    state.clone(),
+                    &format!("{base}&infohash=0123456789abcdef0123456789abcdef01234567&{query}"),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let json: serde_json::Value = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), 8192)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert!(json["error"].is_string(), "{base}&{query}: {json}");
+                assert_eq!(state.ace_sessions.active_count(), 0);
+                assert!(state.manager.list().await.is_empty());
+            }
+        }
+    }
+    #[tokio::test]
+    async fn managed_origin_operational_count_includes_lazy_owned_playbacks() {
+        for enabled in [false, true] {
+            let mut state = empty_state();
+            if enabled {
+                state.origin_hls = Some(crate::origin_hls::OriginHls::new(Default::default()));
+            }
+            let response = request(state.clone(), "/origin-hls/status").await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let json: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(json, json!({"enabled": enabled, "active_sessions": 0}));
+            if let Some(relay) = &state.origin_hls {
+                let playback = relay.start(ORIGIN).await.unwrap();
+                let response = request(state.clone(), "/origin-hls/status").await;
+                let json: serde_json::Value = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), 1024)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(json, json!({"enabled": true, "active_sessions": 1}));
+                let token = playback.stop_url.rsplit('/').next().unwrap();
+                assert!(relay.stop(token));
+                assert_eq!(relay.active_count(), 0);
+            }
+        }
     }
 }

@@ -135,16 +135,11 @@ pub(super) async fn stream_segment(
 /// Response for a failed stream start on the native routes. `Unresolvable` carries a user-facing
 /// reason (a bare infohash without a verified descriptor, #164) and is returned as `422` with
 /// that text; every other failure keeps the historical bodiless `404`.
-fn stream_start_error(e: ProviderError) -> Response {
+async fn stream_start_error(state: &AppState, e: ProviderError) -> Response {
     match e {
-        ProviderError::DirectHls { manifest_url } => (
-            StatusCode::FOUND,
-            [
-                (header::LOCATION, manifest_url),
-                (header::CACHE_CONTROL, "no-store".to_string()),
-            ],
-        )
-            .into_response(),
+        ProviderError::DirectHls { manifest_url } => {
+            resolved_origin_redirect(state, &manifest_url).await
+        }
         ProviderError::Unresolvable(reason) => {
             (StatusCode::UNPROCESSABLE_ENTITY, reason).into_response()
         }
@@ -203,7 +198,7 @@ pub(super) async fn stream_file_with_hls_timeout(
                     )
                         .into_response()
                 }
-                Err(e) => stream_start_error(e),
+                Err(e) => stream_start_error(&s, e).await,
             }
         })
         .await;
@@ -224,7 +219,7 @@ pub(super) async fn stream_file_with_hls_timeout(
     };
     let session = match s.manager.get_or_start(&network, &id).await {
         Ok(sess) => sess,
-        Err(e) => return stream_start_error(e),
+        Err(e) => return stream_start_error(&s, e).await,
     };
     stream_session_response(session)
 }

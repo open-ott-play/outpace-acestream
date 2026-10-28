@@ -64,6 +64,7 @@ the Unix durable peer-hint backend; follow the Windows-specific recipe.
 | Playback output | Direct MPEG-TS and bounded live HLS, with shared source sessions for multiple consumers. |
 | Ace HTTP compatibility | An explicit subset, enabled with `OUTPACE_ACE_COMPAT=1`; see the [compatibility contract](docs/deployment-compatibility.md). |
 | Single-file VOD | Verified file pieces, HTTP byte ranges and native VOD HLS. Requires a VOD descriptor. |
+| Origin HLS | Optional bounded local HTTP relay for resolved HLS descriptors, including TS/fMP4 and ranges. Default direct handoff is preserved. See [source resolution](docs/source-resolution.md). |
 | Broadcast origination | Signed broadcasts from raw HTTP MPEG-TS, RTMP or managed HTTP(S) MPEG-TS input. |
 | Audio conversion | Optional FFmpeg-based conversion of selected supported live-HLS audio to AAC stereo. Video is copied. |
 | Historical playback | Opt-in finite retained-HLS replay with independent viewer generations; experimental exact peer-history acquisition. No UTC programme archive or durable DVR. See [timeshift](docs/timeshift.md). |

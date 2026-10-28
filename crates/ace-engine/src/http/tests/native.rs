@@ -890,6 +890,7 @@ fn ace_provider_state() -> AppState {
         resolve_content_ids_in_getstream: false,
         ace_sessions: Arc::new(AceSessionStore::default()),
         experimental_ace_compat: true,
+        origin_hls: None,
         broadcasts: None,
     }
 }
@@ -1010,6 +1011,7 @@ async fn origin_hls_handoff_is_exact_and_never_starts_a_local_session() {
         resolve_content_ids_in_getstream: false,
         ace_sessions: Arc::new(AceSessionStore::default()),
         experimental_ace_compat: false,
+        origin_hls: None,
         broadcasts: None,
     };
     let app = router(s.clone());

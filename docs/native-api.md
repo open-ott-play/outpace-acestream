@@ -4,8 +4,13 @@ The native CLI and HTTP routes are outpace's supported integration surface. They
 players such as VLC, media servers such as Jellyfin, and playlist/proxy tools such as dispatcharr.
 Playback requests start and share sessions, while status routes observe sessions already active.
 
-An origin-HLS descriptor is the exception: native stream routes return a `302`
-handoff with `Cache-Control: no-store` and create no local session. Use
+By default, an origin-HLS descriptor is the exception: native stream routes return
+a `302` handoff with `Cache-Control: no-store` and create no local session. With
+`OUTPACE_MANAGED_HLS=1`, the redirect instead creates an owned local relay playback.
+Its `/origin-hls/<token>/…` resources and `DELETE /origin-hls/<token>` stop route are
+separate from swarm sessions. `GET /origin-hls/status` reports the enabled flag and
+aggregate active count; operational idle checks must also inspect this endpoint.
+Use
 `outpace play --resolve <input>` for the equivalent explicit CLI URL output.
 Resolved VOD is rejected on live routes; select the native `/vod` route or CLI
 `--vod`. Metadata queried from an unresolved infohash reports unknown properties

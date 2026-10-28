@@ -630,6 +630,7 @@ mod qualification_tests {
             resolve_content_ids_in_getstream: false,
             ace_sessions: Arc::new(AceSessionStore::default()),
             experimental_ace_compat: false,
+            origin_hls: None,
             broadcasts: None,
         };
         let started = tokio::time::Instant::now();

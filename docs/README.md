@@ -44,7 +44,7 @@ sections before replacing an existing service.
 - [CI and dependency maintenance](ci-cd.md): required checks, shared security analysis and Renovate.
 - [Release acceptance](releasing.md): immutable releases, corresponding source and publication checks.
 - [Retained replay](timeshift.md): retained-media replay, per-viewer controls, peer-history experiment and limits.
-- [Source resolution](source-resolution.md): typed live/VOD/HLS contracts, direct handoff, catalog lifetime and container qualification.
+- [Source resolution](source-resolution.md): typed live/VOD/HLS contracts, direct handoff, optional managed origins, catalog lifetime and container qualification.
 
 - [Development](development.md): source builds, meaningful validation and safe
   diagnostic reports.

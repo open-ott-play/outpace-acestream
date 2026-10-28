@@ -64,6 +64,27 @@ callers must check `error`. Sending the expected generation is recommended to
 reject reordered client commands. Server-side compare-and-swap also prevents
 concurrent preparations from replacing a newer view.
 
+`timeshift_seek` also accepts `position_ms` instead of `back`, for example
+`command_url?method=timeshift_seek&position_ms=12000&generation=0`. This is an
+unsigned integer coordinate on the same `retained_media_duration` timeline
+reported by status, not Unix time or an offset from the viewer's current frame.
+It keeps the selected position stable while the live head advances. A position
+of zero is valid only while that beginning is retained and independently
+decodable. The completed `end_ms` is an exclusive boundary; targets at or beyond
+it are unavailable. The start aligns backwards to an independent access point,
+and the returned snapshot ends at the completed head observed during preparation.
+Read the returned snapshot's `start_ms` for the actual aligned start.
+
+Supply exactly one of `back` (positive seconds behind the current head) or
+`position_ms` (absolute media milliseconds). Duplicate command parameters,
+including percent-encoded spellings of the same name, are rejected. Negative,
+fractional, signed or overflowing `position_ms` values, conflicting selectors,
+expired positions, missing ranges and stale generations leave the current view
+unchanged. `timeshift_live` accepts neither seek selector. Coordinates belong to
+one source/packager lifetime and must not be reused after source replacement or
+engine restart. This extension does not implement original-engine `liveseek`
+or UTC programme catch-up.
+
 The status reports `peer_archive=false`, `persistent=false`, `utc_seek=false`.
 History positions are accumulated **media duration**, not Unix timestamps.
 `seekable_start_ms` identifies the earliest independent entry contiguous with

@@ -18,7 +18,8 @@ OUTPACE_HISTORY_TOTAL_BYTES=268435456
 
 History is disabled by default (`OUTPACE_HISTORY_SECONDS=0`). The time limit is
 at most 3,600 seconds. The per-source byte budget defaults to 128 MiB; the shared
-budget for all packagers in one engine defaults to 256 MiB and must cover the
+budget shared by native packagers and managed-origin viewers in one engine
+defaults to 256 MiB and must cover the
 per-source budget. Retention obeys both elapsed time and accepted media duration,
 plus a hard 4,096-segment limit. The first limit reached wins. At 8 Mbit/s,
 128 MiB holds roughly two minutes, not ten; backing allocation capacity is
@@ -34,12 +35,56 @@ A stalled source therefore releases expired history reservations while its
 clients continue polling, without requiring a separate timeshift-status request.
 Its current live window remains available under the normal live retention rules.
 
-Only active HLS packagers collect history. Raw `/ace/getstream` sessions, origin
-HLS redirects and inactive channels do not secretly start recording. History
+Active native HLS packagers and eligible managed-origin viewers collect history.
+Raw native `/ace/getstream` sessions, external HLS redirects and inactive channels
+do not secretly start recording. Native history
 ends when the packager is removed and disappears on process restart. The
 existing disposable peer seed cache is a different store.
 
-## Playback contract
+## Managed-origin TS replay
+
+Starting with **0.9.1-beta.6**, `OUTPACE_MANAGED_HLS=1` and nonzero
+`OUTPACE_HISTORY_SECONDS` also retain completed media fetched by an active origin
+viewer. Existing installations with both settings enabled opt into this additional
+use of their existing shared budget. There is no background fetch or durable
+recording, and the normal thirty-second HTTP cache is a separate mechanism.
+
+This first backend accepts a root media playlist with `EXT-X-INDEPENDENT-SEGMENTS`,
+unique full-segment URLs and complete HTTP-200 MPEG-TS bodies. Each retained body
+must have CRC-checked PAT/PMT tables and first-selected-video access-point
+evidence. The packet-level access-point detector is a conservative heuristic,
+not a complete access-unit or dependency validator; generated-media decoder tests
+qualify the tested formats. Master/alternate-rendition playlists, initialization maps, fMP4,
+byte ranges and audio-only media remain outside this replay subset. Their supported
+live relay behavior is unchanged. A declaration or filename alone is insufficient
+to make media seekable. Gaps in captured segments cannot be skipped by a replay.
+
+Managed playback JSON includes `command_url=/origin-hls/<token>/cmd`. The commands
+`timeshift_status`, `timeshift_seek`, `timeshift_live` and `stop` use the HTTP-200
+JSON envelope and generation checks described below. Status identifies
+`kind=retained_origin_ts`, `time_basis=observed_media_duration`, and reports
+`enabled`, `supported` and `reason`. Inspect `history.seekable_start_ms` and
+`history.end_ms` before seeking; supported format does not mean media has arrived.
+`back` uses seconds behind the retained head; `position_ms` uses the observed
+media-duration timeline, never UTC or original Ace peer-piece coordinates.
+
+Each origin viewer owns its retained sequence table and one finite replay view.
+Its replay URL is `/origin-hls/<token>/replay/<generation>/index.m3u8` with
+`EXT-X-ENDLIST`. Reload the URL returned by a successful seek. A failed seek leaves
+the previous view intact; a successful seek or live return invalidates prior
+replay generations. **The original `/origin-hls/<token>/0.m3u8` URL stays live**
+and is also the URL returned by `timeshift_live`. This differs from the native
+generation-scoped live URLs described below. Another viewer remains independent.
+
+Replay serves only retained bytes, without re-fetching the origin. Whole segments
+and an initial `Range: bytes=0-` probe return 200; other ranges and `If-Range` are
+unsupported. Pruned media or stale replay generations return 410; stopped or
+expired viewers return 404. Sequence/identity rollback clears incompatible
+history. Stop, expiry and process restart discard recording. Existing session,
+request and body limits still apply, and in-flight retained responses hold their
+memory reservation until consumed or dropped.
+
+## Native playback contract
 
 1. Start HLS with `GET /ace/manifest.m3u8?content_id=0123456789abcdef0123456789abcdef01234567&format=json`.
    Replace the synthetic ID with your own current source. Keep the returned
@@ -132,7 +177,11 @@ The engine exposes the capability; the player must retain the JSON control
 session, render the available range, issue a seek and reload the returned HLS
 URL. Proxies must carry the tokenized `/ace/t/...` playlists and `/ace/tc/...`
 segments with their generation intact. Existing `/ace/m/...` and `/ace/c/...`
-live clients continue to work when no seek is requested.
+live clients continue to work when no seek is requested. Managed-origin clients
+must also proxy the returned `/origin-hls/<token>/cmd` control URL and
+`/origin-hls/<token>/replay/<generation>/...` media URLs without removing their
+token or generation. They must use the status time basis rather than treating
+these coordinates as programme dates.
 
 A classic EPG catch-up menu normally asks for a programme by UTC start time.
 This beta cannot satisfy that contract. Do not add `catchup-days`, fabricate

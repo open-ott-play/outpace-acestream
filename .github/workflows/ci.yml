@@ -146,3 +146,6 @@ jobs:
 
       - name: Managed origin HLS with decoded TS and fMP4 media
         run: cargo test -p ace-engine --lib --locked origin_hls::tests::generated_origin_hls_ts_and_fmp4_decode -- --ignored --exact --nocapture
+
+      - name: Retained origin TS decodes after the origin removes its media
+        run: cargo test -p ace-engine --lib --locked origin_hls::tests::generated_origin_ts_archive_decodes_after_origin_removal -- --ignored --exact --nocapture

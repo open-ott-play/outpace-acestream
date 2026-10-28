@@ -270,15 +270,61 @@ class CaptureTests(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
             with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(io.StringIO()):
-                capture.Capture('0123456789abcdef0123456789abcdef01234567', .3, d,
+                client = capture.Capture('0123456789abcdef0123456789abcdef01234567', .3, d,
                     [('x', 'nativecid', f'http://127.0.0.1:{server.server_port}')],
-                    poll_interval=.05).run()
+                    poll_interval=.05)
+                client.run()
+                finished = client.now()
                 stats = [json.loads(line) for line in Path(d, 'x.stats.jsonl').read_text().splitlines()]
+                # A poll admitted before the deadline can be cancelled after it.
+                # Preserve that final diagnostic; it is not a successful stat sample.
+                if stats and 'error' in stats[-1]:
+                    terminal = stats.pop()
+                    self.assertEqual(set(terminal), {'t', 'error'})
+                    self.assertEqual(terminal['error'], "TimeoutError('capture deadline')")
+                    self.assertGreaterEqual(terminal['t'], client.duration)
+                    self.assertLessEqual(terminal['t'], finished + .000001)
                 self.assertGreaterEqual(len(stats), 2)
-                self.assertTrue(all(0 < row['t'] < .3 and row['stat']['status'] == 'playing' for row in stats))
+                self.assertTrue(all(set(row) == {'t', 'stat'} for row in stats))
+                # Persisted timestamps have six decimal places.
+                self.assertTrue(all(0 < row['t'] < client.duration + .000001
+                                    and row['stat']['status'] == 'playing' for row in stats))
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_stat_polling_preserves_final_deadline_error(self):
+        clock = [0.0]
+        calls = []
+
+        class ClockStop:
+            def wait(self, delay):
+                clock[0] += delay
+                return False
+            def is_set(self):
+                return False
+
+        with tempfile.TemporaryDirectory() as d:
+            client = capture.Capture('0123456789abcdef0123456789abcdef01234567', .3, d,
+                                     [], poll_interval=.05)
+            client.stop = ClockStop()
+            client.now = lambda: clock[0]
+
+            def get_json(url, name, maximum):
+                calls.append((url, name, maximum, client.now()))
+                if len(calls) == 1:
+                    return {'status': 'playing'}
+                clock[0] = .31
+                client.timeout(maximum)
+                raise AssertionError('the elapsed capture deadline must cancel the request')
+
+            client.get_json = get_json
+            client.poller('x', {'stat_url': 'http://127.0.0.1/status'})
+            stats = [json.loads(line) for line in Path(d, 'x.stats.jsonl').read_text().splitlines()]
+            self.assertEqual(calls, [('http://127.0.0.1/status', 'x', 5, .05),
+                                     ('http://127.0.0.1/status', 'x', 5, .1)])
+            self.assertEqual(stats, [{'t': .05, 'stat': {'status': 'playing'}},
+                                     {'t': .31, 'error': "TimeoutError('capture deadline')"}])
 
     def test_rejects_unsafe_duplicate_names_and_existing_artifacts(self):
         with self.assertRaises(Exception):

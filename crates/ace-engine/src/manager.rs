@@ -397,6 +397,16 @@ impl StreamManager {
         self.hls
     }
 
+    /// Managed origins and native packagers share one configured retention budget.
+    pub(crate) fn history_context(
+        &self,
+    ) -> (
+        crate::history::HlsHistoryConfig,
+        crate::history::HistoryBudget,
+    ) {
+        (self.history, self.history_budget.clone())
+    }
+
     pub(crate) fn hls_startup_timeout(&self) -> Duration {
         Duration::from_millis(self.hls.startup_timeout_ms)
     }

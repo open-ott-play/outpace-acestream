@@ -27,7 +27,8 @@ Compose users must recreate the service as described in the
 With the gate off, all routes in this document return HTTP 404. Enabling it does not
 change the bind address or add engine access-token authentication. Caller `pid`, input
 `token`, `use_api_events`, and unknown query hints are inert; authorization of minted
-playback/control URLs uses Outpace's own path token.
+playback/control URLs uses Outpace's own path token. The direct-manifest gateway
+below has a stricter, single-parameter query contract.
 
 Engine-owned playback, stat, command and HLS segment URLs use `http://` plus the current
 request's `Host` header, falling back to `127.0.0.1:6878` if absent or unusable.
@@ -121,10 +122,13 @@ returned playlist and its segment URLs, rather than treating the playlist as TS.
 
 With `OUTPACE_MANAGED_HLS=1`, playback starts instead return an engine-owned
 `/origin-hls/<token>/0.m3u8` URL. JSON retains `is_direct: true` and adds
-`managed_origin: true` and `stop_url`; `DELETE stop_url` returns 204 once and 404
+`managed_origin: true`, `command_url` and `stop_url`; `DELETE stop_url` returns 204 once and 404
 for an absent/revoked token. `GET /origin-hls/<token>/<resource>` serves rewritten
 playlists or finite media (200/206), `no-store`. There are no invented swarm
-controls or replay history. Expired/unknown resources return 404, invalid ranges
+controls. Explicit history configuration can enable the restricted
+[origin TS replay contract](../timeshift.md#managed-origin-ts-replay) through
+`command_url`; status reports disabled or unsupported states truthfully.
+Expired/unknown resources return 404, invalid ranges
 400, exhausted admission 503, acquisition deadlines 504, unsupported HLS 415 and
 other invalid/failed origin resources 502. Query-based playlist extensions and
 If-Range are unsupported. Valid playlist probe ranges receive a complete 200
@@ -167,6 +171,37 @@ that lease fail. Manifest creation resolves its source before returning JSON and
 can therefore return direct-origin fields immediately on this path.
 
 ## Routes, envelopes and errors
+
+### Direct HLS manifest gateway
+
+`GET /hls/manifest.m3u8?manifest_url=<percent-encoded HTTP(S) URL>` implements the
+[official direct HLS input route](https://wiki.acestream.media/Engine_HTTP_API#How_to_play_HLS_broadcast).
+It requires both `OUTPACE_ACE_COMPAT` and `OUTPACE_MANAGED_HLS`. A valid request
+returns `302` with a relative, token-bearing local playlist `Location`. Origin
+retrieval is lazy; opening the returned playlist performs HLS validation and
+rewrites references through the existing bounded relay. Admission alone does not
+prove media availability or decoding. Both successful and error responses carry
+`Cache-Control: no-store` when the compatibility route is enabled.
+
+Exactly one nonempty `manifest_url` is required. Duplicates, other selectors,
+options (including `format`), and invalid URLs return `400` without admission or
+remote fetching. When the compatibility gate is disabled the route returns `404`;
+when managed HLS is disabled it returns `501`. The relay's existing resource limits,
+public-destination policy, idle/hard expiry and per-viewer stop semantics apply.
+No swarm stats or file table are fabricated. General `direct_url` playback remains
+unsupported; this route does not imply original peer-history or hybrid-HLS parity.
+
+### Source-query compatibility
+
+The pinned public Android client's GET builder repeats its descriptor query.
+Equal decoded repetitions of `content_id`, `infohash`, `url`, `magnet`, and
+`transport_file_cache_key` are accepted as one value. Conflicting values and all
+other duplicate parameters are rejected. The optional cache key remains inert;
+no descriptor cache is implied. Command parameters retain strict duplicate
+rejection, and this exception does not apply to CLI URIs or the direct-manifest
+gateway. This behavior is derived from
+[the client builder](https://github.com/acestream/acestream-engine-android-core/blob/3798163fc053/src/main/java/org/acestream/engine/AceStreamManagerImpl.java#L2823-L2903),
+not an original-engine precedence claim.
 
 The supported request method is **GET**; no POST/body-form API is provided. Framework
 HEAD handling is not a separate playback/control contract. `/ace/*` JSON uses

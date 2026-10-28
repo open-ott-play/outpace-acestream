@@ -909,6 +909,10 @@ async fn serve_http_inner(
     );
 
     let rtmp_bind = config.rtmp_bind;
+    let origin_hls = config.managed_hls.then(|| {
+        let (history, budget) = manager.history_context();
+        crate::origin_hls::OriginHls::new_with_history(FetchPolicy::default(), history, budget)
+    });
     let state = AppState {
         manager,
         networks: networks.clone(),
@@ -917,9 +921,7 @@ async fn serve_http_inner(
             config.ace_hls_idle_timeout()?,
         )),
         experimental_ace_compat: config.experimental_ace_compat,
-        origin_hls: config
-            .managed_hls
-            .then(|| crate::origin_hls::OriginHls::new(FetchPolicy::default())),
+        origin_hls,
         broadcasts: Some(broadcasts.clone()),
     };
 

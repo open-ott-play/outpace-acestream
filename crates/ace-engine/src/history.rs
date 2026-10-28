@@ -119,7 +119,7 @@ impl HistoryBudget {
             max,
         }
     }
-    fn reserve(&self, bytes: usize) -> Option<Charge> {
+    pub(crate) fn reserve(&self, bytes: usize) -> Option<Charge> {
         let mut used = self.used.lock().unwrap();
         if bytes > self.max || *used > self.max - bytes {
             return None;
@@ -131,7 +131,7 @@ impl HistoryBudget {
         })
     }
 }
-struct Charge {
+pub(crate) struct Charge {
     budget: HistoryBudget,
     bytes: usize,
 }

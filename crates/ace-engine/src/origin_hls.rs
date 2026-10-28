@@ -4,6 +4,7 @@
 //! in local playlists and excluded from diagnostics and resource selectors. The player owns
 //! rendition selection; this module retrieves and rewrites supported resources.
 
+use crate::history::{HistoryBudget, HlsHistoryConfig, HlsHistoryError};
 use ace_media::hls_input::{self as playlist, PlaylistError, ResourceKind};
 use ace_swarm::http_fetch::{self, FetchError, FetchLimits, FetchPolicy, FetchUrl};
 use bytes::{Bytes, BytesMut};
@@ -15,6 +16,10 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
+
+mod history;
+use history::{OriginHistory, Retained};
+pub use history::{OriginHistoryStatus, OriginHistoryView, OriginSeekTarget};
 
 #[cfg(test)]
 mod tests;
@@ -49,6 +54,8 @@ pub enum OriginError {
     InvalidRange,
     Timeout,
     Cancelled,
+    History(HlsHistoryError),
+    HistoryConflict,
     Fetch(FetchError),
 }
 impl OriginError {
@@ -63,6 +70,12 @@ impl OriginError {
             Self::InvalidRange => "invalid_origin_range",
             Self::Timeout => "origin_timeout",
             Self::Cancelled => "origin_cancelled",
+            Self::History(HlsHistoryError::Disabled) => "origin_history_disabled",
+            Self::History(HlsHistoryError::NotReady) => "origin_history_not_ready",
+            Self::History(HlsHistoryError::Unavailable) => "origin_history_unavailable",
+            Self::History(HlsHistoryError::Gone) => "origin_history_gone",
+            Self::History(HlsHistoryError::InvalidTarget) => "invalid_origin_history_target",
+            Self::HistoryConflict => "origin_history_generation_changed",
             Self::Fetch(error) => error.code(),
         }
     }
@@ -72,6 +85,12 @@ impl OriginError {
             Self::UnsupportedPlaylist => 415,
             Self::Busy => 503,
             Self::NotFound | Self::Cancelled => 404,
+            Self::History(HlsHistoryError::Gone) => 410,
+            Self::History(HlsHistoryError::InvalidTarget) => 400,
+            Self::History(HlsHistoryError::NotReady) => 503,
+            Self::History(HlsHistoryError::Unavailable) => 416,
+            Self::History(HlsHistoryError::Disabled) => 409,
+            Self::HistoryConflict => 409,
             Self::Timeout => 504,
             Self::Fetch(
                 FetchError::DnsTimeout
@@ -103,10 +122,16 @@ impl From<FetchError> for OriginError {
         Self::Fetch(value)
     }
 }
+impl From<HlsHistoryError> for OriginError {
+    fn from(value: HlsHistoryError) -> Self {
+        Self::History(value)
+    }
+}
 
 pub struct OriginPlayback {
     pub playback_url: String,
     pub stop_url: String,
+    pub command_url: String,
 }
 #[derive(Clone)]
 struct ResponseData {
@@ -126,6 +151,8 @@ pub struct OriginResponse {
     request: RequestGuard,
     _admission: OwnedSemaphorePermit,
     _fetch: Option<OwnedSemaphorePermit>,
+    _history: Option<Arc<Retained>>,
+    history_generation: Option<u64>,
 }
 impl OriginResponse {
     pub fn into_stream(self) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
@@ -137,6 +164,22 @@ impl OriginResponse {
                 let end = response.body.len();
                 return Some((
                     Err(std::io::Error::other("origin_cancelled")),
+                    (response, end),
+                ));
+            }
+            if response.history_generation.is_some_and(|generation| {
+                !response
+                    .request
+                    .session
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .history
+                    .has_view(generation)
+            }) {
+                let end = response.body.len();
+                return Some((
+                    Err(std::io::Error::other("origin_history_generation_changed")),
                     (response, end),
                 ));
             }
@@ -183,6 +226,7 @@ struct SessionInner {
     url_bytes: usize,
     pending: usize,
     idle: Instant,
+    history: OriginHistory,
 }
 struct Session {
     inner: Mutex<SessionInner>,
@@ -192,11 +236,13 @@ struct Session {
 impl Session {
     fn close(&self) {
         // Cache/registry publication takes this same lock before checking cancellation.
-        let _inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         self.cancel.send_replace(true);
+        inner.history.clear();
     }
     fn expired(&self, now: Instant) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        inner.history.prune(now);
         self.expires <= now || (inner.pending == 0 && inner.idle <= now)
     }
 }
@@ -285,9 +331,18 @@ pub struct OriginHls {
     fetches: Arc<Semaphore>,
     reaper_started: AtomicBool,
     lifetime: watch::Sender<bool>,
+    history_config: HlsHistoryConfig,
+    history_budget: HistoryBudget,
 }
 impl OriginHls {
     pub fn new(policy: FetchPolicy) -> Arc<Self> {
+        Self::new_with_history(policy, HlsHistoryConfig::default(), HistoryBudget::new(0))
+    }
+    pub(crate) fn new_with_history(
+        policy: FetchPolicy,
+        history_config: HlsHistoryConfig,
+        history_budget: HistoryBudget,
+    ) -> Arc<Self> {
         let (lifetime, _) = watch::channel(false);
         Arc::new(Self {
             policy,
@@ -297,6 +352,8 @@ impl OriginHls {
             fetches: Arc::new(Semaphore::new(4)),
             reaper_started: AtomicBool::new(false),
             lifetime,
+            history_config,
+            history_budget,
         })
     }
     /// Admit the resolved origin. Media remains lazy, so creating a playback does not
@@ -332,6 +389,7 @@ impl OriginHls {
                 url_bytes: bytes,
                 pending: 0,
                 idle: now + IDLE_TIMEOUT,
+                history: OriginHistory::new(self.history_config, self.history_budget.clone()),
             }),
             expires: now + HARD_TIMEOUT,
             cancel,
@@ -346,6 +404,7 @@ impl OriginHls {
         Ok(OriginPlayback {
             playback_url: format!("/origin-hls/{token}/0.m3u8"),
             stop_url: format!("/origin-hls/{token}"),
+            command_url: format!("/origin-hls/{token}/cmd"),
         })
     }
     pub fn stop(&self, token: &str) -> bool {
@@ -364,6 +423,104 @@ impl OriginHls {
     pub fn active_count(&self) -> usize {
         self.purge();
         self.sessions.lock().unwrap().len()
+    }
+    fn history_session(&self, token: &str) -> Result<Arc<Session>, OriginError> {
+        if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(OriginError::NotFound);
+        }
+        self.purge();
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(token)
+            .cloned()
+            .ok_or(OriginError::NotFound)
+    }
+    pub fn history_status(&self, token: &str) -> Result<OriginHistoryStatus, OriginError> {
+        let session = self.history_session(token)?;
+        let mut inner = session.inner.lock().unwrap();
+        if *session.cancel.borrow() {
+            return Err(OriginError::NotFound);
+        }
+        inner.idle = Instant::now() + IDLE_TIMEOUT;
+        Ok(inner.history.status(token, Instant::now()))
+    }
+    pub fn seek(
+        &self,
+        token: &str,
+        target: OriginSeekTarget,
+        expected_generation: Option<u64>,
+    ) -> Result<OriginHistoryView, OriginError> {
+        let session = self.history_session(token)?;
+        let mut inner = session.inner.lock().unwrap();
+        if *session.cancel.borrow() {
+            return Err(OriginError::NotFound);
+        }
+        let view = inner
+            .history
+            .seek(token, target, expected_generation, Instant::now())?;
+        inner.idle = Instant::now() + IDLE_TIMEOUT;
+        Ok(view)
+    }
+    pub fn live(
+        &self,
+        token: &str,
+        expected_generation: Option<u64>,
+    ) -> Result<OriginHistoryView, OriginError> {
+        let session = self.history_session(token)?;
+        let mut inner = session.inner.lock().unwrap();
+        if *session.cancel.borrow() {
+            return Err(OriginError::NotFound);
+        }
+        let view = inner.history.live(token, expected_generation)?;
+        inner.idle = Instant::now() + IDLE_TIMEOUT;
+        Ok(view)
+    }
+    pub async fn replay_resource(
+        self: &Arc<Self>,
+        token: &str,
+        generation: u64,
+        resource: &str,
+    ) -> Result<OriginResponse, OriginError> {
+        let session = self.history_session(token)?;
+        let admission = self
+            .admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| OriginError::Busy)?;
+        let (body, owner) = {
+            let mut inner = session.inner.lock().unwrap();
+            if *session.cancel.borrow() {
+                return Err(OriginError::NotFound);
+            }
+            let data = inner
+                .history
+                .replay(token, generation, resource, Instant::now())?;
+            inner.pending += 1;
+            inner
+                .resources
+                .get_mut(&0)
+                .ok_or(OriginError::NotFound)?
+                .active += 1;
+            data
+        };
+        Ok(OriginResponse {
+            status: 200,
+            content_type: if resource == "index.m3u8" {
+                "application/vnd.apple.mpegurl"
+            } else {
+                "video/mp2t"
+            }
+            .into(),
+            content_range: None,
+            content_length: body.len() as u64,
+            body,
+            request: RequestGuard { session, id: 0 },
+            _admission: admission,
+            _fetch: None,
+            _history: owner,
+            history_generation: Some(generation),
+        })
     }
     pub async fn resource(
         self: &Arc<Self>,
@@ -444,6 +601,8 @@ impl OriginHls {
             request,
             _admission: admission,
             _fetch: fetch_permit,
+            _history: None,
+            history_generation: None,
         })
     }
     async fn load(
@@ -536,6 +695,7 @@ impl OriginHls {
                 return Err(OriginError::Fetch(FetchError::BodyFailed));
             }
         }
+        let allocation = bytes.capacity();
         let body = if kind == ResourceKind::Playlist {
             if response.status != 200 {
                 return Err(OriginError::InvalidPlaylist);
@@ -557,6 +717,23 @@ impl OriginHls {
             content_range: response.content_range,
             body,
         };
+        if kind == ResourceKind::Media
+            && response.status == 200
+            && data.content_range.is_none()
+            && matches!(range, None | Some("bytes=0-"))
+        {
+            let mut inner = session.inner.lock().unwrap();
+            if !*session.cancel.borrow()
+                && inner
+                    .resources
+                    .get(&id)
+                    .is_some_and(|r| r.cache_generation == cache_generation)
+            {
+                inner
+                    .history
+                    .capture(id, &data.body, allocation, Instant::now());
+            }
+        }
         if kind == ResourceKind::Media {
             if let Some(ttl) = response.cache_ttl {
                 let ttl = ttl.saturating_sub(opened_at.elapsed());
@@ -588,6 +765,8 @@ impl OriginHls {
         bytes: &[u8],
     ) -> Result<Bytes, OriginError> {
         let playlist = playlist::Playlist::parse(bytes, HARD_TIMEOUT)?;
+        let replay_supported = playlist.supports_simple_replay();
+        let replay_segments = playlist.segments().to_vec();
         let mut refs = Vec::with_capacity(playlist.references().len());
         for reference in playlist.references() {
             refs.push((
@@ -697,6 +876,10 @@ impl OriginHls {
                 let (id, suffix) = selected[key];
                 format!("/origin-hls/{token}/{id}{suffix}")
             })
+            .collect();
+        let replay_segments: Vec<_> = replay_segments
+            .into_iter()
+            .map(|segment| (selected[&refs[segment.reference_index]].0, segment))
             .collect();
         let rendered = playlist.render(&replacements)?;
         // Fingerprint both the source and the planned local representation. Resolved
@@ -815,6 +998,11 @@ impl OriginHls {
         parent.playlist.fingerprint = Some(fingerprint);
         parent.playlist.retention = retention;
         parent.playlist.media = current_media.clone();
+        if parent_id == 0 {
+            inner
+                .history
+                .observe(epoch, replay_supported, &replay_segments, now);
+        }
         for id in required {
             if let Some(resource) = inner.resources.get_mut(&id) {
                 resource.touched = tick;

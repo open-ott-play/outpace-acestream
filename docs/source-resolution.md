@@ -37,10 +37,13 @@ Static client compatibility is not a device playback measurement.
 
 `OUTPACE_MANAGED_HLS=1` routes resolved HLS through the local engine. The default
 remains direct handoff. Compatibility starts return a local playlist redirect or
-JSON with `is_direct: true`, `managed_origin: true`, `playback_url` and `stop_url`.
+JSON with `is_direct: true`, `managed_origin: true`, `playback_url`, `command_url`
+and `stop_url`.
 Follow the returned URL; `DELETE stop_url` cancels only that viewer. The managed
-relay has no swarm statistics, peer controls, native audio conversion or retained
-replay. Metadata/discovery responses still describe the origin; they do not start
+relay has no swarm statistics, peer controls or native audio conversion.
+With history explicitly enabled, eligible single-playlist TS origins also expose
+[bounded retained replay](timeshift.md#managed-origin-ts-replay).
+Metadata/discovery responses still describe the origin; they do not start
 this relay. `play --resolve` continues to print the original URL.
 
 The relay rewrites master variants, alternate renditions, I-frame playlists,
@@ -74,7 +77,9 @@ pinned. Removed media/map references have a grace interval derived conservativel
 from playlist duration plus maximum segment duration, capped by playback expiry.
 If the bounded registry cannot admit an update, it fails atomically rather than
 deleting referenced or unexpired resources. This keeps URLs addressable, not
-media stored indefinitely; the origin must still supply requested bytes.
+media stored indefinitely; ordinary live resource requests still depend on the
+origin. Explicit retained replay has its own byte and time limits and can serve
+previously captured segments after their origin URLs expire.
 Stop and expiry cancel
 pending work and make its URLs unavailable.
 
@@ -99,6 +104,19 @@ and errors are described in the [HTTP compatibility contract](protocol/compat-ma
 
 ## File selection and metadata
 
+The documented direct-manifest gateway is available at
+`/hls/manifest.m3u8?manifest_url=<percent-encoded HTTP(S) HLS URL>` when both
+`OUTPACE_ACE_COMPAT=1` and `OUTPACE_MANAGED_HLS=1` are enabled. It accepts exactly one
+`manifest_url` parameter and returns a `302` redirect to a private local playlist.
+Admission is lazy: following that playlist performs the guarded origin fetch and
+HLS validation. Invalid queries do not admit a viewer or fetch a source. With the
+compatibility gate off the route is absent (`404`); with only managed HLS off it
+returns `501`. Other parameters, including `format=json`, are unsupported here.
+It uses the managed relay's existing limits and public-destination policy; it does
+not create a swarm or file table. This is the
+[documented HLS gateway](https://wiki.acestream.media/Engine_HTTP_API#How_to_play_HLS_broadcast),
+not support for the separate `direct_url` selector or hybrid HLS-over-P2P.
+
 URI `index` and HTTP `_idx` are separate contracts. Only a valid decimal zero is
 accepted while playback supports a single file; non-default, malformed, duplicate
 or unsupported selection requests fail before starting a source. The sampled
@@ -108,6 +126,14 @@ uploads are not silently treated as another selector. SDK expansion flags remain
 accepted for ordinary supported descriptors. Malformed legacy `pieces` and
 multi-file descriptors cannot fall through as live. Single-file VOD piece counts
 must agree with the verified length and geometry.
+
+The sampled Android GET builder emits its descriptor query twice. HTTP source
+admission therefore coalesces equal decoded repetitions of `content_id`,
+`infohash`, `url`, `magnet`, and the SDK's optional `transport_file_cache_key`.
+Different values still fail before resolution; other repeated parameters,
+including file selection, options and commands, remain errors. Cache keys remain
+inert and do not create a descriptor cache. This exception does not change CLI
+URI parsing or the direct-manifest gateway's single-parameter contract.
 
 `get_media_files` carries `type: live` or `type: vod` only after classification,
 and verified single-file VOD `size`. Standard single-file metainfo can also supply
@@ -160,7 +186,8 @@ containers. These limits are separate from live HLS packaging and retained repla
 ## Replay and qualification
 
 [Retained replay](timeshift.md) is a per-viewer, finite snapshot of media packaged
-by this engine. Its generation checks, source ownership, pruning and explicit
+by this engine or qualifying TS segments captured by the managed-origin relay.
+Its generation checks, source ownership, pruning and explicit
 return-to-live behavior are tested independently. Original `liveseek` units and
 UTC programme archive semantics are not inferred from method names or piece
 timestamps. Unsupported original controls remain explicit errors.

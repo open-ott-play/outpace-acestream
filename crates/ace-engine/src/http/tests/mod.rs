@@ -17,6 +17,8 @@ mod broadcast_source;
 mod compat;
 mod compat_hls;
 mod native;
+mod origin_gateway;
+mod origin_history;
 mod server_api;
 mod source;
 mod startup;

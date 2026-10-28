@@ -32,6 +32,20 @@ pub fn hls_playlist(data: &[u8]) {
         let timeline = playlist.media_timeline();
         let discontinuity_sequence = playlist.discontinuity_sequence();
         let retention = playlist.retention();
+        let segments = playlist.segments().to_vec();
+        let simple_replay = playlist.supports_simple_replay();
+        assert!(segments.len() <= count);
+        for segment in &segments {
+            assert!(segment.reference_index < count);
+            assert_eq!(
+                playlist.references()[segment.reference_index].kind,
+                ace_media::hls_input::ResourceKind::Media
+            );
+        }
+        for pair in segments.windows(2) {
+            assert!(pair[0].sequence < pair[1].sequence);
+            assert!(pair[0].discontinuity_sequence <= pair[1].discontinuity_sequence);
+        }
         let unchanged: Vec<_> = playlist
             .references()
             .iter()
@@ -51,6 +65,10 @@ pub fn hls_playlist(data: &[u8]) {
         assert_eq!(reparsed.media_timeline(), timeline);
         assert_eq!(reparsed.discontinuity_sequence(), discontinuity_sequence);
         assert_eq!(reparsed.retention(), retention);
+        assert_eq!(reparsed.segments(), segments);
+        // Eligibility here depends on tags; URI uniqueness and media bytes are
+        // separately checked by the recording backend before capture.
+        assert_eq!(reparsed.supports_simple_replay(), simple_replay);
         assert!(reparsed.references().iter().all(|r| r.uri == "x"));
 
         let wrong_count = vec!["x".to_owned(); count + 1];

@@ -242,8 +242,8 @@ fn memvod_hls_router(data: Vec<u8>, seg_packets: usize) -> Router {
 
 #[tokio::test]
 async fn vod_manifest_serves_a_terminated_vod_playlist() {
-    // 1500 bytes over 564-byte (3-packet) segments => 3 segments.
-    let resp = memvod_hls_router(vec![0u8; 1500], 3)
+    // Eight packets over three-packet segments => three segments.
+    let resp = memvod_hls_router(synthetic_vod_ts(8), 3)
         .oneshot(
             Request::get("/vod/memvod/x/manifest.m3u8")
                 .body(Body::empty())
@@ -269,7 +269,7 @@ async fn vod_manifest_serves_a_terminated_vod_playlist() {
 
 #[tokio::test]
 async fn vod_hls_segment_serves_its_verified_byte_range_as_ts() {
-    let data: Vec<u8> = (0..255u8).cycle().take(1500).collect();
+    let data = synthetic_vod_ts(8);
     // Segment 1 covers bytes [564, 1128).
     let resp = memvod_hls_router(data.clone(), 3)
         .oneshot(
@@ -290,8 +290,8 @@ async fn vod_hls_segment_serves_its_verified_byte_range_as_ts() {
 
 #[tokio::test]
 async fn vod_hls_final_segment_is_clamped_to_the_last_byte() {
-    let data: Vec<u8> = (0..255u8).cycle().take(1500).collect();
-    // 1500 bytes => final segment 2 covers [1128, 1500): 372 bytes.
+    let data = synthetic_vod_ts(8);
+    // Eight packets => final segment 2 covers [1128, 1504): 376 bytes.
     let resp = memvod_hls_router(data.clone(), 3)
         .oneshot(
             Request::get("/vod/memvod/x/seg/2.ts")
@@ -301,16 +301,16 @@ async fn vod_hls_final_segment_is_clamped_to_the_last_byte() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(resp.headers()[header::CONTENT_LENGTH], "372");
+    assert_eq!(resp.headers()[header::CONTENT_LENGTH], "376");
     let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
         .await
         .unwrap();
-    assert_eq!(&body[..], &data[1128..1500]);
+    assert_eq!(&body[..], &data[1128..1504]);
 }
 
 #[tokio::test]
 async fn vod_hls_segment_past_the_end_404s() {
-    let resp = memvod_hls_router(vec![0u8; 1500], 3)
+    let resp = memvod_hls_router(synthetic_vod_ts(8), 3)
         .oneshot(
             Request::get("/vod/memvod/x/seg/99.ts")
                 .body(Body::empty())
@@ -319,4 +319,83 @@ async fn vod_hls_segment_past_the_end_404s() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+fn synthetic_vod_ts(packets: usize) -> Vec<u8> {
+    (0..packets)
+        .flat_map(|index| {
+            let mut packet = [0x55; 188];
+            packet[..4].copy_from_slice(&[0x47, 0x01, 0x00, 0x10 | (index as u8 & 15)]);
+            packet
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn vod_hls_rejects_other_containers_without_changing_raw_ranges() {
+    for signature in [
+        b"\x00\x00\x00\x18ftyp".as_slice(),
+        b"\x1a\x45\xdf\xa3".as_slice(),
+    ] {
+        let mut data = vec![0u8; 188 * 8];
+        data[..signature.len()].copy_from_slice(signature);
+        let app = memvod_hls_router(data.clone(), 3);
+        for suffix in ["manifest.m3u8", "seg/0.ts", "seg/1.ts"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/vod/memvod/x/{suffix}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{suffix}"
+            );
+        }
+        let response = app
+            .oneshot(
+                Request::get("/vod/memvod/x")
+                    .header(header::RANGE, "bytes=0-15")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 32)
+                .await
+                .unwrap()
+                .as_ref(),
+            &data[..16]
+        );
+    }
+}
+
+#[tokio::test]
+async fn vod_hls_rejects_partial_packets_and_invalid_transport_headers() {
+    let mut incomplete = synthetic_vod_ts(8);
+    incomplete.push(0);
+    let mut bad_sync = synthetic_vod_ts(8);
+    bad_sync[188] = 0;
+    let mut scrambled = synthetic_vod_ts(8);
+    scrambled[3] |= 0x80;
+    let mut invalid_adaptation = synthetic_vod_ts(8);
+    invalid_adaptation[3] = 0x30;
+    invalid_adaptation[4] = 183;
+    for data in [incomplete, bad_sync, scrambled, invalid_adaptation] {
+        let response = memvod_hls_router(data, 3)
+            .oneshot(
+                Request::get("/vod/memvod/x/manifest.m3u8")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
 }

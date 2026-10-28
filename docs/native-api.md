@@ -4,6 +4,13 @@ The native CLI and HTTP routes are outpace's supported integration surface. They
 players such as VLC, media servers such as Jellyfin, and playlist/proxy tools such as dispatcharr.
 Playback requests start and share sessions, while status routes observe sessions already active.
 
+An origin-HLS descriptor is the exception: native stream routes return a `302`
+handoff with `Cache-Control: no-store` and create no local session. Use
+`outpace play --resolve <input>` for the equivalent explicit CLI URL output.
+Resolved VOD is rejected on live routes; select the native `/vod` route or CLI
+`--vod`. Metadata queried from an unresolved infohash reports unknown properties
+instead of assuming live content. See [source resolution](source-resolution.md).
+
 Examples use `http://127.0.0.1:6878` and the built-in `ace` network. On live
 `/streams/ace/` routes, a bare 40-character hex `<id>` is a **content id**, matching
 compat `id=`. `cid:<content-id>` is its explicit alias; `ih:<infohash>` explicitly
@@ -28,6 +35,7 @@ CLI inputs retain their existing meanings.
 | `outpace serve` | Runs the native HTTP API, RTMP ingest, and enabled peer services. With no command, outpace defaults to `serve`. |
 | `outpace play <input>` | Writes live MPEG-TS bytes to stdout. Diagnostics go to stderr, so redirection and piping are safe. Accepts `acestream://`, `acestream:?`, `magnet:`, and HTTP(S) transport-file inputs. Infohash and magnet inputs require a verified local or catalog-resolved descriptor and fail closed if it cannot be obtained. |
 | `outpace play --vod <input>` | Downloads a single-file VOD, verifies every piece, and writes the file to stdout. |
+| `outpace play --resolve <input>` | Prints the exact direct-origin HLS URL without opening media or creating a session; mutually exclusive with `--vod`. Swarm sources have no direct origin URL. |
 | `outpace broadcast <name>` | Creates or resumes a broadcast, prints HTTP/RTMP ingest and playback metadata to stderr, and runs the server. |
 
 Use `outpace <command> --help` for arguments and accepted inputs. For example:
@@ -52,8 +60,8 @@ outpace broadcast sports --public-host stream.example
 | `GET /streams/<network>/<id>/status` | `200 application/json` | Active-session status; `404` before playback starts or after teardown. |
 | `DELETE /streams/<network>/<id>` | `204` | Force-stops an active session; `404` if inactive. A `.ts` or `.m3u8` suffix is also accepted. |
 | `GET /vod/<network>/<id>` | `200` or `206` streaming body | Verified single-file VOD. Supports one byte range and advertises `Accept-Ranges: bytes`; an unsatisfiable range returns `416`. |
-| `GET /vod/<network>/<id>/manifest.m3u8` | `200 application/vnd.apple.mpegurl` | Static VOD HLS playlist. |
-| `GET /vod/<network>/<id>/seg/<n>.ts` | `200 video/mp2t` | Verified VOD HLS segment. |
+| `GET /vod/<network>/<id>/manifest.m3u8` | `200 application/vnd.apple.mpegurl` | Experimental TS-only VOD HLS playlist (nominal durations; unsupported containers return `415`). |
+| `GET /vod/<network>/<id>/seg/<n>.ts` | `200 video/mp2t` | Verified MPEG-TS VOD HLS segment; framing is checked before headers and during streaming. Unsupported containers return `415`; late errors terminate the body. |
 | `PUT /broadcast/<name>` | `200 application/json` | Exclusively admits raw MPEG-TS ingest. Returns `name`, `content_id`, and `infohash` immediately while an owned task consumes the request body. |
 | `PUT /broadcast/<name>/source` | `202 application/json` | Attaches one managed HTTP(S) MPEG-TS source; returns `name`, `content_id`, `infohash`, `source`. Acceptance is independent of upstream health. |
 | `GET /broadcast/<name>/source` | `200 application/json` | Returns exactly `name`, `source`; never creates a broadcast. |

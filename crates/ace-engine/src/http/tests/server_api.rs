@@ -90,7 +90,8 @@ async fn server_api_analyze_content_echoes_a_direct_infohash_lowercased() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["error"], serde_json::Value::Null);
     assert_eq!(json["result"]["infohash"], upper.to_lowercase());
-    assert_eq!(json["result"]["is_live"], 1);
+    assert_eq!(json["result"]["is_live"], -1);
+    assert_eq!(json["result"]["is_encrypted"], -1);
 }
 
 #[tokio::test]
@@ -117,7 +118,7 @@ async fn server_api_get_content_id_errors_when_it_cannot_be_derived() {
 }
 
 #[tokio::test]
-async fn server_api_get_media_files_lists_the_infohash_file() {
+async fn server_api_get_media_files_does_not_invent_files_for_an_unresolved_infohash() {
     let ih = "aa".repeat(20);
     let (_, json) = server_api_json(
         ace_compat_state(0),
@@ -125,7 +126,9 @@ async fn server_api_get_media_files_lists_the_infohash_file() {
     )
     .await;
     assert_eq!(json["error"], serde_json::Value::Null);
-    assert_eq!(json["result"]["files"][0]["infohash"], ih);
+    assert_eq!(json["result"]["infohash"], ih);
+    assert_eq!(json["result"]["files"], serde_json::json!([]));
+    assert_eq!(json["result"]["is_live"], -1);
 }
 
 #[tokio::test]

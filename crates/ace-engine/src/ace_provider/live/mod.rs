@@ -1,6 +1,51 @@
 use super::*;
 use ace_swarm::live_session::{follow_live, LiveCounters, LiveSeedOptions, LiveSessionInputs};
 
+const INITIAL_DISCOVERY_BUDGET: Duration = Duration::from_secs(10);
+
+/// Retry a completed empty discovery once within the original deadline. An unfinished
+/// (silent) run is never replaced by a competing generation.
+async fn initial_candidates(
+    discovery: &PeerDiscovery,
+    mut run: DiscoveryRun,
+    mut peers: Vec<SocketAddrV4>,
+    deadline: tokio::time::Instant,
+) -> (Vec<SocketAddrV4>, Option<DiscoveryRun>) {
+    if peers.is_empty() {
+        for attempt in 0..2 {
+            match tokio::time::timeout_at(deadline, run.next_candidate()).await {
+                Ok(Some(peer)) => {
+                    peers.push(peer);
+                    break;
+                }
+                Ok(None) if attempt == 0 && tokio::time::Instant::now() < deadline => {
+                    // Drop the completed owner before starting its replacement.
+                    drop(run);
+                    run = DiscoveryRun::start(
+                        discovery,
+                        DiscoveryOptions {
+                            dht_budget: deadline
+                                .saturating_duration_since(tokio::time::Instant::now()),
+                            ..DiscoveryOptions::default()
+                        },
+                    );
+                }
+                _ => break,
+            }
+        }
+    }
+    while let Ok(peer) = run.try_next_candidate() {
+        if !peers.contains(&peer) {
+            peers.push(peer);
+        }
+    }
+    if peers.is_empty() {
+        (peers, None)
+    } else {
+        (peers, Some(run))
+    }
+}
+
 pub(super) struct AceSource {
     pub(super) metrics: Option<Arc<crate::live_stats::LiveMetrics>>,
     pub(super) _sampler: Option<crate::live_stats::MetricsSampler>,
@@ -73,19 +118,18 @@ impl AceProvider {
         // tracker/DHT discovery. Background refill can still discover more peers after start.
         let mut initial_run = None;
         let peers = if self.bootstrap_peers.is_empty() {
-            let mut run = DiscoveryRun::start(&discovery, DiscoveryOptions::default());
-            self.warm_peers.initialized().await;
+            let deadline = tokio::time::Instant::now() + INITIAL_DISCOVERY_BUDGET;
+            let run = DiscoveryRun::start(
+                &discovery,
+                DiscoveryOptions {
+                    dht_budget: INITIAL_DISCOVERY_BUDGET,
+                    ..DiscoveryOptions::default()
+                },
+            );
+            let _ = tokio::time::timeout_at(deadline, self.warm_peers.initialized()).await;
             let hints = self.warm_peers.candidate_addresses(&info.infohash);
-            let mut peers: Vec<_> = hints.into_iter().collect();
-            if peers.is_empty() {
-                peers.extend(run.next_candidate().await);
-            }
-            while let Ok(peer) = run.try_next_candidate() {
-                peers.push(peer);
-            }
-            if !peers.is_empty() {
-                initial_run = Some(run);
-            }
+            let (peers, run) = initial_candidates(&discovery, run, hints, deadline).await;
+            initial_run = run;
             peers
         } else {
             self.bootstrap_peers.clone()
@@ -163,5 +207,122 @@ impl AceProvider {
             startup_buffer,
             bitrate,
         ))
+    }
+}
+
+#[cfg(test)]
+mod initial_discovery_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_empty_run_retries_and_keeps_replacement_for_late_candidates() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let called = calls.clone();
+        let first = SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 10001);
+        let later = SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 10002);
+        let discovery: PeerDiscovery = Arc::new(move |_, sender| {
+            let attempt = called.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                if attempt == 1 {
+                    sender.send(first).await.unwrap();
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let _ = sender.send(later).await;
+                }
+            })
+        });
+        let run = DiscoveryRun::start(&discovery, DiscoveryOptions::default());
+        let (peers, run) = initial_candidates(
+            &discovery,
+            run,
+            Vec::new(),
+            tokio::time::Instant::now() + INITIAL_DISCOVERY_BUDGET,
+        )
+        .await;
+        assert_eq!(peers, vec![first]);
+        assert_eq!(run.unwrap().next_candidate().await, Some(later));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_retry_shares_deadline_and_remaining_dht_budget() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let called = calls.clone();
+        let budgets = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = budgets.clone();
+        let discovery: PeerDiscovery = Arc::new(move |options, sender| {
+            let attempt = called.fetch_add(1, Ordering::Relaxed);
+            observed.lock().unwrap().push(options.dht_budget);
+            Box::pin(async move {
+                if attempt == 0 {
+                    tokio::time::sleep(Duration::from_secs(6)).await;
+                } else {
+                    sender.closed().await;
+                }
+            })
+        });
+        let started = tokio::time::Instant::now();
+        let run = DiscoveryRun::start(
+            &discovery,
+            DiscoveryOptions {
+                dht_budget: INITIAL_DISCOVERY_BUDGET,
+                ..DiscoveryOptions::default()
+            },
+        );
+        let (peers, run) = initial_candidates(
+            &discovery,
+            run,
+            Vec::new(),
+            started + INITIAL_DISCOVERY_BUDGET,
+        )
+        .await;
+        assert!(peers.is_empty() && run.is_none());
+        assert_eq!(started.elapsed(), INITIAL_DISCOVERY_BUDGET);
+        assert_eq!(
+            *budgets.lock().unwrap(),
+            vec![Duration::from_secs(10), Duration::from_secs(4)]
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_discovery_is_bounded_without_starting_another_generation() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let called = calls.clone();
+        let discovery: PeerDiscovery = Arc::new(move |_, sender| {
+            called.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move { sender.closed().await })
+        });
+        let started = tokio::time::Instant::now();
+        let run = DiscoveryRun::start(&discovery, DiscoveryOptions::default());
+        let (peers, run) = initial_candidates(
+            &discovery,
+            run,
+            Vec::new(),
+            started + INITIAL_DISCOVERY_BUDGET,
+        )
+        .await;
+        assert!(peers.is_empty() && run.is_none());
+        assert_eq!(started.elapsed(), INITIAL_DISCOVERY_BUDGET);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_completed_empty_runs_stop_without_a_retry_loop() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let called = calls.clone();
+        let discovery: PeerDiscovery = Arc::new(move |_, _| {
+            called.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {})
+        });
+        let run = DiscoveryRun::start(&discovery, DiscoveryOptions::default());
+        let (peers, run) = initial_candidates(
+            &discovery,
+            run,
+            Vec::new(),
+            tokio::time::Instant::now() + INITIAL_DISCOVERY_BUDGET,
+        )
+        .await;
+        assert!(peers.is_empty() && run.is_none());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 }

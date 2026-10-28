@@ -458,6 +458,13 @@ impl StreamManager {
         }
     }
 
+    /// Cache a live descriptor and its content-id binding from the same signed catalog result.
+    pub fn remember_catalog_descriptor(&self, network: &str, content_id: &str, info: &StreamInfo) {
+        if let Some(provider) = self.registry.get(network) {
+            provider.remember_catalog_descriptor(content_id, info);
+        }
+    }
+
     /// Resolve `id` to a single-file VOD, caching the resolved handle per `(network, id)` so a
     /// whole playback — the HLS manifest plus every segment read — shares one resolution (and, for
     /// the ace provider, one piece cache + one peer discovery) instead of re-resolving per request.

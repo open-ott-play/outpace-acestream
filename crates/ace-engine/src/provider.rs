@@ -137,9 +137,15 @@ pub trait StreamProvider: Send + Sync {
     /// use it (#164). Callers must pass only descriptors resolved through the signed catalog
     /// (never BEP-9 or a transport url): the index trusts them as-is. Defaults to ignoring it.
     fn remember_live_descriptor(&self, _info: &StreamInfo) {}
+
+    /// Seed a content-id resolution already authenticated by the signed catalog. The id and
+    /// descriptor must come from the same catalog response; never call this for transport URLs,
+    /// BEP-9, HLS or caller-supplied metadata. Retains canonical content-id session ownership.
+    fn remember_catalog_descriptor(&self, _content_id: &str, info: &StreamInfo) {
+        self.remember_live_descriptor(info);
+    }
 }
 
-#[derive(Debug)]
 pub enum ProviderError {
     NotFound,
     Backend(String),
@@ -148,6 +154,23 @@ pub enum ProviderError {
     /// message is user-facing: it explains the refusal and how to open the stream instead, and
     /// is safe to return to HTTP clients and to print in the CLI.
     Unresolvable(String),
+    /// A successfully resolved origin HLS source cannot be opened as raw TS. HTTP callers
+    /// hand this exact URL to the player; no local session or piece geometry is created.
+    DirectHls {
+        manifest_url: String,
+    },
+}
+
+impl std::fmt::Debug for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => f.write_str("NotFound"),
+            Self::Backend(message) => f.debug_tuple("Backend").field(message).finish(),
+            Self::Unresolvable(message) => f.debug_tuple("Unresolvable").field(message).finish(),
+            // Signed origin URLs belong only in explicit playback/resolve responses.
+            Self::DirectHls { .. } => f.debug_struct("DirectHls").finish_non_exhaustive(),
+        }
+    }
 }
 
 impl std::fmt::Display for ProviderError {
@@ -155,6 +178,9 @@ impl std::fmt::Display for ProviderError {
         match self {
             ProviderError::NotFound => f.write_str("not found"),
             ProviderError::Backend(msg) | ProviderError::Unresolvable(msg) => f.write_str(msg),
+            ProviderError::DirectHls { .. } => f.write_str(
+                "source is origin HLS; use the native HTTP playback URL or outpace play --resolve",
+            ),
         }
     }
 }

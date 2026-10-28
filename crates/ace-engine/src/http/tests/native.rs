@@ -983,3 +983,77 @@ async fn compat_getstream_mints_urls_for_an_infohash_with_a_verified_descriptor(
     assert!(json["error"].is_null(), "{json}");
     assert_eq!(json["response"]["infohash"], ih);
 }
+
+#[tokio::test]
+async fn origin_hls_handoff_is_exact_and_never_starts_a_local_session() {
+    use std::sync::atomic::AtomicUsize;
+    const URL: &str = "https://cdn.example.test/a%2Fb/master.m3u8?token=a%2Fb%3D&x=1&x=2";
+    struct OriginProvider(Arc<AtomicUsize>);
+    #[async_trait]
+    impl StreamProvider for OriginProvider {
+        fn network(&self) -> &'static str {
+            "ace"
+        }
+        async fn open(&self, _id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(ProviderError::DirectHls {
+                manifest_url: URL.into(),
+            })
+        }
+    }
+    let opens = Arc::new(AtomicUsize::new(0));
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(OriginProvider(opens.clone())));
+    let s = AppState {
+        manager: StreamManager::new(registry),
+        networks: vec!["ace".into()],
+        resolve_content_ids_in_getstream: false,
+        ace_sessions: Arc::new(AceSessionStore::default()),
+        experimental_ace_compat: false,
+        broadcasts: None,
+    };
+    let app = router(s.clone());
+    const CID: &str = "0123456789abcdef0123456789abcdef01234567";
+    for suffix in ["", ".ts", ".m3u8"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/streams/ace/{CID}{suffix}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(response.headers()[header::LOCATION], URL);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(s.manager.list().await.is_empty());
+        assert!(s
+            .manager
+            .get_hls("ace", &format!("cid:{CID}"))
+            .await
+            .is_none());
+    }
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        3,
+        "signed origin redirects must not become retained sessions"
+    );
+    for suffix in ["status", "seg/0.ts"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/streams/ace/{CID}/{suffix}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+    assert_eq!(
+        opens.load(Ordering::SeqCst),
+        3,
+        "status/segment probes never open origins"
+    );
+}

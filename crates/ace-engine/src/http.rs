@@ -7,7 +7,7 @@ use crate::manager::StreamManager;
 use crate::provider::{ProviderError, VodByteSource, VodContent};
 use crate::session::{StreamEvent, StreamSession};
 use ace_swarm::listen::SeedRegistry;
-use ace_swarm::resolve::{infohash_hex, resolve_via_catalog, stream_info_from_transport_url};
+use ace_swarm::resolve::infohash_hex;
 use ace_swarm::types::StreamMetadata;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};

@@ -239,3 +239,93 @@ async fn disabled_fallback_preserves_catalog_resolution_and_cached_trust() {
         .verified_info_for_infohash(&infohash_hex(&expected.infohash))
         .is_ok());
 }
+
+#[tokio::test]
+async fn origin_hls_classification_is_fresh_and_never_indexes_swarm_geometry() {
+    let p = provider().with_bep9_content_id_fallback(true);
+    for token in ["first%2F", "second%2B"] {
+        let url = format!("https://cdn.example.test/master.m3u8?token={token}");
+        let resolved = p
+            .resolve_content_playback_with_catalog(
+                CID,
+                ready(Ok(ResolvedTransport::Hls {
+                    manifest_url: url.clone(),
+                    metadata: StreamMetadata::default(),
+                })),
+            )
+            .await
+            .unwrap();
+        let error = AceProvider::require_live(resolved).unwrap_err();
+        assert!(
+            matches!(&error, ProviderError::DirectHls { manifest_url } if manifest_url == &url)
+        );
+        assert!(!format!("{error:?}").contains(token));
+        assert!(!error.to_string().contains(token));
+        assert!(p.resolve_cache.get(CID).is_none());
+        assert!(p.peer_resolve_cache.get(CID).is_none());
+        assert!(p.verified_info_for_infohash(CID).is_err());
+    }
+}
+
+#[tokio::test]
+async fn classified_vod_does_not_enter_live_caches_or_peer_fallback() {
+    let p = provider().with_bep9_content_id_fallback(true);
+    let source = p
+        .resolve_content_playback_with_catalog(CID, async { playback_from_transport(RAW_METAINFO) })
+        .await
+        .unwrap();
+    assert!(matches!(&source, ResolvedTransport::Vod(info) if info.total_length == 16_385));
+    let error = AceProvider::require_live(source).unwrap_err();
+    assert!(matches!(&error, ProviderError::Unresolvable(message) if message.contains("/vod/")));
+    assert!(p.resolve_cache.get(CID).is_none());
+    assert!(p.peer_resolve_cache.get(CID).is_none());
+}
+
+#[tokio::test]
+async fn recognized_invalid_source_never_falls_back_to_peer_resolution() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(address) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let p = provider()
+        .with_bep9_content_id_fallback(true)
+        .with_bootstrap_peers(vec![address]);
+    for failure in [
+        ResolveError::Hls("missing manifest"),
+        ResolveError::Transport("multi-file VOD is not supported"),
+    ] {
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            p.resolve_content_playback_with_catalog(CID, ready(Err(failure))),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(ProviderError::Unresolvable(_))));
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn authenticated_cid_seed_preserves_native_session_identity_without_second_fetch() {
+    let p = provider();
+    let (bytes, _) = test_support::synthetic_live_transport(524_288);
+    let expected = stream_info_from_transport(&bytes).unwrap();
+    p.remember_catalog_descriptor(&CID.to_ascii_uppercase(), &expected);
+    let source = p
+        .resolve_content_playback_with_catalog(CID, async {
+            panic!("the signed CID binding should already be cached")
+        })
+        .await
+        .unwrap();
+    assert!(matches!(source, ResolvedTransport::Swarm(info) if info == expected));
+    assert_eq!(
+        p.verified_info_for_infohash(&infohash_hex(&expected.infohash))
+            .unwrap(),
+        expected
+    );
+    assert!(p.peer_resolve_cache.get(CID).is_none());
+}

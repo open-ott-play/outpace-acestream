@@ -43,10 +43,11 @@ use ace_swarm::discover::{
 use ace_swarm::listen::{SeedLease, SeedRegistry};
 use ace_swarm::reachability::ReachabilityMonitor;
 use ace_swarm::resolve::{
-    catalog_transport_bytes, hex20, infohash_hex, resolve_infohash_via_catalog,
-    resolve_via_catalog, resolve_via_peer, stream_info_from_transport,
-    stream_info_from_transport_url, transport_bytes_from_url, transport_bytes_via_peer,
-    vod_info_from_transport, InfohashIndex, ResolveCache, ResolveError,
+    catalog_transport_bytes, hex20, infohash_hex, playback_from_transport,
+    resolve_infohash_via_catalog, resolve_playback_from_url, resolve_playback_via_catalog,
+    resolve_via_peer, stream_info_from_transport, transport_bytes_from_url,
+    transport_bytes_via_peer, vod_info_from_transport, InfohashIndex, ResolveCache, ResolveError,
+    ResolvedTransport,
 };
 use ace_swarm::store::{BackendKind, PieceStore};
 use ace_swarm::types::{StreamInfo, StreamMetadata, VodInfo};
@@ -472,6 +473,13 @@ impl StreamProvider for AceProvider {
 
     fn remember_live_descriptor(&self, info: &StreamInfo) {
         self.infohash_index.put(info.clone());
+    }
+
+    fn remember_catalog_descriptor(&self, content_id: &str, info: &StreamInfo) {
+        if let Ok(key) = hex20(content_id) {
+            self.resolve_cache.put(&infohash_hex(&key), info.clone());
+            self.infohash_index.put(info.clone());
+        }
     }
 
     async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError> {

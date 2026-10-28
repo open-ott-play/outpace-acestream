@@ -183,7 +183,16 @@ pub(super) async fn vod_manifest(
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    let layout = crate::hls::VodHlsLayout::new(vod.content_length(), s.manager.hls_config());
+    let layout = match crate::hls::VodHlsLayout::new(vod.content_length(), s.manager.hls_config()) {
+        Ok(layout) => layout,
+        Err(message) => return (StatusCode::UNSUPPORTED_MEDIA_TYPE, message).into_response(),
+    };
+    // Inspect a bounded, verified prefix before advertising any .ts URLs. A file name or
+    // packet-aligned length does not identify its container. Drop the probe source here.
+    let probe_length = (TS_PROBE_PACKETS * TS_PACKET_BYTES) as u64;
+    if let Err(response) = open_ts_vod_range(&s, vod.as_ref(), 0, probe_length - 1).await {
+        return *response;
+    }
     (
         [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
         layout.playlist(&network, &id),
@@ -205,24 +214,431 @@ pub(super) async fn vod_hls_segment(
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    let layout = crate::hls::VodHlsLayout::new(vod.content_length(), s.manager.hls_config());
+    let layout = match crate::hls::VodHlsLayout::new(vod.content_length(), s.manager.hls_config()) {
+        Ok(layout) => layout,
+        Err(message) => return (StatusCode::UNSUPPORTED_MEDIA_TYPE, message).into_response(),
+    };
     let Some((start, end)) = layout.segment_range(index) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match s.manager.open_vod_range(vod.as_ref(), start, end).await {
-        Ok(source) => vod_hls_segment_response(source),
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
+    match open_ts_vod_range(&s, vod.as_ref(), start, end).await {
+        Ok(stream) => vod_hls_segment_response(stream),
+        Err(response) => *response,
     }
 }
 
-/// Build a streaming `200` response for one HLS VOD segment (MPEG-TS), advertising its length.
-fn vod_hls_segment_response(source: Box<dyn VodByteSource>) -> Response {
-    let len = source.content_length();
+/// Opening a range and probing its format share one deadline. Cancellation drops both the
+/// manager's operation guard and any already-opened range reader.
+async fn open_ts_vod_range(
+    s: &AppState,
+    vod: &dyn VodContent,
+    start: u64,
+    end: u64,
+) -> Result<TsVodStream, Box<Response>> {
+    let timeout = s.manager.hls_startup_timeout();
+    tokio::time::timeout(timeout, async {
+        let source = s
+            .manager
+            .open_vod_range(vod, start, end)
+            .await
+            .map_err(|error| {
+                Box::new((StatusCode::BAD_GATEWAY, error.to_string()).into_response())
+            })?;
+        probe_ts_source(source, end - start + 1, timeout).await
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(Box::new(
+            (StatusCode::GATEWAY_TIMEOUT, "VOD container probe timed out").into_response(),
+        ))
+    })
+}
+
+const TS_PACKET_BYTES: usize = 188;
+const TS_PROBE_PACKETS: usize = 3;
+
+/// Container framing only: this does not certify PAT/PMT, timestamps, codecs or GOP boundaries.
+fn valid_ts_packet(packet: &[u8]) -> bool {
+    if packet.len() != TS_PACKET_BYTES
+        || packet[0] != 0x47
+        || packet[1] & 0x80 != 0
+        || packet[3] & 0xc0 != 0
+    {
+        return false;
+    }
+    match (packet[3] >> 4) & 3 {
+        1 => true,
+        2 => packet[4] == 183,
+        3 => packet[4] <= 182,
+        _ => false,
+    }
+}
+
+struct TsVodStream {
+    source: Box<dyn VodByteSource>,
+    prefix: std::collections::VecDeque<Bytes>,
+    /// Only a packet spanning source chunks is copied. Whole chunks stay zero-copy.
+    partial_packet: Vec<u8>,
+    remaining: u64,
+    timeout: Duration,
+    failed: bool,
+}
+
+impl TsVodStream {
+    fn validate(&mut self, mut chunk: &[u8]) -> bool {
+        if !self.partial_packet.is_empty() {
+            let take = (TS_PACKET_BYTES - self.partial_packet.len()).min(chunk.len());
+            self.partial_packet.extend_from_slice(&chunk[..take]);
+            chunk = &chunk[take..];
+            if self.partial_packet.len() < TS_PACKET_BYTES {
+                return true;
+            }
+            if !valid_ts_packet(&self.partial_packet) {
+                return false;
+            }
+            self.partial_packet.clear();
+        }
+        let (packets, remainder) = chunk.as_chunks::<TS_PACKET_BYTES>();
+        if !packets.iter().all(|packet| valid_ts_packet(packet)) {
+            return false;
+        }
+        self.partial_packet.extend_from_slice(remainder);
+        true
+    }
+}
+
+/// Inspect at most three packets of framing, retaining the original source chunks for the body.
+/// This bounded probe never downloads the complete VOD or starts a live session.
+async fn probe_ts_source(
+    mut source: Box<dyn VodByteSource>,
+    expected_length: u64,
+    timeout: Duration,
+) -> Result<TsVodStream, Box<Response>> {
+    if source.content_length() != expected_length {
+        return Err(Box::new(
+            (StatusCode::BAD_GATEWAY, "VOD range length mismatch").into_response(),
+        ));
+    }
+    let wanted = expected_length.min((TS_PROBE_PACKETS * TS_PACKET_BYTES) as u64) as usize;
+    let mut probe = Vec::with_capacity(wanted);
+    let mut prefix = std::collections::VecDeque::new();
+    let mut received = 0u64;
+    let read = tokio::time::timeout(timeout, async {
+        let mut empty_chunks = 0;
+        while probe.len() < wanted {
+            let Some(chunk) = source.next().await else {
+                return false;
+            };
+            if chunk.is_empty() {
+                empty_chunks += 1;
+                if empty_chunks > 16 {
+                    return false;
+                }
+                continue;
+            }
+            let Some(next_received) = received.checked_add(chunk.len() as u64) else {
+                return false;
+            };
+            if next_received > expected_length {
+                return false;
+            }
+            received = next_received;
+            probe.extend_from_slice(&chunk[..chunk.len().min(wanted - probe.len())]);
+            prefix.push_back(chunk);
+        }
+        true
+    })
+    .await;
+    match read {
+        Err(_) => {
+            return Err(Box::new(
+                (StatusCode::GATEWAY_TIMEOUT, "VOD container probe timed out").into_response(),
+            ))
+        }
+        Ok(false) => {
+            return Err(Box::new(
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "VOD range ended before its declared length",
+                )
+                    .into_response(),
+            ))
+        }
+        Ok(true) => {}
+    }
+    if wanted == 0
+        || !probe.len().is_multiple_of(TS_PACKET_BYTES)
+        || !probe
+            .as_chunks::<TS_PACKET_BYTES>()
+            .0
+            .iter()
+            .all(|packet| valid_ts_packet(packet))
+    {
+        return Err(Box::new((StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "VOD HLS requires unencrypted 188-byte MPEG-TS; use the raw VOD URL for other containers").into_response()));
+    }
+    Ok(TsVodStream {
+        source,
+        prefix,
+        partial_packet: Vec::with_capacity(TS_PACKET_BYTES),
+        remaining: expected_length,
+        timeout,
+        failed: false,
+    })
+}
+
+/// Probe framing before headers; validate every remaining packet during streaming. A late
+/// truncated or corrupt range fails the HTTP body rather than silently publishing valid TS.
+fn vod_hls_segment_response(stream: TsVodStream) -> Response {
+    let expected_length = stream.remaining;
+    let body = futures::stream::unfold(stream, |mut stream| async move {
+        if stream.failed || stream.remaining == 0 {
+            return None;
+        }
+        let chunk = if let Some(chunk) = stream.prefix.pop_front() {
+            Ok(Some(chunk))
+        } else {
+            tokio::time::timeout(stream.timeout, stream.source.next()).await
+        };
+        let result = match chunk {
+            Ok(Some(chunk))
+                if !chunk.is_empty()
+                    && chunk.len() as u64 <= stream.remaining
+                    && stream.validate(&chunk) =>
+            {
+                stream.remaining -= chunk.len() as u64;
+                Ok(chunk)
+            }
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "VOD segment timed out",
+            )),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid or truncated VOD MPEG-TS range",
+            )),
+        };
+        stream.failed = result.is_err();
+        Some((result, stream))
+    });
     axum::http::Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "video/mp2t")
-        .header(header::CONTENT_LENGTH, len)
-        .body(vod_body(source))
+        .header(header::CONTENT_LENGTH, expected_length)
+        .body(Body::from_stream(body))
         .expect("valid vod segment response")
         .into_response()
+}
+
+#[cfg(test)]
+mod qualification_tests {
+    use super::*;
+    use crate::provider::ProviderRegistry;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Source {
+        chunks: std::collections::VecDeque<Bytes>,
+        declared: u64,
+        stall: bool,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Drop for Source {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VodByteSource for Source {
+        fn content_length(&self) -> u64 {
+            self.declared
+        }
+        async fn next(&mut self) -> Option<Bytes> {
+            if self.stall && self.chunks.is_empty() {
+                std::future::pending::<()>().await;
+            }
+            self.chunks.pop_front()
+        }
+    }
+
+    fn packets(count: usize) -> Vec<u8> {
+        (0..count)
+            .flat_map(|_| {
+                let mut packet = [0x55; TS_PACKET_BYTES];
+                packet[..4].copy_from_slice(&[0x47, 0x01, 0x00, 0x10]);
+                packet
+            })
+            .collect()
+    }
+
+    fn source(chunks: Vec<Bytes>, declared: u64) -> (Box<dyn VodByteSource>, Arc<AtomicUsize>) {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        (
+            Box::new(Source {
+                chunks: chunks.into(),
+                declared,
+                stall: false,
+                dropped: dropped.clone(),
+            }),
+            dropped,
+        )
+    }
+
+    async fn qualified_response(
+        source: Box<dyn VodByteSource>,
+        length: u64,
+        timeout: Duration,
+    ) -> Response {
+        match probe_ts_source(source, length, timeout).await {
+            Ok(stream) => vod_hls_segment_response(stream),
+            Err(response) => *response,
+        }
+    }
+
+    #[tokio::test]
+    async fn vod_ts_segment_preserves_bytes_across_every_small_chunk_alignment() {
+        let data = packets(8);
+        for size in [1, 17, 187, 188, 189, 563, 564, 1504] {
+            let chunks = data.chunks(size).map(Bytes::copy_from_slice).collect();
+            let (source, dropped) = source(chunks, data.len() as u64);
+            let response =
+                qualified_response(source, data.len() as u64, Duration::from_secs(1)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(body.as_ref(), data, "chunk size {size}");
+            assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn vod_ts_segment_fails_late_corruption_and_short_ranges() {
+        let data = packets(8);
+        let mut corrupt_tail = data[564..].to_vec();
+        corrupt_tail[188] = 0;
+        for tail in [corrupt_tail, data[564..1000].to_vec()] {
+            let (source, dropped) = source(
+                vec![Bytes::copy_from_slice(&data[..564]), Bytes::from(tail)],
+                data.len() as u64,
+            );
+            let response =
+                qualified_response(source, data.len() as u64, Duration::from_secs(1)).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "prefix qualifies before the later source failure"
+            );
+            assert!(axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .is_err());
+            assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn vod_ts_probe_rejects_short_oversized_and_misdeclared_ranges_and_drops_reader() {
+        for (data, declared) in [(packets(2), 564), (packets(4), 564), (packets(3), 565)] {
+            let (source, dropped) = source(vec![Bytes::from(data)], declared);
+            let response = qualified_response(source, 564, Duration::from_secs(1)).await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn vod_ts_probe_timeout_releases_the_reader() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let source = Box::new(Source {
+            chunks: Default::default(),
+            declared: 564,
+            stall: true,
+            dropped: dropped.clone(),
+        });
+        let response = qualified_response(source, 564, Duration::from_secs(1)).await;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn vod_ts_probe_is_cancel_safe() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let source = Box::new(Source {
+            chunks: Default::default(),
+            declared: 564,
+            stall: true,
+            dropped: dropped.clone(),
+        });
+        let task = tokio::spawn(qualified_response(source, 564, Duration::from_secs(30)));
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn vod_ts_body_timeout_releases_the_reader() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let source = Box::new(Source {
+            chunks: [Bytes::from(packets(3))].into(),
+            declared: 1504,
+            stall: true,
+            dropped: dropped.clone(),
+        });
+        let response = qualified_response(source, 1504, Duration::from_secs(1)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .is_err());
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn vod_ts_range_open_and_probe_share_the_startup_deadline() {
+        struct PendingContent(Arc<AtomicUsize>);
+        struct OpenGuard(Arc<AtomicUsize>);
+        impl Drop for OpenGuard {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        #[async_trait::async_trait]
+        impl VodContent for PendingContent {
+            fn content_length(&self) -> u64 {
+                564
+            }
+            async fn open_range(
+                &self,
+                _: u64,
+                _: u64,
+            ) -> Result<Box<dyn VodByteSource>, ProviderError> {
+                let _guard = OpenGuard(self.0.clone());
+                std::future::pending().await
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let state = AppState {
+            manager: StreamManager::with_config(
+                ProviderRegistry::new(),
+                256,
+                crate::config::HlsConfig {
+                    startup_timeout_ms: 100,
+                    ..crate::config::HlsConfig::default()
+                },
+            ),
+            networks: vec![],
+            resolve_content_ids_in_getstream: false,
+            ace_sessions: Arc::new(AceSessionStore::default()),
+            experimental_ace_compat: false,
+            broadcasts: None,
+        };
+        let started = tokio::time::Instant::now();
+        let result = open_ts_vod_range(&state, &PendingContent(dropped.clone()), 0, 563).await;
+        let Err(response) = result else {
+            panic!("pending range must time out")
+        };
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    }
 }

@@ -1,44 +1,69 @@
 use super::*;
 
 impl AceProvider {
-    /// Resolve a content-id to a [`StreamInfo`] by fetching its `AceStreamTransport` metadata
-    /// from the signed catalog path or this daemon's own broadcast registry. With explicit
-    /// opt-in, BEP-9 peers can resolve raw wrapped-transport hashes (cached with a TTL).
-    /// Only a signed-catalog result is recorded in the
-    /// infohash index; a BEP-9 result goes to `peer_resolve_cache` and never makes its infohash
-    /// openable (#164).
-    async fn resolve_content_id(&self, content_id: &str) -> Result<StreamInfo, ProviderError> {
-        self.resolve_content_id_with_catalog(content_id, resolve_via_catalog(content_id))
-            .await
+    /// Resolve the source transport without opening a peer or creating a playback session.
+    /// HLS URLs are intentionally not cached: their signed query may expire or rotate.
+    async fn resolve_content_playback(
+        &self,
+        content_id: &str,
+    ) -> Result<ResolvedTransport, ProviderError> {
+        self.resolve_content_playback_with_catalog(
+            content_id,
+            resolve_playback_via_catalog(content_id),
+        )
+        .await
     }
 
+    #[cfg(test)]
     pub(super) async fn resolve_content_id_with_catalog(
         &self,
         content_id: &str,
         catalog: impl std::future::Future<Output = Result<StreamInfo, ResolveError>>,
     ) -> Result<StreamInfo, ProviderError> {
+        Self::require_live(
+            self.resolve_content_playback_with_catalog(content_id, async {
+                catalog.await.map(ResolvedTransport::Swarm)
+            })
+            .await?,
+        )
+    }
+
+    pub(super) async fn resolve_content_playback_with_catalog(
+        &self,
+        content_id: &str,
+        catalog: impl std::future::Future<Output = Result<ResolvedTransport, ResolveError>>,
+    ) -> Result<ResolvedTransport, ProviderError> {
         if let Some(info) = self.resolve_cache.get(content_id) {
             // Re-record: the bounded infohash index may have evicted it since (#164).
             self.infohash_index.put(info.clone());
-            return Ok(info);
+            return Ok(ResolvedTransport::Swarm(info));
         }
         let key = hex20(content_id).map_err(|_| ProviderError::Backend("bad content-id".into()))?;
         if let Some(bytes) = self.seed_registry.broadcast_transport_for_content_id(&key) {
-            return stream_info_from_transport(&bytes)
+            return playback_from_transport(&bytes)
                 .map_err(|e| ProviderError::Backend(format!("local broadcast descriptor: {e:?}")));
         }
         if self.bep9_content_id_fallback {
             if let Some(info) = self.peer_resolve_cache.get(content_id) {
-                return Ok(info);
+                return Ok(ResolvedTransport::Swarm(info));
             }
         }
 
         let catalog_error = match catalog.await {
-            Ok(info) => {
+            Ok(source) => {
+                if let ResolvedTransport::Swarm(info) = &source {
+                    self.resolve_cache.put(content_id, info.clone());
+                    self.infohash_index.put(info.clone());
+                }
                 crate::alog!("[ace] resolved content id via catalog");
-                self.resolve_cache.put(content_id, info.clone());
-                self.infohash_index.put(info.clone());
-                return Ok(info);
+                return Ok(source);
+            }
+            Err(error @ (ResolveError::Hls(_) | ResolveError::Transport(_))) => {
+                // A returned descriptor was classified but is unusable/unsupported. This is
+                // not a catalog outage and must not reinterpret its id as raw-hash peer data.
+                return Err(ProviderError::Unresolvable(format!(
+                    "unsupported source descriptor: {error:?}"
+                )));
             }
             Err(e) => e,
         };
@@ -77,7 +102,7 @@ impl AceProvider {
                     // A raw transport hash is not catalog authentication: keep the descriptor
                     // out of the infohash index (#164).
                     self.peer_resolve_cache.put(content_id, info.clone());
-                    return Ok(info);
+                    return Ok(ResolvedTransport::Swarm(info));
                 }
                 Err(ResolveError::Peer(why)) => crate::alog!("[ace] resolve {addr}: {why}"),
                 Err(e) => crate::alog!("[ace] resolve {addr}: {e:?}"),
@@ -93,7 +118,7 @@ impl AceProvider {
     /// `outpace play`). See #164.
     ///
     /// - `cid:<40hex>`: local broadcast or signed catalog; raw-hash BEP-9 peers require opt-in
-    ///   ([`Self::resolve_content_id`]).
+    ///   ([`Self::resolve_content_playback`]).
     /// - a transport-url id: fetched under the SSRF guard; not recorded in the infohash index.
     /// - a bare 40-hex infohash: own broadcast, verified index, then authenticated catalog
     ///   lookup with strict requested-hash binding. Unavailable metadata fails closed;
@@ -102,20 +127,41 @@ impl AceProvider {
     /// Every signed-catalog content-id descriptor resolved here is recorded in the infohash
     /// index, so the stream can later be opened by its infohash too (BEP-9 results are not). outpace never guesses live geometry.
     pub(super) async fn resolve_live_info(&self, id: &str) -> Result<StreamInfo, ProviderError> {
+        Self::require_live(self.resolve_playback(id).await?)
+    }
+
+    pub(super) fn require_live(source: ResolvedTransport) -> Result<StreamInfo, ProviderError> {
+        match source {
+            ResolvedTransport::Swarm(info) => Ok(info),
+            ResolvedTransport::Hls { manifest_url, .. } => {
+                Err(ProviderError::DirectHls { manifest_url })
+            }
+            ResolvedTransport::Vod(_) => Err(ProviderError::Unresolvable(
+                "source is single-file VOD; use /vod/ace/{id} or outpace play --vod".into(),
+            )),
+        }
+    }
+
+    /// Shared classification for native TS/HLS playback and CLI direct-origin resolution.
+    /// Only signed-catalog live descriptors enter the infohash index. Caller-supplied URLs,
+    /// peer fallback, HLS manifests and VOD descriptors never become trusted live geometry.
+    pub(crate) async fn resolve_playback(
+        &self,
+        id: &str,
+    ) -> Result<ResolvedTransport, ProviderError> {
         if let Some(content_id) = id.strip_prefix("cid:") {
-            return self.resolve_content_id(content_id).await;
+            return self.resolve_content_playback(content_id).await;
         }
         if let Some(url) = crate::transport_url::decode_transport_url(id) {
-            // Not recorded in the index: a transport URL is caller-supplied, and the index is
-            // shared state whose trackers the infohash does not bind (#164).
-            return stream_info_from_transport_url(&url)
+            return resolve_playback_from_url(&url)
                 .await
                 .map_err(|e| ProviderError::Backend(format!("transport url: {e:?}")));
         }
         if is_bare_hex40(id) {
             return self
                 .resolve_infohash_with_catalog(id, resolve_infohash_via_catalog(id))
-                .await;
+                .await
+                .map(ResolvedTransport::Swarm);
         }
         Err(ProviderError::Backend(
             "id must be a 40-hex infohash, cid:<40hex>, or a transport-url id".into(),
@@ -301,7 +347,7 @@ impl AceProvider {
 
     /// Fetch VOD transport bytes over a metadata-swarm peer (BEP-9 `ut_metadata`), trying each
     /// discovered/bootstrap peer in turn — the VOD analogue of the peer fallback in
-    /// [`Self::resolve_content_id`].
+    /// [`Self::resolve_content_playback`].
     async fn vod_transport_via_peers(&self, key: [u8; 20]) -> Result<Vec<u8>, ProviderError> {
         let all = if self.bootstrap_peers.is_empty() {
             discover_peers(

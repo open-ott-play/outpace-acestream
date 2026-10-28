@@ -1130,9 +1130,9 @@ impl HlsPackager {
 /// size — no state, no retained window. Each segment maps to an inclusive byte range that the
 /// HTTP layer serves via `VodContent::open_range` (which SHA-1-verifies the covering pieces).
 ///
-/// Segmentation is byte-based and aligned to whole 188-byte TS packets, exactly like the live
-/// packager: it assumes MPEG-TS content and is not keyframe-aware (fine for tolerant players;
-/// precise GOP segmentation is a documented follow-up).
+/// Segmentation remains byte-based, with nominal durations, and is not keyframe-aware.
+/// Callers must qualify the container before exposing this experimental layout. It does not
+/// provide the PCR/GOP index required for accurate VOD seeking or independent segments.
 pub struct VodHlsLayout {
     total: u64,
     /// Segment size in bytes (a whole number of 188-byte TS packets, >= 188).
@@ -1142,15 +1142,30 @@ pub struct VodHlsLayout {
 }
 
 impl VodHlsLayout {
-    pub fn new(total: u64, config: HlsConfig) -> VodHlsLayout {
-        VodHlsLayout {
-            total,
-            seg_bytes: (config.segment_packets.max(3) * TS_PACKET) as u64,
-            seg_duration: config.segment_duration_secs(),
+    pub fn new(total: u64, config: HlsConfig) -> Result<VodHlsLayout, &'static str> {
+        if total < (TS_PACKET * 3) as u64 || !total.is_multiple_of(TS_PACKET as u64) {
+            return Err("VOD HLS requires a nonempty, packet-aligned 188-byte MPEG-TS file; use the raw VOD URL for other containers");
         }
+        let seg_bytes = u64::try_from(config.segment_packets.max(3))
+            .ok()
+            .and_then(|packets| packets.checked_mul(TS_PACKET as u64))
+            .ok_or("VOD HLS segment size overflows")?;
+        // Bound the complete playlist; raw range requests need no in-memory manifest.
+        if total.div_ceil(seg_bytes) > 65_536 {
+            return Err("VOD HLS playlist exceeds the segment limit; use the raw VOD URL");
+        }
+        let seg_duration = config.segment_duration_secs();
+        if !seg_duration.is_finite() || seg_duration <= 0.0 {
+            return Err("VOD HLS requires a positive finite segment duration");
+        }
+        Ok(VodHlsLayout {
+            total,
+            seg_bytes,
+            seg_duration,
+        })
     }
 
-    /// Number of segments covering the whole file (ceil division). Zero-length → 0 segments.
+    /// Number of segments covering the qualified nonempty file (ceil division).
     pub fn segment_count(&self) -> u64 {
         self.total.div_ceil(self.seg_bytes)
     }
@@ -1163,7 +1178,7 @@ impl VodHlsLayout {
             return None;
         }
         let start = index * self.seg_bytes;
-        let end = ((index + 1) * self.seg_bytes).min(self.total) - 1;
+        let end = start.saturating_add(self.seg_bytes).min(self.total) - 1;
         Some((start, end))
     }
 
@@ -2877,39 +2892,59 @@ mod tests {
     }
 
     #[test]
-    fn vod_segment_count_is_ceil_division_of_total_over_segment_bytes() {
-        // 564-byte segments.
-        assert_eq!(VodHlsLayout::new(0, vod_config()).segment_count(), 0);
-        assert_eq!(VodHlsLayout::new(1, vod_config()).segment_count(), 1);
-        assert_eq!(VodHlsLayout::new(564, vod_config()).segment_count(), 1);
-        assert_eq!(VodHlsLayout::new(565, vod_config()).segment_count(), 2);
-        assert_eq!(VodHlsLayout::new(564 * 3, vod_config()).segment_count(), 3);
+    fn vod_layout_rejects_unaligned_short_and_unbounded_files() {
+        for total in [0, 1, 187, 188, 376, 565, 1500, u64::MAX] {
+            assert!(VodHlsLayout::new(total, vod_config()).is_err(), "{total}");
+        }
+        assert!(VodHlsLayout::new(564 * 65_537, vod_config()).is_err());
+        assert!(VodHlsLayout::new(564 * 65_536, vod_config()).is_ok());
+    }
+
+    #[test]
+    fn vod_segment_count_is_ceil_division_of_aligned_total_over_segment_bytes() {
+        assert_eq!(
+            VodHlsLayout::new(564, vod_config())
+                .unwrap()
+                .segment_count(),
+            1
+        );
+        assert_eq!(
+            VodHlsLayout::new(752, vod_config())
+                .unwrap()
+                .segment_count(),
+            2
+        );
+        assert_eq!(
+            VodHlsLayout::new(564 * 3, vod_config())
+                .unwrap()
+                .segment_count(),
+            3
+        );
     }
 
     #[test]
     fn vod_segment_range_is_aligned_with_a_clamped_final_segment() {
-        // 1500 bytes over 564-byte segments => [0,564), [564,1128), [1128,1500).
-        let layout = VodHlsLayout::new(1500, vod_config());
+        let layout = VodHlsLayout::new(188 * 8, vod_config()).unwrap();
         assert_eq!(layout.segment_range(0), Some((0, 563)));
         assert_eq!(layout.segment_range(1), Some((564, 1127)));
-        assert_eq!(layout.segment_range(2), Some((1128, 1499))); // clamped, shorter
-        assert_eq!(layout.segment_range(3), None); // past the last segment
+        assert_eq!(layout.segment_range(2), Some((1128, 1503)));
+        assert_eq!(layout.segment_range(3), None);
+        assert_eq!(layout.segment_range(u64::MAX), None);
     }
 
     #[test]
     fn vod_playlist_is_a_terminated_vod_list_of_every_segment() {
-        // 1500 bytes => 3 segments; last is 372/564 of a full 2.0s segment.
-        let pl = VodHlsLayout::new(1500, vod_config()).playlist("memvod", "abc");
+        let pl = VodHlsLayout::new(188 * 8, vod_config())
+            .unwrap()
+            .playlist("memvod", "abc");
         assert!(pl.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
         assert!(pl.contains("#EXT-X-TARGETDURATION:2"));
         assert!(pl.contains("#EXT-X-MEDIA-SEQUENCE:0"));
         assert!(pl.contains("/vod/memvod/abc/seg/0.ts"));
         assert!(pl.contains("/vod/memvod/abc/seg/2.ts"));
         assert!(!pl.contains("/vod/memvod/abc/seg/3.ts"));
-        assert!(pl.trim_end().ends_with("#EXT-X-ENDLIST"));
-        // Full segments advertise the nominal 2.0s; the trailing partial is scaled by bytes.
-        assert!(pl.contains("#EXTINF:2.000,"));
-        assert!(pl.contains(&format!("#EXTINF:{:.3},", 2.0 * 372.0 / 564.0)));
+        assert!(pl.ends_with("#EXT-X-ENDLIST\n"));
+        assert!(!pl.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
     }
 
     #[test]

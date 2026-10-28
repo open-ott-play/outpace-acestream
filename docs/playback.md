@@ -30,6 +30,13 @@ Play a known Acestream link to stdout:
 cargo run -p ace-engine --bin outpace -- play 'acestream://<content-id>' > live.ts
 ```
 
+The descriptor may instead select a direct HLS origin. For that source, use
+`outpace play --resolve 'acestream://<content-id>'` and pass the printed URL to
+your player. Native and compatibility HTTP playback routes redirect directly;
+the JSON compatibility response sets `is_direct: true` and owns no local controls
+or recording. See [source resolution and playback ownership](source-resolution.md)
+for HLS, VOD container limits and cancellation semantics.
+
 `play` accepts four mutually exclusive selectors, applied in precedence order
 `content_id` > `infohash` > `url` > `magnet`:
 

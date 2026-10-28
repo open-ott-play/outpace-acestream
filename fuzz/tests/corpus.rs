@@ -47,4 +47,21 @@ fn positive_controls_reach_accepted_paths() {
     let ts = include_bytes!("../corpus/media_resync/aligned-packets");
     let output = ace_media::mpegts::TsResync::new().push(ts);
     assert!(!output.is_empty() && ace_media::mpegts::is_aligned(&output));
+    for seed in [
+        include_bytes!("../corpus/media_resync/h264-pes").as_slice(),
+        include_bytes!("../corpus/media_resync/hevc-pes").as_slice(),
+    ] {
+        let mut state = ace_media::mpegts::VideoAccessPointState::new();
+        let accepted: Vec<_> = seed
+            .as_chunks::<188>()
+            .0
+            .iter()
+            .map(|p| state.observe(p))
+            .collect();
+        assert_eq!(accepted, vec![false, false, true]);
+        let mut gate = ace_media::mpegts::KeyframeGate::new();
+        assert_eq!(gate.push(seed), seed);
+        assert!(gate.is_locked());
+        outpace_fuzz::media_resync(seed);
+    }
 }

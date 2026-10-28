@@ -182,11 +182,21 @@ pub fn media_resync(data: &[u8]) {
     assert_eq!(whole, resync(data, chunk_size));
     assert_eq!(whole, resync(data, TS_PACKET_LEN));
     let mut clock = SelectedPcrClock::new();
+    let mut access = mpegts::VideoAccessPointState::new();
+    access.enable_mpeg2();
     for packet in data.as_chunks::<TS_PACKET_LEN>().0 {
         let timing = mpegts::ts_timing(packet);
         assert!(timing.pid < 8192);
         assert!(timing.pcr.is_none_or(|value| value < (1 << 33)));
         clock.observe(timing);
+        if access.observe(packet) {
+            assert_eq!(packet[0], 0x47);
+            assert_eq!(packet[1] & 0x80, 0);
+            assert_ne!(packet[1] & 0x40, 0);
+            let tables = access.table_prefix().expect("access point requires PSI");
+            assert!(mpegts::is_aligned(&tables));
+            assert!(tables.len() <= TS_PACKET_LEN * 3);
+        }
     }
     if let Some(elapsed) = clock.elapsed() {
         assert!(elapsed.as_secs() < (1 << 32) / 90_000 + 1);
@@ -195,5 +205,15 @@ pub fn media_resync(data: &[u8]) {
         let parts = ace_media::hls::segment(&whole, 1 + chunk_size % 16).unwrap();
         assert!(parts.iter().all(|part| mpegts::is_aligned(part)));
         assert_eq!(parts.concat(), whole);
+        // Read boundaries must not change PES-aware keyframe admission or player bytes.
+        let expected = mpegts::KeyframeGate::new().push(&whole);
+        let mut gate = mpegts::KeyframeGate::new();
+        let actual: Vec<_> = whole
+            .chunks(chunk_size)
+            .flat_map(|part| gate.push(part))
+            .collect();
+        assert_eq!(actual, expected);
+        assert!(actual.len() <= whole.len() + TS_PACKET_LEN * 3);
+        assert!(actual.is_empty() || mpegts::is_aligned(&actual));
     }
 }

@@ -10,7 +10,8 @@
 //! these builders. Only a high-value method subset is served — the full contract, including the
 //! routes we intentionally reject, is documented in `docs/protocol/compat-matrix.md`.
 
-use ace_swarm::resolve::{hex20, infohash_hex};
+use ace_swarm::resolve::{hex20, infohash_hex, ResolvedTransport};
+use ace_swarm::types::StreamMetadata;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -100,13 +101,44 @@ pub fn selector(params: &HashMap<String, String>) -> Selector {
 /// A content selector resolved to the fields the `analyze_content`/`get_content_id`/
 /// `get_media_files` methods report.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedContent {
-    /// Canonical lowercase 40-hex infohash.
-    pub infohash: String,
-    /// The acestream content id, when the selector carried or resolved one.
-    pub content_id: Option<String>,
-    /// Whether this is a live stream (the primary outpace path). A bare infohash is assumed live.
-    pub is_live: bool,
+pub enum ResolvedContent {
+    /// A supplied identity with no descriptor yet. Neither live state nor file layout is known.
+    Unresolved { infohash: String },
+    Swarm {
+        infohash: String,
+        content_id: Option<String>,
+        is_live: bool,
+    },
+    Hls {
+        content_id: Option<String>,
+        manifest_url: String,
+        metadata: StreamMetadata,
+    },
+}
+
+impl ResolvedContent {
+    pub fn from_transport(source: ResolvedTransport, content_id: Option<String>) -> Self {
+        match source {
+            ResolvedTransport::Swarm(info) => Self::Swarm {
+                infohash: infohash_hex(&info.infohash),
+                content_id,
+                is_live: true,
+            },
+            ResolvedTransport::Vod(info) => Self::Swarm {
+                infohash: infohash_hex(&info.infohash),
+                content_id,
+                is_live: false,
+            },
+            ResolvedTransport::Hls {
+                manifest_url,
+                metadata,
+            } => Self::Hls {
+                content_id,
+                manifest_url,
+                metadata,
+            },
+        }
+    }
 }
 
 /// Resolve the selectors that need no network — a direct `infohash` or a `magnet` link.
@@ -117,19 +149,13 @@ pub struct ResolvedContent {
 pub fn resolve_offline(sel: &Selector) -> Option<Result<ResolvedContent, String>> {
     match sel {
         Selector::Infohash(h) => Some(match hex20(h) {
-            Ok(bytes) => Ok(ResolvedContent {
+            Ok(bytes) => Ok(ResolvedContent::Unresolved {
                 infohash: infohash_hex(&bytes),
-                content_id: None,
-                is_live: true,
             }),
             Err(_) => Err(format!("invalid infohash: {h}")),
         }),
         Selector::Magnet(m) => Some(match crate::magnet::parse_magnet_infohash(m) {
-            Ok(hex) => Ok(ResolvedContent {
-                infohash: hex,
-                content_id: None,
-                is_live: true,
-            }),
+            Ok(hex) => Ok(ResolvedContent::Unresolved { infohash: hex }),
             Err(e) => Err(format!("invalid magnet: {e:?}")),
         }),
         Selector::ContentId(_) | Selector::Url(_) | Selector::Missing => None,
@@ -175,12 +201,53 @@ pub fn network_status_result(networks: &[String]) -> Value {
 /// `analyze_content` result: at minimum the resolved `infohash` (the field proven in note 10),
 /// plus the content id when known and live/encrypted flags matching the `/ace/*` surface.
 pub fn analyze_result(c: &ResolvedContent) -> Value {
+    match c {
+        ResolvedContent::Unresolved { infohash } => json!({
+            "infohash": infohash, "content_id": null, "transport": "unknown",
+            "is_live": -1, "is_encrypted": -1, "status": "complete",
+        }),
+        ResolvedContent::Swarm {
+            infohash,
+            content_id,
+            is_live,
+        } => json!({
+            "infohash": infohash,
+            "content_id": content_id,
+            "is_live": bool_flag(*is_live),
+            "is_encrypted": 0,
+            "status": "complete",
+        }),
+        ResolvedContent::Hls {
+            content_id,
+            manifest_url,
+            metadata,
+        } => {
+            let mut result = origin_hls_result(content_id, manifest_url, metadata);
+            result["status"] = json!("complete");
+            result
+        }
+    }
+}
+
+fn origin_hls_result(
+    content_id: &Option<String>,
+    manifest_url: &str,
+    metadata: &StreamMetadata,
+) -> Value {
+    // Resolution reads only the descriptor, not the manifest. It establishes neither
+    // live/VOD state nor encryption, files, variants, tracks or retention duration.
     json!({
-        "infohash": c.infohash,
-        "content_id": c.content_id,
-        "is_live": bool_flag(c.is_live),
-        "is_encrypted": 0,
-        "status": "complete",
+        "content_id": content_id,
+        "transport": "hls",
+        "playback_url": manifest_url,
+        "is_direct": true,
+        "is_live": -1,
+        "is_encrypted": -1,
+        "metadata": {
+            "title": metadata.title,
+            "bitrate": metadata.bitrate.map(|rate| rate.saturating_mul(8)),
+            "categories": metadata.categories,
+        },
     })
 }
 
@@ -192,14 +259,31 @@ pub fn content_id_result(content_id: &str) -> Value {
 /// `get_media_files` result: outpace transports are single-file, so this reports one media file
 /// keyed by the infohash. `dump_transport_file` is intentionally unsupported (see the matrix).
 pub fn media_files_result(c: &ResolvedContent) -> Value {
-    json!({
-        "infohash": c.infohash,
-        "files": [{
-            "infohash": c.infohash,
-            "index": 0,
-            "is_live": bool_flag(c.is_live),
-        }],
-    })
+    match c {
+        ResolvedContent::Unresolved { infohash } => json!({
+            "infohash": infohash, "transport": "unknown", "is_live": -1,
+            "is_encrypted": -1, "files": [],
+        }),
+        ResolvedContent::Swarm {
+            infohash, is_live, ..
+        } => json!({
+            "infohash": infohash,
+            "files": [{
+                "infohash": infohash,
+                "index": 0,
+                "is_live": bool_flag(*is_live),
+            }],
+        }),
+        ResolvedContent::Hls {
+            content_id,
+            manifest_url,
+            metadata,
+        } => {
+            let mut result = origin_hls_result(content_id, manifest_url, metadata);
+            result["files"] = json!([]);
+            result
+        }
+    }
 }
 
 /// The engine reports booleans as `0`/`1` integers in these envelopes.
@@ -261,14 +345,14 @@ mod tests {
 
     #[test]
     fn offline_resolution_canonicalizes_a_direct_infohash() {
-        let sel = Selector::Infohash("50E93529D3EB46A50506B14464185A15292D6E47".to_string());
+        let sel = Selector::Infohash("0123456789ABCDEF0123456789ABCDEF01234567".to_string());
         let resolved = resolve_offline(&sel).unwrap().unwrap();
         assert_eq!(
-            resolved.infohash,
-            "50e93529d3eb46a50506b14464185a15292d6e47"
+            resolved,
+            ResolvedContent::Unresolved {
+                infohash: "0123456789abcdef0123456789abcdef01234567".into(),
+            }
         );
-        assert_eq!(resolved.content_id, None);
-        assert!(resolved.is_live);
     }
 
     #[test]
@@ -317,7 +401,7 @@ mod tests {
 
     #[test]
     fn analyze_result_exposes_infohash_and_flags() {
-        let c = ResolvedContent {
+        let c = ResolvedContent::Swarm {
             infohash: "aa".repeat(20),
             content_id: Some("cid".to_string()),
             is_live: true,
@@ -331,7 +415,7 @@ mod tests {
 
     #[test]
     fn media_files_result_lists_the_single_file_by_infohash() {
-        let c = ResolvedContent {
+        let c = ResolvedContent::Swarm {
             infohash: "bb".repeat(20),
             content_id: None,
             is_live: false,
@@ -345,5 +429,47 @@ mod tests {
     #[test]
     fn content_id_result_echoes_the_id() {
         assert_eq!(content_id_result("cid")["content_id"], "cid");
+    }
+}
+
+#[cfg(test)]
+mod transport_contract_tests {
+    use super::*;
+
+    #[test]
+    fn hls_analysis_has_no_fabricated_hash_files_or_live_encryption_state() {
+        const URL: &str = "https://cdn.example.test/a%2Fb/master.m3u8?token=a%2Fb&x=1&x=2";
+        let content = ResolvedContent::from_transport(
+            ResolvedTransport::Hls {
+                manifest_url: URL.into(),
+                metadata: StreamMetadata {
+                    title: Some("Synthetic HLS".into()),
+                    ..Default::default()
+                },
+            },
+            Some("0123456789abcdef0123456789abcdef01234567".into()),
+        );
+        for result in [analyze_result(&content), media_files_result(&content)] {
+            assert_eq!(result["playback_url"], URL);
+            assert_eq!(result["is_direct"], true);
+            assert_eq!(result["transport"], "hls");
+            assert_eq!(result["is_live"], -1);
+            assert_eq!(result["is_encrypted"], -1);
+            assert!(result.get("infohash").is_none());
+            assert!(result.get("stat_url").is_none());
+            assert!(result.get("command_url").is_none());
+        }
+        assert_eq!(media_files_result(&content)["files"], json!([]));
+    }
+
+    #[test]
+    fn classified_vod_reports_finite_file_without_inventing_live_state() {
+        let source = ace_swarm::resolve::playback_from_transport(include_bytes!(
+            "../../../tests/vectors/metainfo/single-file-unsorted.torrent"
+        ))
+        .unwrap();
+        let content = ResolvedContent::from_transport(source, None);
+        assert_eq!(analyze_result(&content)["is_live"], 0);
+        assert_eq!(media_files_result(&content)["files"][0]["is_live"], 0);
     }
 }

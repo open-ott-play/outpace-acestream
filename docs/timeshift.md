@@ -59,6 +59,13 @@ byte ranges and audio-only media remain outside this replay subset. Their suppor
 live relay behavior is unchanged. A declaration or filename alone is insufficient
 to make media seekable. Gaps in captured segments cannot be skipped by a replay.
 
+An overlapping playlist refresh does not cancel recording of a segment that is
+already being fetched. The completed segment may still enter history after it
+slides out of the live playlist, provided its original descriptor remains in the
+retention window. A changed source epoch, replaced descriptor, pruning or stopped
+session prevents that old request from publishing into the new history. HTTP
+cache freshness and history ownership are checked separately.
+
 Managed playback JSON includes `command_url=/origin-hls/<token>/cmd`. The commands
 `timeshift_status`, `timeshift_seek`, `timeshift_live` and `stop` use the HTTP-200
 JSON envelope and generation checks described below. Status identifies

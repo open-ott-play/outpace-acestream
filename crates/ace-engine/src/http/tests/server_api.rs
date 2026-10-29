@@ -277,6 +277,73 @@ async fn only_equal_decoded_sdk_source_fields_may_repeat() {
 }
 
 #[tokio::test]
+async fn nested_magnet_topics_decode_once_across_playback_and_control_routes() {
+    let id = "0123456789abcdef0123456789abcdef01234567";
+    let magnet = format!(
+        "magnet:?xt=urn%3Abtih%3A{id}&xt=urn:btih:{}&dn=words+with+spaces",
+        id.to_ascii_uppercase()
+    );
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair("magnet", &magnet)
+        .append_pair("format", "json")
+        .append_pair("method", "analyze_content")
+        .finish();
+    for path in [
+        "/ace/getstream",
+        "/ace/manifest.m3u8",
+        "/server/api",
+        "/webui/api/service",
+    ] {
+        let state = ace_hls_state(Duration::from_secs(60), 8);
+        let (status, json) = control_api_json(state.clone(), path, &query).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["error"].is_null(), "{path}: {json}");
+        let envelope = if path.starts_with("/ace/") {
+            "response"
+        } else {
+            "result"
+        };
+        assert_eq!(json[envelope]["infohash"], id, "{path}: {json}");
+        state.manager.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn conflicting_or_file_selecting_magnets_never_admit_playback() {
+    let topic = "xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+    for tail in [
+        format!("xt=urn:btih:{}", "0".repeat(40)),
+        "xt=urn%3Abtih%3Ainvalid".into(),
+        "so=1".into(),
+        "%73o=0%2C2".into(),
+    ] {
+        for magnet in [
+            format!("magnet:?{topic}&{tail}"),
+            format!("magnet:?{tail}&{topic}"),
+        ] {
+            let query = form_urlencoded::Serializer::new(String::new())
+                .append_pair("magnet", &magnet)
+                .append_pair("format", "json")
+                .append_pair("method", "analyze_content")
+                .finish();
+            for path in [
+                "/ace/getstream",
+                "/ace/manifest.m3u8",
+                "/server/api",
+                "/webui/api/service",
+            ] {
+                let state = ace_compat_state(0);
+                let (status, json) = control_api_json(state.clone(), path, &query).await;
+                assert_eq!(status, StatusCode::OK);
+                assert!(json["error"].is_string(), "{path}: {json}");
+                assert_eq!(state.ace_sessions.active_count(), 0);
+                assert!(state.manager.list().await.is_empty());
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn server_api_get_network_connection_status_reports_connected() {
     let (_, json) =
         server_api_json(ace_compat_state(0), "method=get_network_connection_status").await;

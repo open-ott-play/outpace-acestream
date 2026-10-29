@@ -1,7 +1,7 @@
 //! Parse a `magnet:` link's `xt=urn:btih:` info-hash into a 40-hex string (BitTorrent v1 only).
 //! Accepts the two standard btih encodings — 40-char hex and 32-char RFC-4648 base32 — and
-//! rejects everything else (notably v2 `urn:btmh:`), so magnet inputs reduce to a bare infohash
-//! and therefore fail closed unless a verified transport descriptor for it is held.
+//! requires one unambiguous v1 topic. Other topics do not add v2 transport support. Magnet
+//! inputs reduce to a bare infohash and require a verified descriptor before playback.
 
 use ace_swarm::resolve::infohash_hex;
 
@@ -13,15 +13,28 @@ pub(crate) fn parse_magnet_infohash(magnet: &str) -> Result<String, String> {
         .strip_prefix("magnet:?")
         .or_else(|| magnet.trim().strip_prefix("magnet:"))
         .unwrap_or(magnet.trim());
-    for (key, value) in query.split('&').filter_map(|p| p.split_once('=')) {
+    let mut selected = None;
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        // BEP 53's select-only list changes which files the caller requested. Do not
+        // erase it while reducing a magnet to the only currently supported v1 key.
+        if key == "so" {
+            return Err("magnet file selection is not supported".into());
+        }
         if key != "xt" {
             continue;
         }
+        if value == "urn:btih" {
+            return Err("missing btih info-hash".into());
+        }
         if let Some(hash) = value.strip_prefix("urn:btih:") {
-            return normalize_btih(hash);
+            let normalized = normalize_btih(hash)?;
+            if selected.as_ref().is_some_and(|old| old != &normalized) {
+                return Err("conflicting magnet btih topics".into());
+            }
+            selected = Some(normalized);
         }
     }
-    Err("magnet has no supported urn:btih: info-hash".into())
+    selected.ok_or_else(|| "magnet has no supported urn:btih: info-hash".into())
 }
 
 fn normalize_btih(hash: &str) -> Result<String, String> {
@@ -97,5 +110,81 @@ mod tests {
         assert!(parse_magnet_infohash("magnet:?xt=urn:btmh:1220abcd").is_err());
         assert!(parse_magnet_infohash("magnet:?dn=noxt").is_err());
         assert!(parse_magnet_infohash("magnet:?xt=urn:btih:tooshort").is_err());
+    }
+
+    #[test]
+    fn decodes_query_once_and_checks_all_supported_topics() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            parse_magnet_infohash(&format!("magnet:?%78t=urn%3Abtih%3A{id}")).unwrap(),
+            id
+        );
+        assert_eq!(
+            parse_magnet_infohash(&format!(
+                "magnet:?xt=urn:btih:{}&xt=urn%3Abtih%3A{id}",
+                id.to_ascii_uppercase()
+            ))
+            .unwrap(),
+            id
+        );
+        for tail in [
+            format!("xt=urn:btih:{}", "0".repeat(40)),
+            "xt=urn:btih:invalid".into(),
+            "xt=urn:btih".into(),
+            "xt=urn%3Abtih%3A%FF".into(),
+        ] {
+            for query in [
+                format!("xt=urn:btih:{id}&{tail}"),
+                format!("{tail}&xt=urn:btih:{id}"),
+            ] {
+                assert!(parse_magnet_infohash(&format!("magnet:?{query}")).is_err());
+            }
+        }
+        assert!(parse_magnet_infohash(&format!("magnet:?xt=urn%253Abtih%253A{id}")).is_err());
+    }
+
+    #[test]
+    fn canonical_equal_base32_topics_and_unrelated_topics_remain_supported() {
+        let zero_hex = "0".repeat(40);
+        let zero_base32 = "a".repeat(32);
+        assert_eq!(
+            parse_magnet_infohash(&format!(
+                "magnet:?xt=urn:btih:{zero_base32}&xt=urn%3Abtih%3A{zero_hex}"
+            ))
+            .unwrap(),
+            zero_hex
+        );
+        let topic = "xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+        for unrelated in [
+            "xt=urn:sha1:unrelated",
+            "xt=urn:btmh:1220abcd",
+            "dn=words+with+spaces",
+        ] {
+            for query in [
+                format!("{topic}&{unrelated}"),
+                format!("{unrelated}&{topic}"),
+            ] {
+                assert!(parse_magnet_infohash(&format!("magnet:?{query}")).is_ok());
+            }
+        }
+        for bad in [
+            format!("magnet:?{topic}+"),
+            format!("magnet:?{topic}%2B"),
+            "magnet:?xt=urn+btih+0123456789abcdef0123456789abcdef01234567".into(),
+        ] {
+            assert!(parse_magnet_infohash(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn file_selection_is_not_discarded_after_a_valid_topic() {
+        let topic = "xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+        for selector in ["so=0", "so=1", "so=0,2,4,6-8", "so=", "so", "%73o=1"] {
+            for query in [format!("{topic}&{selector}"), format!("{selector}&{topic}")] {
+                assert!(parse_magnet_infohash(&format!("magnet:?{query}")).is_err());
+            }
+        }
+        // Ignoring an additional v2 topic preserves the existing v1-only behavior.
+        assert!(parse_magnet_infohash(&format!("magnet:?{topic}&xt=urn:btmh:1220abcd")).is_ok());
     }
 }

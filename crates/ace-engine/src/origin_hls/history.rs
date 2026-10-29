@@ -49,6 +49,38 @@ impl AsRef<[u8]> for ReplayBytes {
         &self.0.bytes
     }
 }
+/// Request-time identity, independent of cache freshness and seek/live generation.
+#[derive(Clone, Copy)]
+pub(super) struct CaptureTicket {
+    incarnation: u64,
+    sequence: u64,
+    id: u64,
+    max_bytes: usize,
+}
+pub(super) struct ValidatedCapture {
+    ticket: CaptureTicket,
+    bytes: Bytes,
+    allocation: usize,
+}
+impl CaptureTicket {
+    /// Linear validation runs without the session mutex held.
+    pub(super) fn validate(
+        self,
+        bytes: &Bytes,
+        allocation: usize,
+        cancelled: impl FnMut() -> bool,
+    ) -> Option<ValidatedCapture> {
+        let allocation = allocation.max(bytes.len());
+        if allocation > self.max_bytes || !independent_ts_until(bytes, cancelled) {
+            return None;
+        }
+        Some(ValidatedCapture {
+            ticket: self,
+            bytes: bytes.clone(),
+            allocation,
+        })
+    }
+}
 struct Record {
     id: u64,
     duration: Duration,
@@ -70,6 +102,7 @@ pub(super) struct OriginHistory {
     window_start: Option<(u64, u64)>,
     retired_through: Option<u64>,
     generation: u64,
+    incarnation: u64,
     snapshot: Option<HlsHistorySnapshot>,
     reason: Option<&'static str>,
 }
@@ -87,6 +120,7 @@ impl OriginHistory {
             window_start: None,
             retired_through: None,
             generation: 0,
+            incarnation: 0,
             snapshot: None,
             reason: Some("manifest_not_observed"),
         }
@@ -101,6 +135,8 @@ impl OriginHistory {
         }
     }
     pub(super) fn clear(&mut self) {
+        // Equal descriptors after reset must never revive old tickets.
+        self.incarnation = self.incarnation.saturating_add(1);
         self.records.clear();
         self.current.clear();
         self.used = 0;
@@ -138,7 +174,10 @@ impl OriginHistory {
         if self.config.max_seconds == 0 {
             return;
         }
-        let unique: HashSet<_> = segments.iter().map(|(id, _)| *id).collect();
+        let unique: HashMap<_, _> = segments
+            .iter()
+            .map(|(id, segment)| (*id, segment.sequence))
+            .collect();
         let supported = supported
             && unique.len() == segments.len()
             && segments.iter().all(|(_, segment)| {
@@ -161,6 +200,11 @@ impl OriginHistory {
                         || old.duration != segment.duration
                         || old.discontinuity != segment.discontinuity_sequence
                 })
+            })
+            // A mutable origin URL reused at another sequence cannot identify
+            // the bytes of an already admitted request. Start a fresh timeline.
+            || self.records.iter().any(|(sequence, record)| {
+                unique.get(&record.id).is_some_and(|new_sequence| new_sequence != sequence)
             });
         if reset {
             self.reset();
@@ -236,23 +280,39 @@ impl OriginHistory {
             .map(|(_, segment)| (segment.sequence, position));
         self.prune(now);
     }
-    pub(super) fn capture(&mut self, id: u64, bytes: &Bytes, allocation: usize, now: Instant) {
+    pub(super) fn capture_ticket(&mut self, id: u64, now: Instant) -> Option<CaptureTicket> {
         self.prune(now);
-        if self.config.max_seconds == 0 || self.reason.is_some() {
-            return;
+        if self.config.max_seconds == 0 || self.reason.is_some() || self.incarnation == u64::MAX {
+            return None;
         }
-        let Some(seq) = self.current.get(&id).copied() else {
-            return;
-        };
-        if self
-            .records
-            .get(&seq)
-            .is_none_or(|record| record.body.is_some())
+        let sequence = *self.current.get(&id)?;
+        let record = self.records.get(&sequence)?;
+        if record.body.is_some() {
+            return None;
+        }
+        Some(CaptureTicket {
+            incarnation: self.incarnation,
+            sequence,
+            id,
+            max_bytes: self.config.max_bytes,
+        })
+    }
+    pub(super) fn capture_validated(&mut self, capture: ValidatedCapture, now: Instant) {
+        self.prune(now);
+        let ValidatedCapture {
+            ticket,
+            bytes,
+            allocation,
+        } = capture;
+        let seq = ticket.sequence;
+        if self.config.max_seconds == 0
+            || self.reason.is_some()
+            || self.incarnation != ticket.incarnation
+            || self
+                .records
+                .get(&seq)
+                .is_none_or(|record| record.id != ticket.id || record.body.is_some())
         {
-            return;
-        }
-        let allocation = allocation.max(bytes.len());
-        if allocation > self.config.max_bytes || !independent_ts(bytes) {
             return;
         }
         while self.used > self.config.max_bytes - allocation {
@@ -279,11 +339,20 @@ impl OriginHistory {
             return;
         };
         record.body = Some(Arc::new(Retained {
-            bytes: bytes.clone(),
+            bytes,
             allocation,
             _charge: charge,
         }));
         self.used += allocation;
+    }
+    #[cfg(test)]
+    fn capture(&mut self, id: u64, bytes: &Bytes, allocation: usize, now: Instant) {
+        if let Some(capture) = self
+            .capture_ticket(id, now)
+            .and_then(|ticket| ticket.validate(bytes, allocation, || false))
+        {
+            self.capture_validated(capture, now);
+        }
     }
     fn available(&self) -> Result<(), OriginError> {
         if self.config.max_seconds == 0 {
@@ -553,14 +622,21 @@ impl OriginHistory {
 /// Keep the byte representation intact. A declaration alone cannot make arbitrary
 /// or mid-GOP bytes a replay entry; validated fresh tables and a first video access
 /// point are also required. Audio-only and unknown video layouts remain unsupported.
+#[cfg(test)]
 fn independent_ts(bytes: &[u8]) -> bool {
-    if !mpegts::is_aligned(bytes) {
+    independent_ts_until(bytes, || false)
+}
+fn independent_ts_until(bytes: &[u8], mut cancelled: impl FnMut() -> bool) -> bool {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(TS_PACKET_LEN) {
         return false;
     }
     let mut access = VideoAccessPointState::new();
     access.enable_mpeg2();
     let mut first_video = None;
-    for packet in bytes.as_chunks::<TS_PACKET_LEN>().0 {
+    for (index, packet) in bytes.as_chunks::<TS_PACKET_LEN>().0.iter().enumerate() {
+        if (index % 256 == 0 && cancelled()) || packet[0] != mpegts::TS_SYNC {
+            return false;
+        }
         if packet[1] & 0x80 != 0 || packet[3] & 0xc0 != 0 || packet[3] & 0x30 == 0 {
             return false;
         }
@@ -586,7 +662,7 @@ fn independent_ts(bytes: &[u8]) -> bool {
             );
         }
     }
-    first_video == Some(true)
+    first_video == Some(true) && !cancelled()
 }
 
 fn valid_table_crc(packet: &[u8]) -> bool {
@@ -840,5 +916,117 @@ mod tests {
         assert!(history
             .replay("viewer", view.generation, "1.ts", now)
             .is_err());
+    }
+    #[test]
+    fn capture_tickets_survive_sliding_windows_and_view_changes() {
+        let now = Instant::now();
+        let cfg = config();
+        let mut history = OriginHistory::new(cfg, HistoryBudget::new(cfg.global_max_bytes));
+        let bytes = bytes();
+        history.observe(0, true, &metadata(10, 3), now);
+        let removed = history.capture_ticket(11, now).unwrap();
+        let overlap = history.capture_ticket(12, now).unwrap();
+        history.capture(13, &bytes, bytes.len(), now);
+        let view = history
+            .seek("viewer", OriginSeekTarget::PositionMs(4000), None, now)
+            .unwrap();
+        history.live("viewer", Some(view.generation)).unwrap();
+        history.observe(0, true, &metadata(11, 3), now);
+        for ticket in [overlap, removed] {
+            history.capture_validated(ticket.validate(&bytes, bytes.len(), || false).unwrap(), now);
+        }
+        let view = history
+            .seek("viewer", OriginSeekTarget::PositionMs(0), None, now)
+            .unwrap();
+        assert_eq!(view.snapshot.unwrap().first_seq, 10);
+        assert_eq!(history.used, bytes.len() * 3);
+        history.capture_validated(
+            removed.validate(&bytes, bytes.len(), || false).unwrap(),
+            now,
+        );
+        assert_eq!(
+            history.used,
+            bytes.len() * 3,
+            "duplicate completion must not charge twice"
+        );
+    }
+
+    #[test]
+    fn capture_tickets_reject_reset_aba_descriptor_changes_and_pruning() {
+        let now = Instant::now();
+        let cfg = config();
+        let bytes = bytes();
+        for mode in 0..7 {
+            let mut history = OriginHistory::new(cfg, HistoryBudget::new(cfg.global_max_bytes));
+            history.observe(0, true, &metadata(10, 1), now);
+            let ticket = history.capture_ticket(11, now).unwrap();
+            let mut changed = metadata(10, 1);
+            match mode {
+                0 => {
+                    history.observe(0, false, &changed, now);
+                    history.observe(0, true, &changed, now);
+                }
+                1 => {
+                    history.observe(1, true, &changed, now);
+                }
+                2 => {
+                    changed[0].1.duration = Duration::from_secs(3);
+                    history.observe(0, true, &changed, now);
+                }
+                3 => {
+                    changed[0].0 = 99;
+                    history.observe(0, true, &changed, now);
+                }
+                4 => {
+                    history.prune(now + Duration::from_secs(61));
+                    history.observe(0, true, &changed, now + Duration::from_secs(61));
+                }
+                5 => {
+                    changed[0].1.sequence += 1;
+                    history.observe(0, true, &changed, now);
+                }
+                _ => {
+                    history.clear();
+                    history.observe(0, true, &changed, now);
+                }
+            }
+            history.capture_validated(ticket.validate(&bytes, bytes.len(), || false).unwrap(), now);
+            assert_eq!(history.used, 0, "stale completion accepted in case {mode}");
+        }
+    }
+
+    #[test]
+    fn capture_validation_is_cancellable_without_holding_history_lock() {
+        let now = Instant::now();
+        let cfg = config();
+        let history = Mutex::new(OriginHistory::new(
+            cfg,
+            HistoryBudget::new(cfg.global_max_bytes),
+        ));
+        let ticket = {
+            let mut guard = history.lock().unwrap();
+            guard.observe(0, true, &metadata(10, 1), now);
+            guard.capture_ticket(11, now).unwrap()
+        };
+        let bytes = bytes();
+        let mut polls = 0;
+        assert!(ticket
+            .validate(&bytes, bytes.len(), || {
+                polls += 1;
+                let mut guard = history
+                    .try_lock()
+                    .expect("validation does not hold history lock");
+                guard.clear();
+                true
+            })
+            .is_none());
+        assert_eq!(polls, 1);
+        let mut guard = history.lock().unwrap();
+        guard.incarnation = u64::MAX;
+        guard.observe(0, true, &metadata(10, 1), now);
+        assert!(
+            guard.capture_ticket(11, now).is_none(),
+            "ticket identity never wraps"
+        );
     }
 }

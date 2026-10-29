@@ -749,6 +749,28 @@ mod tests {
     }
 
     #[test]
+    fn magnet_selection_survives_bare_and_nested_cli_forms() {
+        let id = "0123456789abcdef0123456789abcdef01234567";
+        let valid = format!("magnet:?xt=urn%3Abtih%3A{id}&xt=urn:btih:{id}");
+        for (magnet, accepted) in [
+            (valid, true),
+            (format!("magnet:?xt=urn:btih:{id}&so=1"), false),
+            (format!("magnet:?xt=urn:btih:{id}&xt=urn:btih:bad"), false),
+        ] {
+            let nested = form_urlencoded::Serializer::new(String::new())
+                .append_pair("magnet", &magnet)
+                .finish();
+            for input in [magnet, format!("acestream:?{nested}")] {
+                let result = PlaybackTarget::parse(&input);
+                assert_eq!(result.is_ok(), accepted, "{input}");
+                if accepted {
+                    assert_eq!(result.unwrap().provider_id, id);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn parses_transport_url_input() {
         let t = PlaybackTarget::parse("acestream:?url=https://example.com/x.acelive").unwrap();
         assert_eq!(

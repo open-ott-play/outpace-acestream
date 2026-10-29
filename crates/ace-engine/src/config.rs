@@ -655,8 +655,22 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("outpace-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let a = load_or_create_identity(&dir).unwrap();
+        let path = dir.join("identity.seed");
+        let persisted = std::fs::read(&path).unwrap();
+        assert_eq!(persisted.len(), 32);
         let b = load_or_create_identity(&dir).unwrap();
         assert_eq!(a.node_id(), b.node_id());
+        assert_eq!(std::fs::read(&path).unwrap(), persisted);
+        let message = b"persisted identity survives dependency upgrades";
+        assert_eq!(a.sign(message), b.sign(message));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

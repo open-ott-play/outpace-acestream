@@ -16,7 +16,7 @@ Stream product. The executable remains `outpace`; configuration uses `OUTPACE_*`
 
 [v0.9.0 release](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.0)
 · [0.9.0 changes](docs/releases/v0.9.0.md)
-· [0.9.1-beta.6 changes](docs/releases/v0.9.1-beta.6.md)
+· [0.9.1-beta.7 changes](docs/releases/v0.9.1-beta.7.md)
 · [Previous stable v0.8.1](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.8.1)
 · [Beta.8 history](docs/releases/v0.9.0-beta.8.md)
 · [Retained replay](docs/timeshift.md)

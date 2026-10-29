@@ -18,7 +18,7 @@ use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 mod history;
-use history::{OriginHistory, Retained};
+use history::{CaptureTicket, OriginHistory, Retained};
 pub use history::{OriginHistoryStatus, OriginHistoryView, OriginSeekTarget};
 
 #[cfg(test)]
@@ -40,6 +40,7 @@ struct RequestedResource {
     kind: ResourceKind,
     fetch: Arc<tokio::sync::Mutex<()>>,
     cache_generation: u64,
+    capture: Option<CaptureTicket>,
 }
 
 /// Fixed diagnostics deliberately exclude origin URLs and client error chains.
@@ -139,6 +140,7 @@ struct ResponseData {
     content_type: String,
     content_range: Option<String>,
     body: Bytes,
+    allocation: usize,
 }
 
 /// A response retains admission and viewer ownership until its body is consumed or dropped.
@@ -281,7 +283,11 @@ struct Cache {
 impl Cache {
     fn retain(&mut self, mut keep: impl FnMut(&CacheKey, &Cached) -> bool) {
         self.entries.retain(|key, value| keep(key, value));
-        self.bytes = self.entries.values().map(|c| c.data.body.len()).sum();
+        self.bytes = self
+            .entries
+            .values()
+            .map(|c| c.data.allocation.max(c.data.body.len()))
+            .sum();
     }
     fn get(&mut self, key: &CacheKey) -> Option<ResponseData> {
         self.retain(|_, value| value.expires > Instant::now());
@@ -292,12 +298,12 @@ impl Cache {
         })
     }
     fn put(&mut self, key: CacheKey, data: ResponseData, ttl: Duration) {
-        if data.body.len() > MAX_CACHE_BYTES || ttl.is_zero() {
+        if data.allocation.max(data.body.len()) > MAX_CACHE_BYTES || ttl.is_zero() {
             return;
         }
         self.retain(|k, value| value.expires > Instant::now() && *k != key);
         while self.entries.len() >= MAX_CACHE_ENTRIES
-            || self.bytes + data.body.len() > MAX_CACHE_BYTES
+            || self.bytes + data.allocation.max(data.body.len()) > MAX_CACHE_BYTES
         {
             let Some(oldest) = self
                 .entries
@@ -307,10 +313,11 @@ impl Cache {
             else {
                 break;
             };
-            self.bytes -= self.entries.remove(&oldest).unwrap().data.body.len();
+            let removed = self.entries.remove(&oldest).unwrap().data;
+            self.bytes -= removed.allocation.max(removed.body.len());
         }
         self.tick = self.tick.wrapping_add(1);
-        self.bytes += data.body.len();
+        self.bytes += data.allocation.max(data.body.len());
         self.entries.insert(
             key,
             Cached {
@@ -567,12 +574,16 @@ impl OriginHls {
             }
             entry.active += 1;
             entry.touched = tick;
-            let resource = RequestedResource {
+            let mut resource = RequestedResource {
                 url: entry.url.clone(),
                 kind: entry.kind,
                 fetch: entry.fetch.clone(),
                 cache_generation: entry.cache_generation,
+                capture: None,
             };
+            if resource.kind == ResourceKind::Media && matches!(range, None | Some("bytes=0-")) {
+                resource.capture = inner.history.capture_ticket(id, Instant::now());
+            }
             inner.pending += 1;
             resource
         };
@@ -618,6 +629,7 @@ impl OriginHls {
             kind,
             fetch,
             cache_generation,
+            capture,
         } = resource;
         let key = CacheKey {
             token: token.to_owned(),
@@ -635,7 +647,9 @@ impl OriginHls {
             return Err(OriginError::Cancelled);
         }
         if kind == ResourceKind::Media {
-            if let Some(data) = self.cache.lock().unwrap().get(&key) {
+            let cached = self.cache.lock().unwrap().get(&key);
+            if let Some(data) = cached {
+                Self::record(session, capture, &data);
                 return Ok((data, Some(fetch_permit)));
             }
         }
@@ -716,24 +730,9 @@ impl OriginHls {
             },
             content_range: response.content_range,
             body,
+            allocation,
         };
-        if kind == ResourceKind::Media
-            && response.status == 200
-            && data.content_range.is_none()
-            && matches!(range, None | Some("bytes=0-"))
-        {
-            let mut inner = session.inner.lock().unwrap();
-            if !*session.cancel.borrow()
-                && inner
-                    .resources
-                    .get(&id)
-                    .is_some_and(|r| r.cache_generation == cache_generation)
-            {
-                inner
-                    .history
-                    .capture(id, &data.body, allocation, Instant::now());
-            }
-        }
+        Self::record(session, capture, &data);
         if kind == ResourceKind::Media {
             if let Some(ttl) = response.cache_ttl {
                 let ttl = ttl.saturating_sub(opened_at.elapsed());
@@ -755,6 +754,20 @@ impl OriginHls {
         // Retain the slot while the response is owned by a slow reader; otherwise
         // completed 16 MiB resources could accumulate beyond the fetch memory bound.
         Ok((data, Some(fetch_permit)))
+    }
+    fn record(session: &Session, ticket: Option<CaptureTicket>, data: &ResponseData) {
+        if data.status != 200 || data.content_range.is_some() {
+            return;
+        }
+        let Some(capture) = ticket.and_then(|ticket| {
+            ticket.validate(&data.body, data.allocation, || *session.cancel.borrow())
+        }) else {
+            return;
+        };
+        let mut inner = session.inner.lock().unwrap();
+        if !*session.cancel.borrow() {
+            inner.history.capture_validated(capture, Instant::now());
+        }
     }
     fn rewrite(
         &self,

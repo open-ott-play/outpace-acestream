@@ -192,8 +192,8 @@ impl SeedEntry {
 
 /// Maps infohash -> the store and/or metadata we'd serve. Entry lifetime is anchored by
 /// `SeedLease` (producer refcount): the leech download loop and each broadcast hold a lease and
-/// the entry is evicted when the last one drops. An idle-TTL reaper (added later) backstops leaked
-/// leases for `Leech` entries.
+/// the entry is evicted when the last one drops. An idle-TTL reaper backstops ownerless `Leech`
+/// entries created without a lease; it never reaps entries held by a live producer lease.
 #[derive(Clone, Default)]
 pub struct SeedRegistry {
     stores: Arc<StdMutex<HashMap<[u8; 20], SeedEntry>>>,

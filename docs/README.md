@@ -67,6 +67,7 @@ superseded and do not override the current code.
 - [Wire protocol](protocol/wire-protocol.md)
 - [Transport descriptors](protocol/transport-file.md)
 - [Compatibility matrix](protocol/compat-matrix.md)
+- [Public Ace Stream source review](protocol/public-code-review.md): pinned repository inventory and client-contract evidence.
 - [Shared seeding and admission](protocol/shared-seeding.md)
 - [Protocol research notes](protocol/notes/)
 - [Design specifications](superpowers/specs/) and [implementation plans](superpowers/plans/)

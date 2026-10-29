@@ -475,6 +475,11 @@ impl StreamProvider for AceProvider {
         self.infohash_index.put(info.clone());
     }
 
+    fn verified_live_descriptor(&self, infohash: &[u8; 20]) -> Option<StreamInfo> {
+        self.verified_info_for_infohash(&infohash_hex(infohash))
+            .ok()
+    }
+
     fn remember_catalog_descriptor(&self, content_id: &str, info: &StreamInfo) {
         if let Ok(key) = hex20(content_id) {
             self.resolve_cache.put(&infohash_hex(&key), info.clone());

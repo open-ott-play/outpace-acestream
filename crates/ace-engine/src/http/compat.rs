@@ -897,7 +897,8 @@ pub(super) async fn server_api(
 }
 
 /// Resolve a `/server/api` content [`crate::server_api::Selector`] to its source type. Direct
-/// infohashes and magnets resolve offline; `content_id`/`url` need a catalog/transport fetch,
+/// infohashes and magnets use already verified local metadata when available, otherwise remain
+/// unresolved; this lookup is offline. `content_id`/`url` need a catalog/transport fetch,
 /// which is gated by the same `resolve_content_ids_in_getstream` switch tests use to stay offline
 /// (production enables it). A best-effort failure is reported in-band, never as an HTTP error.
 async fn resolve_server_api_selector(
@@ -907,7 +908,19 @@ async fn resolve_server_api_selector(
     use crate::server_api::{ResolvedContent, Selector};
 
     if let Some(resolved) = crate::server_api::resolve_offline(&sel) {
-        return resolved;
+        let resolved = resolved?;
+        if let ResolvedContent::Unresolved { infohash } = &resolved {
+            if let (Some(network), Ok(key)) = (ace_network(s), ace_swarm::resolve::hex20(infohash))
+            {
+                if let Some(info) = s.manager.verified_live_descriptor(&network, &key) {
+                    return Ok(ResolvedContent::from_transport(
+                        ResolvedTransport::Swarm(info),
+                        None,
+                    ));
+                }
+            }
+        }
+        return Ok(resolved);
     }
     match sel {
         Selector::ContentId(cid) => {

@@ -271,7 +271,8 @@ pub fn content_id_result(content_id: &str) -> Value {
 }
 
 /// `get_media_files` result: a classified single-file swarm reports its known type and finite
-/// VOD size. Standard metainfo may also supply an advisory filename; MIME is not inferred.
+/// VOD size. Live output is MPEG-TS and has a generic display filename when none is supplied.
+/// Standard VOD metainfo may supply an advisory filename; its MIME is not inferred.
 /// Unresolved identities and HLS descriptors do not establish a file list.
 /// `dump_transport_file` is intentionally unsupported (see the matrix).
 pub fn media_files_result(c: &ResolvedContent) -> Value {
@@ -299,6 +300,14 @@ pub fn media_files_result(c: &ResolvedContent) -> Value {
             }
             if let Some(filename) = filename {
                 file["filename"] = json!(filename);
+            } else if *is_live {
+                // A display fallback, not an asserted filename from the transport descriptor.
+                file["filename"] = json!("stream.ts");
+            }
+            if *is_live {
+                // StreamProvider::open exposes live MPEG-TS; Android clients use this value
+                // before selecting an output route and may dereference it without a null check.
+                file["mime"] = json!("video/mp2t");
             }
             json!({ "infohash": infohash, "files": [file] })
         }
@@ -496,7 +505,7 @@ mod transport_contract_tests {
     }
 
     #[test]
-    fn classified_live_file_supplies_client_type_without_fabricating_size_or_mime() {
+    fn classified_live_file_supplies_sdk_mime_and_display_name_without_fabricating_size() {
         let source = ace_swarm::resolve::playback_from_transport(include_bytes!(
             "../../../tests/vectors/transport/synthetic-live-512k.bin"
         ))
@@ -509,8 +518,8 @@ mod transport_contract_tests {
         assert_eq!(file.index, 0);
         assert_eq!(file.content_type, "live");
         assert!(file.size.is_none());
-        assert!(file.mime.is_none());
-        assert!(file.filename.is_none());
+        assert_eq!(file.mime.as_deref(), Some("video/mp2t"));
+        assert_eq!(file.filename.as_deref(), Some("stream.ts"));
         assert_eq!(result["files"][0]["is_live"], 1);
     }
 

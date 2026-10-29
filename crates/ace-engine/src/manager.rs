@@ -468,6 +468,18 @@ impl StreamManager {
         }
     }
 
+    /// Read already verified live metadata without starting a source or doing network I/O.
+    pub fn verified_live_descriptor(
+        &self,
+        network: &str,
+        infohash: &[u8; 20],
+    ) -> Option<StreamInfo> {
+        self.registry
+            .get(network)?
+            .verified_live_descriptor(infohash)
+            .filter(|info| &info.infohash == infohash)
+    }
+
     /// Cache a live descriptor and its content-id binding from the same signed catalog result.
     pub fn remember_catalog_descriptor(&self, network: &str, content_id: &str, info: &StreamInfo) {
         if let Some(provider) = self.registry.get(network) {

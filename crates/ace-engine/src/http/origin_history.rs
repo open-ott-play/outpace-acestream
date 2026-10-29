@@ -20,13 +20,21 @@ fn command_params(query: Option<&str>) -> Result<HashMap<String, String>, &'stat
     for (key, value) in entries {
         if !matches!(
             key.as_str(),
-            "method" | "back" | "position_ms" | "generation"
+            "method" | "back" | "position_ms" | "generation" | "api_version"
         ) {
             return Err("unsupported command parameter");
         }
         if params.insert(key, value).is_some() {
             return Err("duplicate command parameter");
         }
+    }
+    // The public Android SDK appends this hint to its stop command. It does
+    // not change token ownership or select a different control protocol.
+    if params
+        .get("api_version")
+        .is_some_and(|version| version != "2")
+    {
+        return Err("unsupported api_version");
     }
     Ok(params)
 }

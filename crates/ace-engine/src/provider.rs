@@ -138,6 +138,14 @@ pub trait StreamProvider: Send + Sync {
     /// (never BEP-9 or a transport url): the index trusts them as-is. Defaults to ignoring it.
     fn remember_live_descriptor(&self, _info: &StreamInfo) {}
 
+    /// Return an already verified live descriptor without resolving, fetching or opening it.
+    /// Only locally originated or signed-catalog descriptors qualify, with an exact infohash
+    /// match. Peer metadata and caller-supplied transport URLs must not enter this lookup.
+    /// The default reports unknown metadata rather than guessing live state or file layout.
+    fn verified_live_descriptor(&self, _infohash: &[u8; 20]) -> Option<StreamInfo> {
+        None
+    }
+
     /// Seed a content-id resolution already authenticated by the signed catalog. The id and
     /// descriptor must come from the same catalog response; never call this for transport URLs,
     /// BEP-9, HLS or caller-supplied metadata. Retains canonical content-id session ownership.

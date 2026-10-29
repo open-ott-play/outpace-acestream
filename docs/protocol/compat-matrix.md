@@ -253,9 +253,17 @@ falling through.
   it does not share playback's normalization step. `query` is a control-only
   content-id alias. The echo-only `get_content_id` exception is described below.
 - `infohash` is a 40-hex swarm selector, normalized to lowercase. `magnet` extracts
-  only a v1 `xt=urn:btih:` hash (40-hex or 32-character base32); v2 `btmh` is
-  unsupported. Magnet names, trackers and other source options are not a promise
-  of additional playback features.
+  only a v1 `xt=urn:btih:` hash (40-hex or 32-character base32), decoding the inner
+  query once. Repeated v1 topics must normalize to the same hash; a conflicting or
+  malformed v1 topic fails even after an earlier valid one. A hybrid link may also
+  contain an unrelated `btmh` topic, but only its v1 hash is used; v2-only playback
+  remains unsupported. Any `so` select-only file list is rejected, including `so=0`,
+  because reducing that intent to a bare hash would discard file selection.
+  This is Outpace's explicit input policy, not an original-engine precedence claim.
+  [BEP 9](https://www.bittorrent.org/beps/bep_0009.html) defines the hash encodings
+  and hybrid topics; [BEP 53](https://www.bittorrent.org/beps/bep_0053.html) defines
+  select-only indices. Magnet names and trackers do not enable additional source
+  acquisition features.
 - `url` means an HTTP(S) **transport descriptor** URL, not an arbitrary media URL.
   Playback performs a scheme check before minting; fetching uses the SSRF guard,
   a 1 MiB cap, timeouts and disabled redirects. The

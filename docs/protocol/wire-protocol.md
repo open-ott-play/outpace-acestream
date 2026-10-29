@@ -82,7 +82,17 @@ mi={distance_from_source, down_rate, download_window…}   # live-streaming metr
 ```
 `ut_metadata` (BEP-9) fetches the transport metadata from peers. The `mi` sub-dict
 and other Acestream keys drive live piece selection (live source distance, rates).
-Exact live-extension message semantics: OPEN (Phase-1 `ace-peer` work).
+Most detailed live-extension message semantics remain OPEN (Phase-1 `ace-peer`
+work); the current source-distance convention is reconciled below.
+
+`distance_from_source` has a project-local, evidence-bounded convention. The
+current outbound source profile sends `-1` (see `ace-swarm::SeederSession` and
+the official-engine local-source observation in note 32); the live peer selector prefers
+lower signed values only when the advertised piece head is otherwise tied. The
+older phase notes that describe a source value of `0` are historical experiments,
+not a normative protocol rule. Treat the universal wire meaning as unresolved;
+do not change the current profile based on those older notes alone. See
+[the source-distance evidence reconciliation](notes/98-distance-from-source-semantics.md).
 
 ## 4. Minimal client recipe (for the interop spike / `ace-peer`)
 1. Choose the swarm key. For known live content ids, the content id can be used directly;

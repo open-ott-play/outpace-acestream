@@ -33,9 +33,11 @@ impl Identity {
 
     /// Mint a fresh random identity.
     pub fn generate() -> Self {
-        Identity {
-            key: SigningKey::generate(&mut rand::rngs::OsRng),
-        }
+        // Fill the Ed25519 seed directly so RSA's rand 0.8 dependency does not
+        // have to implement ed25519-dalek's newer rand_core traits.
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+        Self::from_seed(seed)
     }
 
     /// The `node_id` peers see: the 32-byte Ed25519 public key.
@@ -121,10 +123,22 @@ mod tests {
     #[test]
     fn from_seed_is_deterministic() {
         let seed = [7u8; 32];
-        assert_eq!(
-            Identity::from_seed(seed).node_id(),
-            Identity::from_seed(seed).node_id()
-        );
+        // Independent Ed25519 vector: a dependency upgrade must not rotate
+        // the public identity derived from an existing persisted seed.
+        let expected = [
+            234, 74, 108, 99, 226, 156, 82, 10, 190, 245, 80, 123, 19, 46, 197, 249, 149, 71, 118,
+            174, 190, 190, 123, 146, 66, 30, 234, 105, 20, 70, 210, 44,
+        ];
+        assert_eq!(Identity::from_seed(seed).node_id(), expected);
+    }
+
+    #[test]
+    fn generated_identity_preserves_its_seed_and_signatures() {
+        let generated = Identity::generate();
+        let restored = Identity::from_seed(generated.key.to_bytes());
+        let message = b"identity persistence regression";
+        assert_eq!(generated.node_id(), restored.node_id());
+        assert_eq!(generated.sign(message), restored.sign(message));
     }
 
     #[test]

@@ -51,6 +51,15 @@ async fn origin_history_controls_reject_ambiguous_queries_without_changing_view(
     let initial = json_body(get(&app, &format!("{command}?method=timeshift_status")).await).await;
     assert_eq!(initial["response"]["enabled"], false);
     assert_eq!(initial["response"]["reason"], "history_disabled");
+    let versioned = json_body(
+        get(
+            &app,
+            &format!("{command}?method=timeshift_status&api_version=2"),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(versioned, initial);
     for query in [
         "method=timeshift_seek&back=1&position_ms=0",
         "method=timeshift_seek&back=NaN",
@@ -65,6 +74,17 @@ async fn origin_history_controls_reject_ambiguous_queries_without_changing_view(
         "method=timeshift_live&unknown=1",
         "method=stop&method=stop",
         "method=stop&generation=0",
+        "method=stop&api_version=",
+        "method=stop&api_version=1",
+        "method=stop&api_version=3",
+        "method=stop&api_version=02",
+        "method=stop&api_version=+2",
+        "method=stop&api_version=%FF",
+        "method=stop&api_version=2&api_version=2",
+        "method=stop&api_version=2&api%5fversion=2",
+        "method=stop&api_version=2&api_version=1",
+        "method=stop&api_version=2&unknown=1",
+        "method=stop&api_version=2&generation=0",
         "method=timeshift_status&generation=0",
         "method=liveseek&position_ms=0",
         "method=timeshift_seek&position_ms=0",
@@ -234,13 +254,52 @@ async fn origin_history_http_replays_deleted_media_and_revokes_only_its_view() {
     assert!(!bytes(get(&app, &playback.playback_url).await)
         .await
         .is_empty());
-    let stop = json_body(get(&app, &format!("{command}?method=stop")).await).await;
+    // EngineApi.stopSession() in the public Android SDK uses this exact query.
+    let stop = json_body(get(&app, &format!("{command}?method=stop&api_version=2")).await).await;
     assert_eq!(stop["response"], "ok");
     assert_eq!(get(&app, replay).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        get(&app, &retained[0]).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(get(&app, &media[0]).await.status(), StatusCode::NOT_FOUND);
     assert_eq!(
         get(&app, &playback.playback_url).await.status(),
         StatusCode::NOT_FOUND
     );
+    let stopped_status = json_body(
+        get(
+            &app,
+            &format!("{command}?method=timeshift_status&api_version=2"),
+        )
+        .await,
+    )
+    .await;
+    assert!(stopped_status["response"].is_null());
+    assert!(stopped_status["error"].is_string());
+    let repeated_stop =
+        json_body(get(&app, &format!("{command}?method=stop&api_version=2")).await).await;
+    assert!(repeated_stop["response"].is_null());
+    assert!(repeated_stop["error"].is_string());
     assert!(!bytes(get(&app, &other.playback_url).await).await.is_empty());
+    let other_after = json_body(
+        get(
+            &app,
+            &format!(
+                "{}?method=timeshift_status&api_version=2",
+                other.command_url
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        other_after["response"]["view"],
+        other_status["response"]["view"]
+    );
+    // Omitting the SDK hint remains a supported native control request.
+    let plain_stop =
+        json_body(get(&app, &format!("{}?method=stop", other.command_url)).await).await;
+    assert_eq!(plain_stop["response"], "ok");
     server.abort();
 }

@@ -140,12 +140,18 @@ and verified single-file VOD `size`. Standard single-file metainfo can also supp
 its advisory `info.name` as `filename`: nonempty UTF-8, at most 4,096 bytes, without
 control characters. Invalid or missing names are omitted without changing the
 original infohash or piece geometry. The name is display metadata, not a trusted
-filesystem path. Legacy live titles are not filenames, and MIME is not inferred
-from an extension. Unknown filenames and MIME remain omitted. HLS
-and unresolved identities still have no invented file table. Consequently, an
-Android discovery-first flow that requires a nonempty HLS file list, or an external
-player path that requires MIME, remains unqualified. A successful direct playback
-response does not establish those separate client contracts.
+filesystem path. Verified live sources expose the supported output MIME
+`video/mp2t` and the display fallback `stream.ts`; that fallback is not a filename
+extracted from the descriptor. Legacy live titles are not filenames. VOD MIME is
+not inferred from an extension and remains absent when unknown.
+
+Infohash and magnet metadata queries consult the provider's existing verified
+live descriptor before reporting an unresolved identity. The lookup accepts only
+the exact requested infohash and neither opens a source nor performs network I/O.
+Cold hashes remain unresolved. HLS and unresolved identities still have no
+invented file table. An Android discovery-first flow requiring a nonempty HLS
+file list, or a VOD player requiring known MIME, remains unqualified. A successful
+direct playback response does not establish those separate client contracts.
 
 ## Resolution lifetime and trust
 

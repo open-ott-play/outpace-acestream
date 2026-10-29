@@ -74,6 +74,9 @@ JSON envelope and generation checks described below. Status identifies
 `history.end_ms` before seeking; supported format does not mean media has arrived.
 `back` uses seconds behind the retained head; `position_ms` uses the observed
 media-duration timeline, never UTC or original Ace peer-piece coordinates.
+The optional SDK hint `api_version=2` is accepted on these commands, including
+`stop`; other versions and duplicate parameters are rejected. This hint does
+not change the units or meaning of the Outpace replay commands.
 
 Each origin viewer owns its retained sequence table and one finite replay view.
 Its replay URL is `/origin-hls/<token>/replay/<generation>/index.m3u8` with

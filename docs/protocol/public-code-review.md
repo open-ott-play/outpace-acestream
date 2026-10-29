@@ -10,7 +10,7 @@ Inventory verified on 2026-10-29 against the public `acestream` GitHub account. 
 | [ace-network-docs](https://github.com/acestream/ace-network-docs/tree/54a185dd0993) | `54a185dd0993` | DAO/network documentation; adjacent subsystem |
 | [ace-network-explorer](https://github.com/acestream/ace-network-explorer/tree/2fa6f77239c3) | `2fa6f77239c3` | Stellar-derived ledger explorer; adjacent subsystem |
 | [ace-network-node](https://github.com/acestream/ace-network-node/tree/2b69d8493633) | `2b69d8493633` | Stellar-derived consensus node; adjacent subsystem |
-| [ace-script-extension](https://github.com/acestream/ace-script-extension/tree/ad395daee41d) | `ad395daee41d` | Browser script/engine integration |
+| [ace-script-extension](https://github.com/acestream/ace-script-extension/tree/ad395daee41d) | `ad395daee41d` | Browser userscript manager; entrypoint review |
 | [acestream-android-sdk](https://github.com/acestream/acestream-android-sdk/tree/65a6e5399b5c) | `65a6e5399b5c` | Descriptor, HTTP request and response contracts |
 | [acestream-docs](https://github.com/acestream/acestream-docs/tree/fec817567504) | `fec817567504` | Published protocol and integration documentation |
 | [acestream-engine-android](https://github.com/acestream/acestream-engine-android/tree/88ddcc93ae71) | `88ddcc93ae71` | Android packaging and engine startup |

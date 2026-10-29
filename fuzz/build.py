@@ -8,7 +8,7 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 NIGHTLY = "nightly-2026-10-12"
-TARGETS = ("metadata", "peer_frames", "peer_extensions", "media_resync", "hls_playlist")
+TARGETS = ("metadata", "peer_frames", "peer_extensions", "media_resync", "hls_playlist", "tracker_responses")
 
 
 def main():

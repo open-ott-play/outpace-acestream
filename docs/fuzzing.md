@@ -1,10 +1,10 @@
 # Offline fuzz assessment
 
 Outpace tests its production protocol and media parsers with bounded,
-coverage-guided libFuzzer targets. The harness links `ace-wire` and `ace-media`
-directly; neither crate performs network or device I/O. All committed seeds are
-synthetic. The harness never reads a local identifier registry, fetches a
-tracker, joins a swarm, starts the daemon or tests a real stream.
+coverage-guided libFuzzer targets. The harness links `ace-wire`, `ace-media` and
+`ace-tracker` directly and calls their parsers without network or device I/O.
+All committed seeds are synthetic. The harness never reads a local identifier
+registry, fetches a tracker, joins a swarm, starts the daemon or tests a real stream.
 
 ## What is checked
 
@@ -18,6 +18,9 @@ tracker, joins a swarm, starts the daemon or tests a real stream.
 - **Peer extensions:** metadata control dictionaries and payload boundaries,
   peer-list record sizes, nonzero endpoints, valid advertised piece windows,
   and stable priority ordering without dropping candidates.
+- **Tracker responses:** BEP-15 connect and announce replies, transaction
+  correlation, bounded peer counts and byte-preserving response round trips.
+  No tracker client or socket is created.
 - **Media resynchronization:** MPEG-TS alignment across arbitrary input chunk
   boundaries, ordered loss boundaries, bounded loss accounting, PCR field
   ranges and packet-preserving HLS segmentation.
@@ -28,11 +31,11 @@ tracker, joins a swarm, starts the daemon or tests a real stream.
   URI is resolved or fetched.
 
 The same target functions run against the committed corpus in ordinary CI.
-Positive controls ensure valid metainfo, frames, metadata messages, peer records
-and aligned media actually reach successful parse paths. Unexpected panics and
-assertion failures are findings; the harness does not suppress them.
+Positive controls ensure valid metainfo, frames, metadata messages, peer records,
+tracker replies and aligned media actually reach successful parse paths.
+Unexpected panics and assertion failures are findings; the harness does not suppress them.
 
-These five targets do not exercise the daemon's viewer leases, shared history
+These six targets do not exercise the daemon's viewer leases, shared history
 budget or runtime shutdown. Those stateful paths have separate deterministic
 `ace-engine` tests, including multi-store retention and listener cleanup after
 startup failure or cancellation. The generated-media integration test checks
@@ -41,7 +44,7 @@ replace these checks or qualify every possible playback sequence.
 
 ## Budgets and execution policy
 
-Each target accepts at most 16 KiB and has a 60-second mutation budget: five
+Each target accepts at most 16 KiB and has a 60-second mutation budget: six
 minutes in total, excluding setup. The shared runner owns the 10-second input
 timeout, 2 GiB RSS limit, process supervision, network isolation, corpus copies
 and evidence artifacts. Production parser bounds remain active. The media
@@ -67,7 +70,7 @@ cargo fmt --manifest-path fuzz/Cargo.toml --all --check
 
 The separate `fuzz` Cargo workspace keeps the fuzz engine out of the product
 dependency graph and signed build. Its `Cargo.lock` pins registry packages and
-checksums; the two product crates are path dependencies, so the exact reviewed
+checksums; the three product crates are path dependencies, so the exact reviewed
 source is tested. Default features do not compile or run libFuzzer.
 
 When changing the product workspace version or parser dependencies, update both

@@ -69,7 +69,7 @@ evidence. This request does not publish a tag, binary, GitHub Release or image.
 Stable and beta tags retain their existing publication path.
 
 The pipeline runs normal Rust and Python checks, decoded replay, identifier
-hygiene, shared security analysis and all five bounded fuzz targets against the
+hygiene, shared security analysis and all six bounded fuzz targets against the
 same source commit. Its `RC gate` requires every stage to succeed; failed,
 cancelled, missing or skipped stages cannot produce an accepted result. The
 shared fuzz runner and checkout use the same reviewed immutable toolkit pin.

@@ -13,6 +13,56 @@ use ace_wire::ut_metadata::{self, MetadataMessage};
 
 pub const MAX_INPUT: usize = 16 * 1024;
 
+/// Exercise UDP tracker response parsing without creating a client or socket.
+pub fn tracker_responses(data: &[u8]) {
+    use ace_tracker::codec::{
+        build_announce_response, build_connect_response, parse_announce_response,
+        parse_connect_response,
+    };
+    use ace_tracker::TrackerError;
+
+    if data.len() > MAX_INPUT {
+        return;
+    }
+    // Matching the on-wire transaction lets mutations reach the payload parsers.
+    // A second parse checks that a different transaction can never be accepted.
+    let txid = data
+        .get(4..8)
+        .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()))
+        .unwrap_or(0);
+    if let Ok(connection_id) = parse_connect_response(data, txid) {
+        assert_eq!(build_connect_response(txid, connection_id), data[..16]);
+    }
+    assert!(parse_connect_response(data, txid ^ 1).is_err());
+    if data.len() >= 16 {
+        assert!(matches!(
+            parse_connect_response(data, txid ^ 1),
+            Err(TrackerError::TransactionMismatch)
+        ));
+    }
+
+    if let Ok((interval, peers)) = parse_announce_response(data, txid) {
+        assert!(data.len() >= 20);
+        assert_eq!(peers.len(), (data.len() - 20) / 6);
+        let leechers = u32::from_be_bytes(data[12..16].try_into().unwrap());
+        let seeders = u32::from_be_bytes(data[16..20].try_into().unwrap());
+        let encoded = build_announce_response(txid, interval, leechers, seeders, &peers);
+        // The parser accepts complete peer records and ignores a partial tail.
+        assert_eq!(encoded, data[..20 + peers.len() * 6]);
+        assert_eq!(
+            parse_announce_response(&encoded, txid).unwrap(),
+            (interval, peers)
+        );
+    }
+    assert!(parse_announce_response(data, txid ^ 1).is_err());
+    if data.len() >= 8 {
+        assert!(matches!(
+            parse_announce_response(data, txid ^ 1),
+            Err(TrackerError::TransactionMismatch)
+        ));
+    }
+}
+
 /// Exercise the same bounded parser and byte-span rewriting used by the origin relay.
 /// No URL is resolved or fetched, and replacement text cannot enlarge an input line.
 pub fn hls_playlist(data: &[u8]) {

@@ -18,11 +18,20 @@ fuzzing = ["dep:libfuzzer-sys"]
 [dependencies]
 ace-wire = { path = "../crates/ace-wire" }
 ace-media = { path = "../crates/ace-media" }
+ace-tracker = { path = "../crates/ace-tracker" }
 libfuzzer-sys = { version = "=0.4.13", optional = true }
 
 [[bin]]
 name = "metadata"
 path = "fuzz_targets/metadata.rs"
+test = false
+doc = false
+bench = false
+required-features = ["fuzzing"]
+
+[[bin]]
+name = "tracker_responses"
+path = "fuzz_targets/tracker_responses.rs"
 test = false
 doc = false
 bench = false

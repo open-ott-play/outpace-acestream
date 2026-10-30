@@ -934,6 +934,14 @@ async fn resolve_safe_addr(host: &str, port: u16) -> Result<SocketAddr, ResolveE
 /// catalog path and `MAX_METADATA_SIZE` already impose on the same `AceStreamTransport` dict.
 pub const MAX_TRANSPORT_FILE: u64 = 1_048_576;
 
+/// Validate a caller-supplied transport URL without resolving DNS or fetching it. The
+/// fetch path uses the same parser; address policy is still checked during acquisition.
+pub fn validate_transport_url(url: &str) -> Result<(), ResolveError> {
+    FetchUrl::parse_transport(url)
+        .map(|_| ())
+        .map_err(transport_fetch_error)
+}
+
 const TRANSPORT_URL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TRANSPORT_URL_TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
 

@@ -120,7 +120,7 @@ pub trait StreamProvider: Send + Sync {
     /// this. Kept separate from [`open`](Self::open) because VOD is finite, length-known content
     /// (seekable), not an unbounded live stream.
     async fn resolve_vod(&self, _id: &str) -> Result<Box<dyn VodContent>, ProviderError> {
-        Err(ProviderError::Backend(
+        Err(ProviderError::Unresolvable(
             "this network does not support VOD".into(),
         ))
     }
@@ -138,6 +138,14 @@ pub trait StreamProvider: Send + Sync {
     /// (never BEP-9 or a transport url): the index trusts them as-is. Defaults to ignoring it.
     fn remember_live_descriptor(&self, _info: &StreamInfo) {}
 
+    /// Return an already verified live descriptor without resolving, fetching or opening it.
+    /// Only locally originated or signed-catalog descriptors qualify, with an exact infohash
+    /// match. Peer metadata and caller-supplied transport URLs must not enter this lookup.
+    /// The default reports unknown metadata rather than guessing live state or file layout.
+    fn verified_live_descriptor(&self, _infohash: &[u8; 20]) -> Option<StreamInfo> {
+        None
+    }
+
     /// Seed a content-id resolution already authenticated by the signed catalog. The id and
     /// descriptor must come from the same catalog response; never call this for transport URLs,
     /// BEP-9, HLS or caller-supplied metadata. Retains canonical content-id session ownership.
@@ -148,9 +156,11 @@ pub trait StreamProvider: Send + Sync {
 
 pub enum ProviderError {
     NotFound,
+    /// The caller's selector is malformed. The message is safe to return to clients.
+    Invalid(String),
     Backend(String),
-    /// The id is well-formed, but the provider holds no verified metadata to open it with and
-    /// will not guess (#164: a bare infohash without a verified transport descriptor). The
+    /// The id is well-formed, but the requested playback mode is unsupported or the provider
+    /// has no verified metadata to open it (#164: a bare infohash without a descriptor). The
     /// message is user-facing: it explains the refusal and how to open the stream instead, and
     /// is safe to return to HTTP clients and to print in the CLI.
     Unresolvable(String),
@@ -165,6 +175,7 @@ impl std::fmt::Debug for ProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound => f.write_str("NotFound"),
+            Self::Invalid(message) => f.debug_tuple("Invalid").field(message).finish(),
             Self::Backend(message) => f.debug_tuple("Backend").field(message).finish(),
             Self::Unresolvable(message) => f.debug_tuple("Unresolvable").field(message).finish(),
             // Signed origin URLs belong only in explicit playback/resolve responses.
@@ -177,7 +188,9 @@ impl std::fmt::Display for ProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProviderError::NotFound => f.write_str("not found"),
-            ProviderError::Backend(msg) | ProviderError::Unresolvable(msg) => f.write_str(msg),
+            ProviderError::Invalid(msg)
+            | ProviderError::Backend(msg)
+            | ProviderError::Unresolvable(msg) => f.write_str(msg),
             ProviderError::DirectHls { .. } => f.write_str(
                 "source is origin HLS; use the native HTTP playback URL or outpace play --resolve",
             ),
@@ -234,6 +247,10 @@ mod tests {
 
     #[test]
     fn provider_error_display_is_the_user_facing_message() {
+        assert_eq!(
+            ProviderError::Invalid("invalid selector".into()).to_string(),
+            "invalid selector"
+        );
         assert_eq!(
             ProviderError::Unresolvable("use cid:<id>".into()).to_string(),
             "use cid:<id>"

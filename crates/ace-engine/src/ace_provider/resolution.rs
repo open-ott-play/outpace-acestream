@@ -304,23 +304,36 @@ impl AceProvider {
     ) -> Result<VodInfo, ProviderError> {
         let bytes = if let Some(content_id) = id.strip_prefix("cid:") {
             let key =
-                hex20(content_id).map_err(|_| ProviderError::Backend("bad content-id".into()))?;
+                hex20(content_id).map_err(|_| ProviderError::Invalid("bad content-id".into()))?;
             self.content_id_transport_with_catalog(key, catalog).await?
         } else if let Some(url) = crate::transport_url::decode_transport_url(id) {
+            ace_swarm::resolve::validate_transport_url(&url)
+                .map_err(|_| ProviderError::Invalid("invalid transport URL".into()))?;
             transport_bytes_from_url(&url)
                 .await
                 .map_err(|e| ProviderError::Backend(format!("transport url: {e:?}")))?
-        } else if id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(ProviderError::Backend(
-                "a bare infohash is not a VOD target (no descriptor with piece hashes)".into(),
+        } else if is_bare_hex40(id.strip_prefix("ih:").unwrap_or(id)) {
+            // Well-formed but not openable: the VOD analogue of the live `ih:` refusal (#164), so
+            // HTTP callers get `422` with this reason instead of an upstream `502`.
+            return Err(ProviderError::Unresolvable(
+                "an infohash alone is not a VOD target (no descriptor with piece hashes); use cid:<40hex> or a transport-url id".into(),
             ));
         } else {
-            return Err(ProviderError::Backend(
+            return Err(ProviderError::Invalid(
                 "id must be cid:<40hex> or a transport-url id for VOD".into(),
             ));
         };
-        vod_info_from_transport(&bytes)
-            .map_err(|e| ProviderError::Backend(format!("vod descriptor: {e:?}")))
+        match playback_from_transport(&bytes)
+            .map_err(|e| ProviderError::Backend(format!("vod descriptor: {e:?}")))?
+        {
+            ResolvedTransport::Vod(info) => Ok(info),
+            ResolvedTransport::Swarm(_) => Err(ProviderError::Unresolvable(
+                "source is live; use /streams/ace/{id}".into(),
+            )),
+            ResolvedTransport::Hls { .. } => Err(ProviderError::Unresolvable(
+                "source is origin HLS; use /streams/ace/{id} or outpace play --resolve".into(),
+            )),
+        }
     }
 
     async fn content_id_transport_with_catalog(

@@ -401,3 +401,366 @@ async fn vod_hls_rejects_partial_packets_and_invalid_transport_headers() {
         assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 }
+
+#[tokio::test]
+async fn vod_failures_map_to_the_documented_selector_contract() {
+    // A well-formed id the provider will not open is client-actionable (`422`, like the live
+    // `ih:` refusal), a missing network or target is `404`, and only an upstream failure is
+    // `502`. Bodies carry the provider's reason without its outer error-variant wrapper.
+    let invalid = vod_failure(ProviderError::Invalid("invalid selector".into()));
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(invalid.into_body(), 256)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"invalid selector");
+
+    let unprocessable = vod_failure(ProviderError::Unresolvable("bare infohash".into()));
+    assert_eq!(unprocessable.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = axum::body::to_bytes(unprocessable.into_body(), 256)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"bare infohash");
+
+    let missing = vod_failure(ProviderError::NotFound);
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let body = axum::body::to_bytes(missing.into_body(), 256)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"vod target not found");
+
+    let upstream = vod_failure(ProviderError::Backend("catalog timeout".into()));
+    assert_eq!(upstream.status(), StatusCode::BAD_GATEWAY);
+    let body = axum::body::to_bytes(upstream.into_body(), 256)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"catalog timeout");
+
+    let direct_hls = vod_failure(ProviderError::DirectHls {
+        manifest_url: "https://origin.invalid/manifest.m3u8".into(),
+    });
+    assert_eq!(direct_hls.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+fn vod_provider_router(provider: Arc<dyn StreamProvider>) -> Router {
+    let network = provider.network();
+    let mut registry = ProviderRegistry::new();
+    registry.register(provider);
+    router(AppState {
+        manager: StreamManager::with_config(
+            registry,
+            256,
+            crate::config::HlsConfig {
+                startup_timeout_ms: 100,
+                ..Default::default()
+            },
+        ),
+        networks: vec![network.into()],
+        resolve_content_ids_in_getstream: false,
+        ace_sessions: Arc::new(AceSessionStore::default()),
+        experimental_ace_compat: false,
+        origin_hls: None,
+        broadcasts: None,
+    })
+}
+
+#[tokio::test]
+async fn native_vod_routes_reject_malformed_and_unsupported_ace_selectors_offline() {
+    let app = vod_provider_router(Arc::new(crate::ace_provider::AceProvider::new(
+        Arc::new(ace_wire::identity::Identity::generate()),
+        0,
+    )));
+    for suffix in ["", "/manifest.m3u8", "/seg/0.ts"] {
+        for (id, expected) in [
+            ("cid:xyz", StatusCode::BAD_REQUEST),
+            ("ih:xyz", StatusCode::BAD_REQUEST),
+            ("turl-", StatusCode::BAD_REQUEST),
+            ("invalid-selector", StatusCode::BAD_REQUEST),
+            (
+                "0123456789abcdef0123456789abcdef01234567",
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "ih:0123456789abcdef0123456789abcdef01234567",
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/vod/ace/{id}{suffix}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{id}{suffix}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn vod_range_failures_use_the_same_status_contract_on_every_route() {
+    struct FailingVodProvider;
+    struct FailingVod(String);
+    #[async_trait]
+    impl StreamProvider for FailingVodProvider {
+        fn network(&self) -> &'static str {
+            "failure"
+        }
+        async fn open(&self, _: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+            Err(ProviderError::NotFound)
+        }
+        async fn resolve_vod(&self, id: &str) -> Result<Box<dyn VodContent>, ProviderError> {
+            Ok(Box::new(FailingVod(id.into())))
+        }
+    }
+    #[async_trait]
+    impl VodContent for FailingVod {
+        fn content_length(&self) -> u64 {
+            188 * 8
+        }
+        async fn open_range(
+            &self,
+            _: u64,
+            _: u64,
+        ) -> Result<Box<dyn VodByteSource>, ProviderError> {
+            Err(match self.0.as_str() {
+                "invalid" => ProviderError::Invalid("invalid range".into()),
+                "refused" => ProviderError::Unresolvable("range refused".into()),
+                "missing" => ProviderError::NotFound,
+                _ => ProviderError::Backend("range unavailable".into()),
+            })
+        }
+    }
+    let app = vod_provider_router(Arc::new(FailingVodProvider));
+    for suffix in ["", "/manifest.m3u8", "/seg/0.ts"] {
+        for (id, expected) in [
+            ("invalid", StatusCode::BAD_REQUEST),
+            ("refused", StatusCode::UNPROCESSABLE_ENTITY),
+            ("missing", StatusCode::NOT_FOUND),
+            ("backend", StatusCode::BAD_GATEWAY),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/vod/failure/{id}{suffix}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{id}{suffix}");
+        }
+    }
+}
+
+struct VodTiming {
+    delays: [Duration; 3],
+    bypass: std::sync::atomic::AtomicBool,
+    active: std::sync::atomic::AtomicUsize,
+    resolutions: std::sync::atomic::AtomicUsize,
+    sources_dropped: std::sync::atomic::AtomicUsize,
+}
+
+struct VodOperation(Arc<VodTiming>);
+impl Drop for VodOperation {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+impl VodTiming {
+    fn new(delays: [u64; 3]) -> Arc<Self> {
+        Arc::new(Self {
+            delays: delays.map(Duration::from_millis),
+            bypass: false.into(),
+            active: 0.into(),
+            resolutions: 0.into(),
+            sources_dropped: 0.into(),
+        })
+    }
+    async fn delay(self: &Arc<Self>, phase: usize) {
+        self.active.fetch_add(1, Ordering::SeqCst);
+        let _operation = VodOperation(self.clone());
+        if !self.bypass.load(Ordering::SeqCst) && !self.delays[phase].is_zero() {
+            tokio::time::sleep(self.delays[phase]).await;
+        }
+    }
+}
+
+struct TimedVod(Arc<VodTiming>);
+struct TimedVodSource {
+    timing: Arc<VodTiming>,
+    chunk: Option<Bytes>,
+    length: u64,
+}
+impl Drop for TimedVodSource {
+    fn drop(&mut self) {
+        self.timing.sources_dropped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+#[async_trait]
+impl StreamProvider for TimedVod {
+    fn network(&self) -> &'static str {
+        "timed-vod"
+    }
+    async fn open(&self, _: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+        Err(ProviderError::NotFound)
+    }
+    async fn resolve_vod(&self, _: &str) -> Result<Box<dyn VodContent>, ProviderError> {
+        self.0.resolutions.fetch_add(1, Ordering::SeqCst);
+        self.0.delay(0).await;
+        Ok(Box::new(Self(self.0.clone())))
+    }
+}
+#[async_trait]
+impl VodContent for TimedVod {
+    fn content_length(&self) -> u64 {
+        188 * 8
+    }
+    async fn open_range(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<Box<dyn VodByteSource>, ProviderError> {
+        self.0.delay(1).await;
+        Ok(Box::new(TimedVodSource {
+            timing: self.0.clone(),
+            chunk: Some(Bytes::copy_from_slice(
+                &synthetic_vod_ts(8)[start as usize..=end as usize],
+            )),
+            length: end - start + 1,
+        }))
+    }
+}
+#[async_trait]
+impl VodByteSource for TimedVodSource {
+    fn content_length(&self) -> u64 {
+        self.length
+    }
+    async fn next(&mut self) -> Option<Bytes> {
+        let chunk = self.chunk.take()?;
+        self.timing.delay(2).await;
+        Some(chunk)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn vod_startup_deadline_cancels_each_phase_and_allows_retry() {
+    for suffix in ["", "/manifest.m3u8", "/seg/0.ts"] {
+        for phase in 0..3 {
+            // Raw VOD returns headers before media, so reading its body is not startup work.
+            if suffix.is_empty() && phase == 2 {
+                continue;
+            }
+            let mut delays = [0; 3];
+            delays[phase] = 200;
+            let timing = VodTiming::new(delays);
+            let app = vod_provider_router(Arc::new(TimedVod(timing.clone())));
+            let uri = format!("/vod/timed-vod/x{suffix}");
+            let started = tokio::time::Instant::now();
+            let response = app
+                .clone()
+                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::GATEWAY_TIMEOUT,
+                "{suffix}, phase {phase}"
+            );
+            assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+            assert_eq!(started.elapsed(), Duration::from_millis(100));
+            assert_eq!(timing.active.load(Ordering::SeqCst), 0);
+            if phase == 2 {
+                assert_eq!(timing.sources_dropped.load(Ordering::SeqCst), 1);
+            }
+
+            timing.bypass.store(true, Ordering::SeqCst);
+            let response = app
+                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(!axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                timing.resolutions.load(Ordering::SeqCst),
+                if phase == 0 { 2 } else { 1 }
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn vod_resolution_range_open_and_probe_share_one_deadline() {
+    for (suffix, delays) in [
+        ("", [60, 60, 0]),
+        ("/manifest.m3u8", [40, 40, 40]),
+        ("/seg/0.ts", [40, 40, 40]),
+    ] {
+        let timing = VodTiming::new(delays);
+        let app = vod_provider_router(Arc::new(TimedVod(timing.clone())));
+        let started = tokio::time::Instant::now();
+        let response = app
+            .oneshot(
+                Request::get(format!("/vod/timed-vod/x{suffix}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        assert_eq!(timing.active.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn vod_waiter_keeps_its_deadline_when_a_cancelled_resolver_is_replaced() {
+    let timing = VodTiming::new([200, 0, 0]);
+    let app = vod_provider_router(Arc::new(TimedVod(timing.clone())));
+    let request = || {
+        Request::get("/vod/timed-vod/x")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let mut owner = Box::pin(app.clone().oneshot(request()));
+    assert!(futures::poll!(owner.as_mut()).is_pending());
+    tokio::time::advance(Duration::from_millis(50)).await;
+    let mut waiter = Box::pin(app.clone().oneshot(request()));
+    assert!(futures::poll!(waiter.as_mut()).is_pending());
+    assert_eq!(timing.resolutions.load(Ordering::SeqCst), 1);
+    tokio::time::advance(Duration::from_millis(50)).await;
+    assert_eq!(owner.await.unwrap().status(), StatusCode::GATEWAY_TIMEOUT);
+    assert!(futures::poll!(waiter.as_mut()).is_pending());
+    assert_eq!(timing.resolutions.load(Ordering::SeqCst), 2);
+    tokio::time::advance(Duration::from_millis(50)).await;
+    assert_eq!(waiter.await.unwrap().status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(timing.active.load(Ordering::SeqCst), 0);
+    timing.bypass.store(true, Ordering::SeqCst);
+    assert_eq!(
+        app.oneshot(request()).await.unwrap().status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn raw_vod_body_can_outlive_the_startup_budget() {
+    let timing = VodTiming::new([0, 0, 200]);
+    let app = vod_provider_router(Arc::new(TimedVod(timing)));
+    let response = app
+        .oneshot(
+            Request::get("/vod/timed-vod/x")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), synthetic_vod_ts(8));
+}

@@ -8,36 +8,62 @@ pub(super) async fn vod_stream(
     Path((network, id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let vod = match resolve_vod(&s, &network, &id).await {
-        Ok(v) => v,
-        Err(resp) => return *resp,
-    };
-    let total = vod.content_length();
-    if total == 0 {
-        return empty_vod_response();
-    }
-    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
-    match parse_byte_range(range, total) {
-        // Whole file (no usable Range): 200 with Accept-Ranges so players know they *can* seek.
-        RangeOutcome::Full => match s.manager.open_vod_range(vod.as_ref(), 0, total - 1).await {
-            Ok(source) => vod_response_from_source(source),
-            Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
-        },
-        RangeOutcome::Satisfiable(start, end) => {
-            match s.manager.open_vod_range(vod.as_ref(), start, end).await {
-                Ok(source) => vod_partial_response(source, start, end, total),
-                Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
-            }
+    vod_startup_response(s.manager.hls_startup_timeout(), async {
+        let vod = match resolve_vod(&s, &network, &id).await {
+            Ok(v) => v,
+            Err(resp) => return *resp,
+        };
+        let total = vod.content_length();
+        if total == 0 {
+            return empty_vod_response();
         }
-        // A well-formed range that can't be met: 416 with the resource's true length.
-        RangeOutcome::Unsatisfiable => axum::http::Response::builder()
-            .status(StatusCode::RANGE_NOT_SATISFIABLE)
-            .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::CONTENT_RANGE, format!("bytes */{total}"))
-            .body(Body::empty())
-            .expect("valid 416 response")
-            .into_response(),
-    }
+        let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+        match parse_byte_range(range, total) {
+            // Whole file (no usable Range): 200 with Accept-Ranges so players know they *can* seek.
+            RangeOutcome::Full => {
+                match s.manager.open_vod_range(vod.as_ref(), 0, total - 1).await {
+                    Ok(source) => vod_response_from_source(source),
+                    Err(e) => vod_failure(e),
+                }
+            }
+            RangeOutcome::Satisfiable(start, end) => {
+                match s.manager.open_vod_range(vod.as_ref(), start, end).await {
+                    Ok(source) => vod_partial_response(source, start, end, total),
+                    Err(e) => vod_failure(e),
+                }
+            }
+            // A well-formed range that can't be met: 416 with the resource's true length.
+            RangeOutcome::Unsatisfiable => axum::http::Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CONTENT_RANGE, format!("bytes */{total}"))
+                .body(Body::empty())
+                .expect("valid 416 response")
+                .into_response(),
+        }
+    })
+    .await
+}
+
+/// Include descriptor resolution and lock waits in the existing VOD startup budget.
+/// Dropping a timed-out request cancels its provider work and releases its range reader;
+/// once headers are returned, a raw VOD body has no whole-file download deadline.
+async fn vod_startup_response(
+    timeout: Duration,
+    response: impl std::future::Future<Output = Response>,
+) -> Response {
+    tokio::time::timeout(timeout, response)
+        .await
+        .unwrap_or_else(|_| vod_startup_timeout())
+}
+
+fn vod_startup_timeout() -> Response {
+    (
+        StatusCode::GATEWAY_TIMEOUT,
+        [(header::RETRY_AFTER, "1")],
+        "VOD startup timed out",
+    )
+        .into_response()
 }
 
 /// How a `Range` request header resolves against a known content length.
@@ -153,8 +179,30 @@ fn vod_partial_response(
         .into_response()
 }
 
+/// HTTP mapping for a failed VOD provider call: malformed selectors are `400`, a missing
+/// network or target is `404`, a well-formed id the provider will not open is `422`, and an
+/// upstream failure is `502`. Return the provider's reason without its outer `ProviderError`
+/// debug wrapper.
+pub(super) fn vod_failure(error: ProviderError) -> Response {
+    let status = match &error {
+        ProviderError::Invalid(_) => StatusCode::BAD_REQUEST,
+        ProviderError::NotFound => StatusCode::NOT_FOUND,
+        ProviderError::Unresolvable(_) | ProviderError::DirectHls { .. } => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        ProviderError::Backend(_) => StatusCode::BAD_GATEWAY,
+    };
+    let body = match &error {
+        // `NotFound` covers both an unknown network and an unknown target; a single "not found"
+        // reason is accurate for either and does not claim the network is unknown.
+        ProviderError::NotFound => "vod target not found".to_owned(),
+        _ => error.to_string(),
+    };
+    (status, body).into_response()
+}
+
 /// Resolve `id` on `network` to a single-file VOD via the manager's shared cache, or the HTTP
-/// error response to return: `404` for an unknown network, `502` if resolution fails.
+/// error response to return (see [`vod_failure`]).
 pub(super) async fn resolve_vod(
     s: &AppState,
     network: &str,
@@ -162,12 +210,7 @@ pub(super) async fn resolve_vod(
 ) -> Result<Arc<dyn VodContent>, Box<Response>> {
     match s.manager.resolve_vod(network, id).await {
         Ok(v) => Ok(v),
-        Err(ProviderError::NotFound) => Err(Box::new(
-            (StatusCode::NOT_FOUND, "unknown network").into_response(),
-        )),
-        Err(e) => Err(Box::new(
-            (StatusCode::BAD_GATEWAY, format!("{e:?}")).into_response(),
-        )),
+        Err(e) => Err(Box::new(vod_failure(e))),
     }
 }
 
@@ -179,25 +222,31 @@ pub(super) async fn vod_manifest(
     State(s): State<AppState>,
     Path((network, id)): Path<(String, String)>,
 ) -> Response {
-    let vod = match resolve_vod(&s, &network, &id).await {
-        Ok(v) => v,
-        Err(resp) => return *resp,
-    };
-    let layout = match crate::hls::VodHlsLayout::new(vod.content_length(), s.manager.hls_config()) {
-        Ok(layout) => layout,
-        Err(message) => return (StatusCode::UNSUPPORTED_MEDIA_TYPE, message).into_response(),
-    };
-    // Inspect a bounded, verified prefix before advertising any .ts URLs. A file name or
-    // packet-aligned length does not identify its container. Drop the probe source here.
-    let probe_length = (TS_PROBE_PACKETS * TS_PACKET_BYTES) as u64;
-    if let Err(response) = open_ts_vod_range(&s, vod.as_ref(), 0, probe_length - 1).await {
-        return *response;
-    }
-    (
-        [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
-        layout.playlist(&network, &id),
-    )
-        .into_response()
+    vod_startup_response(s.manager.hls_startup_timeout(), async {
+        let vod = match resolve_vod(&s, &network, &id).await {
+            Ok(v) => v,
+            Err(resp) => return *resp,
+        };
+        let layout =
+            match crate::hls::VodHlsLayout::new(vod.content_length(), s.manager.hls_config()) {
+                Ok(layout) => layout,
+                Err(message) => {
+                    return (StatusCode::UNSUPPORTED_MEDIA_TYPE, message).into_response()
+                }
+            };
+        // Inspect a bounded, verified prefix before advertising any .ts URLs. A file name or
+        // packet-aligned length does not identify its container. Drop the probe source here.
+        let probe_length = (TS_PROBE_PACKETS * TS_PACKET_BYTES) as u64;
+        if let Err(response) = open_ts_vod_range(&s, vod.as_ref(), 0, probe_length - 1).await {
+            return *response;
+        }
+        (
+            [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
+            layout.playlist(&network, &id),
+        )
+            .into_response()
+    })
+    .await
 }
 
 /// `GET /vod/{network}/{id}/seg/{n}.ts` — HLS segment `n` of the resolved VOD, served as the
@@ -207,24 +256,30 @@ pub(super) async fn vod_hls_segment(
     State(s): State<AppState>,
     Path((network, id, seg)): Path<(String, String, String)>,
 ) -> Response {
-    let Some(index) = seg.strip_suffix(".ts").and_then(|n| n.parse::<u64>().ok()) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let vod = match resolve_vod(&s, &network, &id).await {
-        Ok(v) => v,
-        Err(resp) => return *resp,
-    };
-    let layout = match crate::hls::VodHlsLayout::new(vod.content_length(), s.manager.hls_config()) {
-        Ok(layout) => layout,
-        Err(message) => return (StatusCode::UNSUPPORTED_MEDIA_TYPE, message).into_response(),
-    };
-    let Some((start, end)) = layout.segment_range(index) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    match open_ts_vod_range(&s, vod.as_ref(), start, end).await {
-        Ok(stream) => vod_hls_segment_response(stream),
-        Err(response) => *response,
-    }
+    vod_startup_response(s.manager.hls_startup_timeout(), async {
+        let Some(index) = seg.strip_suffix(".ts").and_then(|n| n.parse::<u64>().ok()) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let vod = match resolve_vod(&s, &network, &id).await {
+            Ok(v) => v,
+            Err(resp) => return *resp,
+        };
+        let layout =
+            match crate::hls::VodHlsLayout::new(vod.content_length(), s.manager.hls_config()) {
+                Ok(layout) => layout,
+                Err(message) => {
+                    return (StatusCode::UNSUPPORTED_MEDIA_TYPE, message).into_response()
+                }
+            };
+        let Some((start, end)) = layout.segment_range(index) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        match open_ts_vod_range(&s, vod.as_ref(), start, end).await {
+            Ok(stream) => vod_hls_segment_response(stream),
+            Err(response) => *response,
+        }
+    })
+    .await
 }
 
 /// Opening a range and probing its format share one deadline. Cancellation drops both the
@@ -241,17 +296,11 @@ async fn open_ts_vod_range(
             .manager
             .open_vod_range(vod, start, end)
             .await
-            .map_err(|error| {
-                Box::new((StatusCode::BAD_GATEWAY, error.to_string()).into_response())
-            })?;
+            .map_err(|error| Box::new(vod_failure(error)))?;
         probe_ts_source(source, end - start + 1, timeout).await
     })
     .await
-    .unwrap_or_else(|_| {
-        Err(Box::new(
-            (StatusCode::GATEWAY_TIMEOUT, "VOD container probe timed out").into_response(),
-        ))
-    })
+    .unwrap_or_else(|_| Err(Box::new(vod_startup_timeout())))
 }
 
 const TS_PACKET_BYTES: usize = 188;
@@ -350,11 +399,7 @@ async fn probe_ts_source(
     })
     .await;
     match read {
-        Err(_) => {
-            return Err(Box::new(
-                (StatusCode::GATEWAY_TIMEOUT, "VOD container probe timed out").into_response(),
-            ))
-        }
+        Err(_) => return Err(Box::new(vod_startup_timeout())),
         Ok(false) => {
             return Err(Box::new(
                 (

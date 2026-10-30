@@ -5,11 +5,66 @@ async fn resolve_vod_rejects_bare_infohash() {
     // A bare infohash carries no transport descriptor, so it has no VOD piece hashes.
     // This resolves synchronously (no network) to a clear error.
     let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
-    let err = p
-        .resolve_vod("00112233445566778899aabbccddeeff00112233")
+    for id in [
+        "0123456789abcdef0123456789abcdef01234567",
+        "ih:0123456789abcdef0123456789abcdef01234567",
+    ] {
+        let err = p.resolve_vod(id).await.err();
+        assert!(matches!(err, Some(ProviderError::Unresolvable(_))));
+    }
+}
+
+#[tokio::test]
+async fn malformed_vod_selectors_fail_before_catalog_or_url_fetch() {
+    let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
+    let invalid_url = crate::transport_url::encode_transport_url("http://").unwrap();
+    for id in [
+        "",
+        "cid:",
+        "cid:xyz",
+        "ih:xyz",
+        "turl-",
+        "turl-!",
+        &invalid_url,
+    ] {
+        let error = p
+            .resolve_vod_info_with_catalog(id, async { panic!("invalid id reached catalog") })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ProviderError::Invalid(_)),
+            "{id}: {error:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn vod_refuses_other_resolved_source_types_but_retains_backend_failures() {
+    let p = AceProvider::new(Arc::new(Identity::generate()), 6878);
+    let (live, _) = test_support::synthetic_live_transport(524_288);
+    let hls = ace_wire::bencode::Bencode::parse(
+        include_bytes!("../../../../../tests/vectors/hls-descriptor.bencode")
+            .strip_suffix(b"\n")
+            .unwrap(),
+    )
+    .unwrap();
+    for bytes in [live, ace_wire::transport::encode_transport(&hls)] {
+        let error = p
+            .resolve_vod_info_with_catalog("cid:0123456789abcdef0123456789abcdef01234567", async {
+                Ok(bytes)
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::Unresolvable(_)));
+        assert!(!error.to_string().contains("token="));
+    }
+    let error = p
+        .resolve_vod_info_with_catalog("cid:0123456789abcdef0123456789abcdef01234567", async {
+            Ok(b"invalid descriptor".to_vec())
+        })
         .await
-        .err();
-    assert!(err.is_some(), "a bare infohash is not a VOD target");
+        .unwrap_err();
+    assert!(matches!(error, ProviderError::Backend(_)));
 }
 
 #[tokio::test]

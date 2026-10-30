@@ -193,6 +193,148 @@ async fn server_api_get_media_files_does_not_invent_files_for_an_unresolved_info
     }
 }
 
+fn metadata_ace_state() -> AppState {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(crate::ace_provider::AceProvider::new(
+        Arc::new(ace_wire::identity::Identity::from_seed([7; 32])),
+        0,
+    )));
+    AppState {
+        manager: StreamManager::new(registry),
+        networks: vec!["ace".into()],
+        resolve_content_ids_in_getstream: false,
+        ace_sessions: Arc::new(AceSessionStore::default()),
+        experimental_ace_compat: true,
+        origin_hls: None,
+        broadcasts: None,
+    }
+}
+
+#[tokio::test]
+async fn server_api_reuses_catalog_verified_live_metadata_for_hash_and_magnet_offline() {
+    let state = metadata_ace_state();
+    let (transport, _) = crate::ace_provider::test_support::synthetic_live_transport(524_288);
+    let info = ace_swarm::resolve::stream_info_from_transport(&transport).unwrap();
+    let ih = infohash_hex(&info.infohash);
+    assert!(state
+        .manager
+        .verified_live_descriptor("ace", &info.infohash)
+        .is_none());
+    // Model the exact registration performed after a signed content-id lookup, without
+    // accessing the catalog. These bytes and the content ID are synthetic test fixtures.
+    state.manager.remember_catalog_descriptor(
+        "ace",
+        "0123456789abcdef0123456789abcdef01234567",
+        &info,
+    );
+    for path in ["/server/api", "/webui/api/service"] {
+        for selector in [
+            format!("infohash={}", ih.to_uppercase()),
+            format!("magnet=magnet%3A%3Fxt%3Durn%3Abtih%3A{ih}"),
+        ] {
+            let (status, json) = control_api_json(
+                state.clone(),
+                path,
+                &format!("method=get_media_files&mode=full&expand_wrapper=1&dump_transport_file=1&{selector}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(json["error"].is_null(), "{json}");
+            assert_eq!(json["result"]["infohash"], ih);
+            let files = json["result"]["files"].as_array().unwrap();
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0]["infohash"], ih);
+            assert_eq!(files[0]["index"], 0);
+            assert_eq!(files[0]["type"], "live");
+            assert_eq!(files[0]["is_live"], 1);
+            assert_eq!(files[0]["mime"], "video/mp2t");
+            assert_eq!(files[0]["filename"], "stream.ts");
+            assert!(files[0].get("size").is_none());
+            let (_, analysis) = control_api_json(
+                state.clone(),
+                path,
+                &format!("method=analyze_content&{selector}"),
+            )
+            .await;
+            assert!(analysis["error"].is_null(), "{analysis}");
+            assert_eq!(analysis["result"]["infohash"], ih);
+            assert_eq!(analysis["result"]["is_live"], 1);
+            assert_eq!(analysis["result"]["is_encrypted"], 0);
+            // An infohash lookup does not invent a reverse catalog content-id binding.
+            assert!(analysis["result"]["content_id"].is_null());
+        }
+    }
+    assert!(state.manager.list().await.is_empty());
+    assert_eq!(state.ace_sessions.active_count(), 0);
+}
+
+#[tokio::test]
+async fn server_api_unknown_hash_and_magnet_remain_unresolved_without_starting_sessions() {
+    let state = metadata_ace_state();
+    let ih = "0123456789abcdef0123456789abcdef01234567";
+    for path in ["/server/api", "/webui/api/service"] {
+        for selector in [
+            format!("infohash={ih}"),
+            format!("magnet=magnet%3A%3Fxt%3Durn%3Abtih%3A{ih}"),
+        ] {
+            for method in ["get_media_files", "analyze_content"] {
+                let (status, json) =
+                    control_api_json(state.clone(), path, &format!("method={method}&{selector}"))
+                        .await;
+                assert_eq!(status, StatusCode::OK);
+                assert!(json["error"].is_null());
+                assert_eq!(json["result"]["transport"], "unknown");
+                assert_eq!(json["result"]["is_live"], -1);
+                assert_eq!(json["result"]["is_encrypted"], -1);
+                if method == "get_media_files" {
+                    assert_eq!(json["result"]["files"], json!([]));
+                }
+                for field in ["mime", "filename", "size", "playback_url"] {
+                    assert!(json["result"].get(field).is_none());
+                }
+            }
+        }
+    }
+    assert!(state.manager.list().await.is_empty());
+    assert_eq!(state.ace_sessions.active_count(), 0);
+}
+
+#[tokio::test]
+async fn server_api_rejects_mismatched_cached_descriptor_without_opening_provider() {
+    struct WrongDescriptor(ace_swarm::types::StreamInfo);
+    #[async_trait]
+    impl StreamProvider for WrongDescriptor {
+        fn network(&self) -> &'static str {
+            "ace"
+        }
+        async fn open(&self, _id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+            panic!("metadata lookup must never open a source")
+        }
+        fn verified_live_descriptor(
+            &self,
+            _infohash: &[u8; 20],
+        ) -> Option<ace_swarm::types::StreamInfo> {
+            Some(self.0.clone())
+        }
+    }
+    let (transport, _) = crate::ace_provider::test_support::synthetic_live_transport(524_288);
+    let mut info = ace_swarm::resolve::stream_info_from_transport(&transport).unwrap();
+    info.infohash = [0; 20];
+    let mut registry = ProviderRegistry::new();
+    registry.register(Arc::new(WrongDescriptor(info)));
+    let mut state = metadata_ace_state();
+    state.manager = StreamManager::new(registry);
+    let (_, json) = server_api_json(
+        state.clone(),
+        "method=get_media_files&infohash=0123456789abcdef0123456789abcdef01234567",
+    )
+    .await;
+    assert!(json["error"].is_null());
+    assert_eq!(json["result"]["files"], json!([]));
+    assert_eq!(json["result"]["is_live"], -1);
+    assert!(state.manager.list().await.is_empty());
+}
+
 #[tokio::test]
 async fn pinned_sdk_default_selection_allows_a_json_playback_request() {
     // Android SDK PlaybackData (65a6e53) initializes streamIndex=-1. The Android

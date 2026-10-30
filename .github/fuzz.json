@@ -29,6 +29,11 @@
       "name": "hls-playlist", "engine": "libfuzzer",
       "command": [".fuzz-build/bin/hls_playlist", "-max_len=16384"],
       "seconds": 60, "corpus": "fuzz/corpus/hls_playlist"
+    },
+    {
+      "name": "tracker-responses", "engine": "libfuzzer",
+      "command": [".fuzz-build/bin/tracker_responses", "-max_len=16384"],
+      "seconds": 60, "corpus": "fuzz/corpus/tracker_responses"
     }
   ]
 }

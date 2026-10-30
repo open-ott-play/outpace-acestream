@@ -245,24 +245,38 @@ impl SeedRegistry {
         infohash: [u8; 20],
         make: impl FnOnce() -> PieceStore,
     ) -> SharedStore {
-        {
+        self.with_store(infohash, make, |_, store| store)
+    }
+
+    /// Choose/publish the store and apply internal registration in one registry mutation.
+    /// A producer lease must be counted before another producer can remove the chosen entry.
+    /// Only the potentially blocking factory and rendezvous wait run outside the mutex.
+    fn with_store<R>(
+        &self,
+        infohash: [u8; 20],
+        make: impl FnOnce() -> PieceStore,
+        register: impl FnOnce(&mut HashMap<[u8; 20], SeedEntry>, SharedStore) -> R,
+    ) -> R {
+        let rendezvous = {
             let mut map = self.stores.lock().unwrap();
             if let Some(entry) = map.get_mut(&infohash) {
                 entry.require_canonical(infohash);
                 entry.last_active = now_millis();
                 if let Some(store) = &entry.store {
-                    return store.clone();
+                    let store = store.clone();
+                    return register(&mut map, store);
                 }
             }
-        }
-        let rendezvous = {
+            // Reserve construction before releasing the missing-store check. Otherwise a
+            // racing caller can publish and remove its rendezvous in this gap, and our new
+            // factory would wipe the disk directory of its already-published store.
             let mut creating = self.creating.lock().unwrap();
             creating.entry(infohash).or_default().clone()
         };
         let candidate = rendezvous
             .get_or_init(|| Arc::new(Mutex::new(make())))
             .clone();
-        let store = {
+        let result = {
             let mut map = self.stores.lock().unwrap();
             let entry = map.entry(infohash).or_insert_with(|| SeedEntry {
                 canonical: Some(infohash),
@@ -271,12 +285,28 @@ impl SeedRegistry {
                 ..Default::default()
             });
             entry.require_canonical(infohash);
-            entry.store.get_or_insert_with(|| candidate.clone()).clone()
+            let store = entry.store.get_or_insert_with(|| candidate.clone()).clone();
+            register(&mut map, store)
         };
-        // Removing the rendezvous can drop its final store reference, so do it outside `stores`.
-        let finished = self.creating.lock().unwrap().remove(&infohash);
+        // Keep the rendezvous while another caller is still using it. Its registry entry may
+        // be evicted before that caller publishes; a new caller must still reuse its store.
+        let finished = {
+            let mut creating = self.creating.lock().unwrap();
+            // Release our reference under the same lock as the last-user check, so two
+            // finishing callers cannot both leave a now-unused rendezvous behind.
+            drop(rendezvous);
+            if creating
+                .get(&infohash)
+                .is_some_and(|rendezvous| Arc::strong_count(rendezvous) == 1)
+            {
+                creating.remove(&infohash)
+            } else {
+                None
+            }
+        };
+        // Dropping the final store reference may do cleanup; keep it outside registry locks.
         drop(finished);
-        store
+        result
     }
 
     /// Acquire a leech producer lease for `infohash`, creating the store via `make` if absent.
@@ -290,22 +320,15 @@ impl SeedRegistry {
         infohash: [u8; 20],
         make: impl FnOnce() -> PieceStore,
     ) -> (SharedStore, SeedLease) {
-        let candidate = self.get_or_create(infohash, make);
-        let mut map = self.stores.lock().unwrap();
-        let entry = map.entry(infohash).or_insert_with(|| SeedEntry {
-            canonical: Some(infohash),
-            generation: next_generation(),
-            last_active: now_millis(),
-            ..Default::default()
-        });
-        entry.require_canonical(infohash);
-        let store = entry.store.get_or_insert_with(|| candidate.clone()).clone();
-        entry.producers += 1;
-        let lease = SeedLease {
-            registry: Arc::downgrade(&self.stores),
-            keys: vec![(infohash, entry.generation)],
-        };
-        (store, lease)
+        self.with_store(infohash, make, |map, store| {
+            let entry = map.get_mut(&infohash).expect("store entry was initialized");
+            entry.producers += 1;
+            let lease = SeedLease {
+                registry: Arc::downgrade(&self.stores),
+                keys: vec![(infohash, entry.generation)],
+            };
+            (store, lease)
+        })
     }
 
     /// Acquire a broadcast producer lease owning both the `infohash` (store) and `content_id`
@@ -323,40 +346,34 @@ impl SeedRegistry {
         metadata: Vec<u8>,
         make: impl FnOnce() -> PieceStore,
     ) -> (SharedStore, SeedLease) {
-        let candidate = self.get_or_create(infohash, make);
-        let mut map = self.stores.lock().unwrap();
-        let (store, ih_generation) = {
-            let entry = map.entry(infohash).or_insert_with(|| SeedEntry {
-                canonical: Some(infohash),
-                generation: next_generation(),
-                last_active: now_millis(),
-                ..Default::default()
-            });
-            entry.associate_broadcast(infohash, content_id);
-            entry.producers += 1;
-            entry.kind = OwnerKind::Broadcast;
-            let store = entry.store.get_or_insert_with(|| candidate.clone()).clone();
-            (store, entry.generation)
-        };
-        let cid_generation = {
-            let meta_entry = map.entry(content_id).or_insert_with(|| SeedEntry {
-                canonical: Some(infohash),
-                generation: next_generation(),
-                last_active: now_millis(),
-                ..Default::default()
-            });
-            meta_entry.associate_broadcast(infohash, content_id);
-            meta_entry.producers += 1;
-            meta_entry.kind = OwnerKind::Broadcast;
-            meta_entry.metadata = Some(Arc::new(metadata));
-            meta_entry.generation
-        };
-        self.retain_live_aliases(&mut map, infohash);
-        let lease = SeedLease {
-            registry: Arc::downgrade(&self.stores),
-            keys: vec![(infohash, ih_generation), (content_id, cid_generation)],
-        };
-        (store, lease)
+        self.with_store(infohash, make, |map, store| {
+            let ih_generation = {
+                let entry = map.get_mut(&infohash).expect("store entry was initialized");
+                entry.associate_broadcast(infohash, content_id);
+                entry.producers += 1;
+                entry.kind = OwnerKind::Broadcast;
+                entry.generation
+            };
+            let cid_generation = {
+                let meta_entry = map.entry(content_id).or_insert_with(|| SeedEntry {
+                    canonical: Some(infohash),
+                    generation: next_generation(),
+                    last_active: now_millis(),
+                    ..Default::default()
+                });
+                meta_entry.associate_broadcast(infohash, content_id);
+                meta_entry.producers += 1;
+                meta_entry.kind = OwnerKind::Broadcast;
+                meta_entry.metadata = Some(Arc::new(metadata));
+                meta_entry.generation
+            };
+            self.retain_live_aliases(map, infohash);
+            let lease = SeedLease {
+                registry: Arc::downgrade(&self.stores),
+                keys: vec![(infohash, ih_generation), (content_id, cid_generation)],
+            };
+            (store, lease)
+        })
     }
 
     /// Called under the registry mutation lock after associating both broadcast entries.
@@ -851,6 +868,17 @@ async fn handle_inbound<S: AsyncRead + AsyncWrite + Unpin>(
 mod tests {
     use super::*;
 
+    struct PauseUnusedFactory {
+        entered: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    }
+    impl Drop for PauseUnusedFactory {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            let _ = self.resume.recv_timeout(std::time::Duration::from_secs(5));
+        }
+    }
+
     #[test]
     fn get_or_create_is_idempotent() {
         let reg = SeedRegistry::new();
@@ -900,6 +928,152 @@ mod tests {
             b"data",
             "a racing caller must not wipe or drop the published disk store"
         );
+    }
+
+    #[test]
+    fn pending_creator_keeps_its_rendezvous_until_it_publishes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let reg = SeedRegistry::new();
+        let ih = [2; 20];
+        let factories = Arc::new(AtomicUsize::new(0));
+        let (factory_entered, factory_started) = mpsc::channel();
+        let (resume_factory, factory_resumed) = mpsc::channel();
+        let first = {
+            let reg = reg.clone();
+            let factories = factories.clone();
+            std::thread::spawn(move || {
+                reg.get_or_create(ih, || {
+                    factories.fetch_add(1, Ordering::SeqCst);
+                    factory_entered.send(()).unwrap();
+                    factory_resumed
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                    PieceStore::new(4, 4, 1024)
+                })
+            })
+        };
+        factory_started
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+
+        // OnceLock drops a waiter's unused factory after the first factory completes. Pause
+        // there, before the waiter publishes, without adding hooks to production code.
+        let (waiter_entered, waiter_paused) = mpsc::channel();
+        let (resume_waiter, waiter_resumed) = mpsc::channel();
+        let second = {
+            let reg = reg.clone();
+            let pause = PauseUnusedFactory {
+                entered: waiter_entered,
+                resume: waiter_resumed,
+            };
+            std::thread::spawn(move || {
+                reg.get_or_create(ih, move || {
+                    let _pause = pause;
+                    panic!("waiter must reuse the first factory's store")
+                })
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let joined = reg
+                .creating
+                .lock()
+                .unwrap()
+                .get(&ih)
+                .is_some_and(|rendezvous| Arc::strong_count(rendezvous) == 3);
+            if joined {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "waiter never joined construction"
+            );
+            std::thread::yield_now();
+        }
+        resume_factory.send(()).unwrap();
+        let first_store = first.join().unwrap();
+        waiter_paused.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // A producer can finish while another creator has not yet published. That creator
+        // still owns the store: a new call must join it rather than run a disk-wiping factory.
+        reg.remove(&ih);
+        let third_store = reg.get_or_create(ih, || {
+            factories.fetch_add(1, Ordering::SeqCst);
+            PieceStore::new(4, 4, 1024)
+        });
+        resume_waiter.send(()).unwrap();
+        let second_store = second.join().unwrap();
+        assert_eq!(factories.load(Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&first_store, &second_store));
+        assert!(Arc::ptr_eq(&first_store, &third_store));
+
+        reg.remove(&ih);
+        let fresh_store = reg.get_or_create(ih, || {
+            factories.fetch_add(1, Ordering::SeqCst);
+            PieceStore::new(4, 4, 1024)
+        });
+        assert_eq!(factories.load(Ordering::SeqCst), 2);
+        assert!(!Arc::ptr_eq(&first_store, &fresh_store));
+    }
+
+    #[test]
+    fn acquiring_a_lease_keeps_the_selected_store_alive_when_the_previous_lease_drops() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        for broadcast in [false, true] {
+            let reg = SeedRegistry::new();
+            let ih = [3; 20];
+            let cid = [4; 20];
+            let factories = AtomicUsize::new(0);
+            let (first_store, first_lease) = reg.lease_store(ih, || {
+                factories.fetch_add(1, Ordering::SeqCst);
+                PieceStore::new(4, 4, 1024)
+            });
+            let (entered, paused) = mpsc::channel();
+            let (resume, resumed) = mpsc::channel();
+            let second = {
+                let reg = reg.clone();
+                let pause = PauseUnusedFactory {
+                    entered,
+                    resume: resumed,
+                };
+                std::thread::spawn(move || {
+                    let make = move || {
+                        let _pause = pause;
+                        panic!("an existing store must not be recreated")
+                    };
+                    if broadcast {
+                        reg.lease_broadcast(ih, cid, b"synthetic metadata".to_vec(), make)
+                    } else {
+                        reg.lease_store(ih, make)
+                    }
+                })
+            };
+            // The unused factory is dropped once the store has been selected. Its lease
+            // must already own that entry before another producer can drop the last lease.
+            paused.recv_timeout(Duration::from_secs(5)).unwrap();
+            drop(first_lease);
+            let (third_store, third_lease) = reg.lease_store(ih, || {
+                factories.fetch_add(1, Ordering::SeqCst);
+                PieceStore::new(4, 4, 1024)
+            });
+            resume.send(()).unwrap();
+            let (second_store, second_lease) = second.join().unwrap();
+            assert_eq!(factories.load(Ordering::SeqCst), 1, "broadcast={broadcast}");
+            assert!(Arc::ptr_eq(&first_store, &second_store));
+            assert!(Arc::ptr_eq(&first_store, &third_store));
+            assert_eq!(reg.metadata(&cid).is_some(), broadcast);
+            drop(third_lease);
+            assert!(reg.serves(&ih));
+            drop(second_lease);
+            assert!(!reg.serves(&ih));
+            assert!(!reg.serves(&cid));
+        }
     }
 
     #[test]

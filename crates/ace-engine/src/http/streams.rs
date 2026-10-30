@@ -134,9 +134,11 @@ pub(super) async fn stream_segment(
 
 /// Response for a failed stream start on the native routes. `Unresolvable` carries a user-facing
 /// reason (a bare infohash without a verified descriptor, #164) and is returned as `422` with
-/// that text; every other failure keeps the historical bodiless `404`.
+/// that text; malformed selectors return `400`. Other failures keep the historical
+/// bodiless `404`.
 async fn stream_start_error(state: &AppState, e: ProviderError) -> Response {
     match e {
+        ProviderError::Invalid(reason) => (StatusCode::BAD_REQUEST, reason).into_response(),
         ProviderError::DirectHls { manifest_url } => {
             resolved_origin_redirect(state, &manifest_url).await
         }

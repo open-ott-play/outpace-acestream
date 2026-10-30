@@ -46,8 +46,7 @@ use ace_swarm::resolve::{
     catalog_transport_bytes, hex20, infohash_hex, playback_from_transport,
     resolve_infohash_via_catalog, resolve_playback_from_url, resolve_playback_via_catalog,
     resolve_via_peer, stream_info_from_transport, transport_bytes_from_url,
-    transport_bytes_via_peer, vod_info_from_transport, InfohashIndex, ResolveCache, ResolveError,
-    ResolvedTransport,
+    transport_bytes_via_peer, InfohashIndex, ResolveCache, ResolveError, ResolvedTransport,
 };
 use ace_swarm::store::{BackendKind, PieceStore};
 use ace_swarm::types::{StreamInfo, StreamMetadata, VodInfo};

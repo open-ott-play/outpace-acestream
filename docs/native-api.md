@@ -74,6 +74,19 @@ outpace broadcast sports --public-host stream.example
 | `GET /broadcast/<name>` | `200 application/octet-stream` | Returns the broadcast transport descriptor; `404` until minted. |
 | `DELETE /broadcast/<name>` | `204` | Stops ingress/announcements and deletes identity after persistence settles; unknown names are idempotent. Names must be 1–64 ASCII letters, digits, `.`, `_`, or `-`, excluding `.` and `..`. |
 
+All native VOD routes return `400` for malformed selectors, `422` for valid selectors
+that cannot be opened as VOD (including bare hashes, `ih:` selectors, live or origin-HLS
+descriptors, and networks without VOD support), `404` for an unknown network or target,
+and `502` for upstream resolution or range-opening failures. The response body carries
+the provider's reason.
+
+VOD response startup shares the `OUTPACE_HLS_STARTUP_TIMEOUT_MS` budget (45 seconds by
+default) across descriptor resolution, waits behind another resolver or range reader,
+range opening, and the HLS container probe. Expiry returns `504` with `Retry-After: 1`,
+cancels that request's pending work, and permits a subsequent retry. This is a deadline
+for returning response headers; a raw VOD download can take longer. VOD HLS also uses
+the same timeout between body reads; an error after headers terminates that body.
+
 A broadcast accepts one producer at a time across raw PUT, RTMP and managed HTTP sources. A competing publisher
 receives `409` / `producer_conflict`; separate names can ingest concurrently. Sequential
 producers retain the signing identity and continue piece numbering. RTMP keys use the exact

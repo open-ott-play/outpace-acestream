@@ -549,6 +549,11 @@ pub(super) async fn ace_playback(
             // category, and keep both logs and response bodies independent of that text.
             let (status, category, reason) = match error {
                 ProviderError::NotFound => (StatusCode::NOT_FOUND, "NotFound", ""),
+                ProviderError::Invalid(_) => (
+                    StatusCode::BAD_REQUEST,
+                    "Invalid",
+                    "invalid stream selector",
+                ),
                 ProviderError::Backend(_) => {
                     (StatusCode::BAD_GATEWAY, "Backend", "stream start failed")
                 }

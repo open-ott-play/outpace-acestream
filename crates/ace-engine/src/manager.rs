@@ -317,6 +317,7 @@ pub struct StreamManager {
     history: crate::history::HlsHistoryConfig,
     history_budget: crate::history::HistoryBudget,
     normalizer: Option<crate::hls_audio::PreparedNormalizer>,
+    audio_languages: Vec<[u8; 3]>,
     grace: Duration,
     cleanup: CleanupTracker,
     reaper: StdMutex<Option<WorkerControl>>,
@@ -366,6 +367,18 @@ impl StreamManager {
         normalizer: Option<crate::hls_audio::PreparedNormalizer>,
         history: crate::history::HlsHistoryConfig,
     ) -> Arc<StreamManager> {
+        Self::with_audio_languages(registry, buffer, hls, normalizer, history, Vec::new())
+    }
+
+    /// One immutable selection policy for all viewers of this manager's HLS streams.
+    pub(crate) fn with_audio_languages(
+        registry: ProviderRegistry,
+        buffer: usize,
+        hls: HlsConfig,
+        normalizer: Option<crate::hls_audio::PreparedNormalizer>,
+        history: crate::history::HlsHistoryConfig,
+        audio_languages: Vec<[u8; 3]>,
+    ) -> Arc<StreamManager> {
         Arc::new(StreamManager {
             registry,
             sessions: Mutex::new(HashMap::new()),
@@ -380,6 +393,7 @@ impl StreamManager {
             history,
             history_budget: crate::history::HistoryBudget::new(history.global_max_bytes),
             normalizer,
+            audio_languages,
             grace: Duration::from_secs(30),
             cleanup: CleanupTracker::default(),
             reaper: StdMutex::new(None),
@@ -771,12 +785,13 @@ impl StreamManager {
             packagers
                 .entry(key)
                 .or_insert_with(|| {
-                    let media = HlsPackager::create_with_history(
+                    let media = HlsPackager::create_with_audio_languages(
                         &session,
                         self.hls,
                         self.normalizer.is_some(),
                         self.history,
                         self.history_budget.clone(),
+                        self.audio_languages.clone(),
                     );
                     let control = crate::hls_audio::spawn_worker(
                         &session,
@@ -784,6 +799,7 @@ impl StreamManager {
                         self.hls,
                         self.normalizer.clone(),
                         &self.cleanup,
+                        self.audio_languages.clone(),
                     );
                     HlsEntry { media, control }
                 })
@@ -1140,6 +1156,156 @@ mod tests {
             ));
         }
         input
+    }
+
+    /// Synthetic transport/selection fixture; its marked payload is not encoded audio.
+    fn language_selection_input(start_second: u64) -> Vec<u8> {
+        use crate::hls_audio::process::test_fixtures as fixtures;
+        let mut input = fixtures::psi_packet(0, 0, &fixtures::pat_section(7, 9, 4096)).to_vec();
+        input.extend_from_slice(&fixtures::pmt_packet_with_section(vec![
+            0x02, 0xb0, 0x00, 0x00, 0x09, 0xc1, 0, 0, 0xe1, 0x00, 0xf0, 0, 0x1b, 0xe1, 0x00, 0xf0,
+            0, // video 256
+            0x0f, 0xe1, 0x01, 0xf0, 6, 0x0a, 4, b'r', b'u', b's', 0, // AAC 257
+            0x0f, 0xe1, 0x02, 0xf0, 6, 0x0a, 4, b'e', b'n', b'g', 0, // AAC 258
+        ]));
+        for second in start_second..start_second + 5 {
+            input.extend_from_slice(&fixtures::pcr_packet(256, second * 90_000));
+            for pid in [257_u16, 258] {
+                let mut packet = [0xa0 | (pid & 0x0f) as u8; 188];
+                packet[..4].copy_from_slice(&[
+                    0x47,
+                    (pid >> 8) as u8,
+                    pid as u8,
+                    0x10 | (second as u8 & 0x0f),
+                ]);
+                input.extend_from_slice(&packet);
+            }
+        }
+        input
+    }
+
+    fn assert_english_aac_segment(segment: &[u8]) {
+        let pids: Vec<_> = segment
+            .as_chunks::<188>()
+            .0
+            .iter()
+            .map(|packet| ace_media::mpegts::ts_pid(packet))
+            .collect();
+        assert!(
+            pids.contains(&258),
+            "selected English AAC payload is retained"
+        );
+        assert!(
+            !pids.contains(&257),
+            "unselected Russian AAC payload is removed"
+        );
+        let pmt = segment
+            .as_chunks::<188>()
+            .0
+            .iter()
+            .find(|packet| ace_media::mpegts::ts_pid(*packet) == 4096)
+            .expect("PMT prefix");
+        assert!(pmt.windows(6).any(|w| w == [0x0a, 4, b'e', b'n', b'g', 0]));
+        assert!(!pmt.windows(6).any(|w| w == [0x0a, 4, b'r', b'u', b's', 0]));
+    }
+
+    #[tokio::test]
+    async fn global_aac_language_reaches_both_workers_and_cannot_be_changed_by_a_viewer() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use tower::ServiceExt;
+        let _serial = crate::hls_audio::process::test_support::process_test_lock().await;
+        for normalize in [false, true] {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut providers = ProviderRegistry::new();
+            providers.register(Arc::new(FeedProvider(StdMutex::new(Some(rx)))));
+            let manager = StreamManager::with_audio_languages(
+                providers,
+                32,
+                HlsConfig {
+                    segment_packets: 128,
+                    window_segments: 12,
+                    segment_duration_ms: 1000,
+                    startup_segments: 1,
+                    startup_timeout_ms: 5000,
+                },
+                normalize.then(|| crate::hls_audio::PreparedNormalizer {
+                    executable: "__missing_language_selection_ffmpeg__".into(),
+                }),
+                Default::default(),
+                vec![*b"deu", *b"eng"],
+            );
+            let media = manager
+                .get_or_start_hls("normalization-test", "languages")
+                .await
+                .unwrap();
+            tx.send((false, bytes::Bytes::from(language_selection_input(0))))
+                .unwrap();
+            assert_eq!(
+                media.wait_available(Duration::from_secs(4)).await,
+                crate::hls::HlsStatus::Ready,
+                "normalization={normalize} must copy AAC without launching FFmpeg"
+            );
+            assert_english_aac_segment(&media.segment(0).expect("first segment"));
+            let app = crate::http::router(crate::http::AppState {
+                manager: manager.clone(),
+                networks: vec!["normalization-test".into()],
+                resolve_content_ids_in_getstream: false,
+                ace_sessions: Arc::new(crate::http::AceSessionStore::default()),
+                experimental_ace_compat: true,
+                origin_hls: None,
+                broadcasts: None,
+            });
+            for suffix in ["?audio=rus", "", "?audio=eng"] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::get(format!(
+                            "/streams/normalization-test/languages.m3u8{suffix}"
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+            let (compatibility, _, pin) = manager
+                .get_or_start_compatibility_hls("normalization-test", "languages")
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(&media, &compatibility));
+            let previous = (0..16)
+                .filter(|seq| media.segment(*seq).is_some())
+                .max()
+                .unwrap();
+            // Repeat source PSI after all viewers attach, so any accidental preference
+            // mutation would affect new segments rather than only cached responses.
+            tx.send((false, bytes::Bytes::from(language_selection_input(5))))
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(4), async {
+                while media.segment(previous + 1).is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("new media after viewer requests");
+            // One boundary can finish the old run; a subsequent completed segment must
+            // also retain the configured language under the newly received PMT.
+            tokio::time::timeout(Duration::from_secs(4), async {
+                while media.segment(previous + 2).is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("second new segment");
+            assert_english_aac_segment(&media.segment(previous + 2).unwrap());
+            drop(pin);
+            drop(tx);
+            manager.shutdown().await;
+        }
     }
 
     #[tokio::test]

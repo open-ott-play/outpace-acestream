@@ -206,6 +206,14 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Some(v) = bool_from_env("OUTPACE_HLS_AUDIO_NORMALIZE")? {
         config.hls_audio.normalize = v;
     }
+    if let Ok(v) = std::env::var("OUTPACE_HLS_AUDIO_LANGUAGE") {
+        config.hls_audio.preferred_languages = v
+            .split(',')
+            .map(str::trim)
+            .filter(|language| !language.is_empty())
+            .map(str::to_owned)
+            .collect();
+    }
     if let Some(v) = bool_from_env("OUTPACE_MANAGED_HLS")? {
         config.managed_hls = v;
     }
@@ -753,12 +761,16 @@ pub async fn build_runtime(
     }
     let networks: Vec<String> = registry.networks().iter().map(|s| s.to_string()).collect();
 
-    let manager = StreamManager::with_normalizer_and_history(
+    let manager = StreamManager::with_audio_languages(
         registry,
         config.session_buffer,
         config.hls,
         normalizer,
         config.history,
+        config
+            .hls_audio
+            .preferred_language_tags()
+            .expect("configuration was validated"),
     );
     manager.spawn_reaper();
     let broadcasts = BroadcastState {
@@ -1563,6 +1575,40 @@ mod tests {
 
         let config = config.unwrap();
         assert_eq!(config.rtmp_bind, "127.0.0.1:19935".parse().unwrap());
+    }
+
+    #[test]
+    fn global_audio_language_environment_is_ordered_and_validated() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let name = "OUTPACE_HLS_AUDIO_LANGUAGE";
+        let old = std::env::var_os(name);
+        for (value, expected) in [
+            (None, Some(Vec::new())),
+            (Some(""), Some(Vec::new())),
+            (Some(" ENG , rus ,"), Some(vec![*b"eng", *b"rus"])),
+            (Some("eng,en"), None),
+            (Some("english"), None),
+            (Some("e1g"), None),
+        ] {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+            let result = config_from_env();
+            // Restore before assertions so a failure cannot leak environment into another test.
+            match &old {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+            if let Some(expected) = expected {
+                assert_eq!(
+                    result.unwrap().hls_audio.preferred_language_tags(),
+                    Some(expected)
+                );
+            } else {
+                assert!(result.unwrap_err().to_string().contains(name));
+            }
+        }
     }
 
     #[test]

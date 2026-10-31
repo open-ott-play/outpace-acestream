@@ -284,9 +284,7 @@ pub fn encode_transport(descriptor: &Bencode) -> Vec<u8> {
 pub fn encode_transport_with_key(descriptor: &Bencode, key: &[u8; 16], iv: &[u8; 16]) -> Vec<u8> {
     use cbc::cipher::{block_padding::Pkcs7, BlockModeEncrypt, KeyIvInit};
     type Enc = cbc::Encryptor<aes::Aes128>;
-    let ct = Enc::new_from_slices(key, iv)
-        .expect("16-byte key/iv")
-        .encrypt_padded_vec::<Pkcs7>(&descriptor.encode());
+    let ct = Enc::new(key.into(), iv.into()).encrypt_padded_vec::<Pkcs7>(&descriptor.encode());
     let mut out = b"AceStreamTransport\x00\x02".to_vec();
     out.extend_from_slice(&ct);
     out

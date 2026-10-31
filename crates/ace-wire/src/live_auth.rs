@@ -43,6 +43,10 @@ use sha1::{Digest, Sha1};
 /// matching it avoids being fingerprinted as an obviously-different implementation.
 const KEY_BITS: usize = 768;
 
+// PKCS#1 v1.5 requires the SHA-1 DigestInfo prefix (15 bytes), digest (20 bytes),
+// and at least 11 bytes of encoding overhead, including eight padding bytes.
+const MIN_SIGNING_MODULUS_BYTES: usize = 15 + 20 + 11;
+
 /// A broadcast source's live-auth RSA identity.
 pub struct LiveSourceAuth {
     key: RsaPrivateKey,
@@ -57,9 +61,15 @@ impl LiveSourceAuth {
     }
 
     /// Load an identity from its PKCS#1 PEM private-key text (the `.sauth` format).
+    /// Reject keys too short to encode a SHA-1 PKCS#1 v1.5 signature before use.
     pub fn from_pkcs1_pem(pem: &str) -> Result<Self, crate::WireError> {
         let key = RsaPrivateKey::from_pkcs1_pem(pem)
             .map_err(|_| crate::WireError::Invalid("bad PKCS#1 RSA private key PEM"))?;
+        if key.size() < MIN_SIGNING_MODULUS_BYTES {
+            return Err(crate::WireError::Invalid(
+                "RSA key too short for SHA-1 PKCS#1 v1.5 signing",
+            ));
+        }
         Ok(LiveSourceAuth { key })
     }
 
@@ -151,6 +161,44 @@ pub fn split_piece(piece: &[u8], sig_len: usize) -> Option<(&[u8], &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_loaded_keys_below_the_sha1_signature_encoding_boundary() {
+        // These ephemeral keys exercise the encoding boundary, not the default
+        // key generator. In particular, 45 bytes is one byte too short.
+        for bytes in [32, 45] {
+            let key = RsaPrivateKey::new(&mut rand::thread_rng(), bytes * 8)
+                .expect("synthetic boundary key");
+            assert_eq!(key.size(), bytes);
+            let pem = key
+                .to_pkcs1_pem(rsa::pkcs8::LineEnding::LF)
+                .expect("synthetic key encodes");
+            assert!(matches!(
+                LiveSourceAuth::from_pkcs1_pem(&pem),
+                Err(crate::WireError::Invalid(
+                    "RSA key too short for SHA-1 PKCS#1 v1.5 signing"
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn loaded_key_at_the_sha1_encoding_boundary_signs_and_round_trips() {
+        let key =
+            RsaPrivateKey::new(&mut rand::thread_rng(), 46 * 8).expect("synthetic boundary key");
+        assert_eq!(key.size(), 46);
+        let pem = key
+            .to_pkcs1_pem(rsa::pkcs8::LineEnding::LF)
+            .expect("synthetic key encodes");
+        let auth = LiveSourceAuth::from_pkcs1_pem(&pem).expect("encoding fits exactly");
+        let reloaded = LiveSourceAuth::from_pkcs1_pem(&auth.to_pkcs1_pem()).unwrap();
+        let payload = b"synthetic encoding boundary";
+        let signature = auth.sign(payload);
+        assert_eq!(signature.len(), 46);
+        assert_eq!(auth.pubkey_der(), reloaded.pubkey_der());
+        assert_eq!(signature, reloaded.sign(payload));
+        assert!(verify_piece(&auth.pubkey_der(), payload, &signature));
+    }
 
     #[test]
     fn generated_pubkey_der_round_trips_through_pem_reload() {

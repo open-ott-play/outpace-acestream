@@ -122,6 +122,20 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_HLS_AUDIO_NORMALIZE` - optional live-HLS audio conversion, default `false`.
   Accepts `true`, `false`, `1`, or `0`. Selected supported AC3/MP2/MP3 audio becomes
   AAC-LC stereo; video is copied. This is not general video transcoding.
+- `OUTPACE_HLS_AUDIO_LANGUAGE` - ordered comma-separated ISO 639 three-letter
+  language codes for native ADTS AAC tracks, for example `eng,rus`. Unset or
+  empty means no language preference; spaces, case and empty comma-separated
+  entries are ignored. Other malformed codes fail configuration validation.
+  The equivalent JSON field is `hls_audio.preferred_languages`, an array of
+  nonempty three-letter codes. Primary audio takes precedence over tracks marked
+  as hearing-impaired or visual-impaired commentary. Among eligible AAC tracks,
+  the first matching language wins; without a match, PMT order wins. If every
+  AAC track is an accessibility mix, one is still retained. This selection works
+  with normalization enabled or disabled and does not require FFmpeg for AAC.
+  It does not select AC3/MPEG audio by language, convert LATM AAC, or infer missing
+  language metadata. It applies to local native/compatibility HLS packaging,
+  not raw TS, VOD, or origin HLS. All viewers share the same setting; restart the
+  engine after changing it. HTTP query parameters cannot override it.
 - `OUTPACE_HISTORY_SECONDS` - 0.9.0 beta retained-HLS replay duration, default `0`
   (disabled), maximum `3600`. Active native HLS packagers and eligible managed
   origin TS playbacks collect history; it is not persistent or UTC-indexed.

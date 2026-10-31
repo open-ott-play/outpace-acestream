@@ -235,6 +235,20 @@ impl HlsPackager {
         media
     }
 
+    pub(crate) fn create_with_audio_languages(
+        session: &StreamSession,
+        config: HlsConfig,
+        strict: bool,
+        history: HlsHistoryConfig,
+        budget: HistoryBudget,
+        audio_languages: Vec<[u8; 3]>,
+    ) -> Arc<Self> {
+        let media = Self::create_with_history(session, config, strict, history, budget);
+        media.state.lock().unwrap().audio =
+            LiveAudioSelection::with_preferred_languages(audio_languages);
+        media
+    }
+
     pub fn history_status(&self) -> HlsHistoryStatus {
         self.state.lock().unwrap().history.status(Instant::now())
     }

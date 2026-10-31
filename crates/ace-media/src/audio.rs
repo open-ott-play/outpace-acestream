@@ -42,20 +42,81 @@ pub struct TransportLayout {
     pub semantic_identity: Vec<u8>,
 }
 
+/// Validated PMT entry shared by packet filtering and strict layout classification.
+struct EsEntry {
+    start: usize,
+    end: usize,
+    pid: u16,
+    codec: Option<AudioCodec>,
+    language: Option<LanguageTag>,
+}
+
+#[derive(Clone, Copy)]
+struct LanguageTag {
+    code: [u8; 3],
+    audio_type: u8,
+}
+
+impl LanguageTag {
+    fn is_accessibility(self) -> bool {
+        // ISO 639 audio_type: hearing impaired, visual-impaired commentary.
+        matches!(self.audio_type, 0x02 | 0x03)
+    }
+}
+
+/// Select the same native ADTS AAC track for the rewritten PMT and the layout.
+/// Prefer primary mixes, then the operator's language order, then PMT order.
+/// A missing language never removes all audio; accessibility-only muxes retain one track.
+fn natively_copied_audio(
+    entries: &[EsEntry],
+    preferred_languages: &[[u8; 3]],
+) -> Option<SelectedAudio> {
+    let aac = || {
+        entries
+            .iter()
+            .filter(|e| e.codec == Some(AudioCodec::AdtsAac))
+    };
+    let has_primary = aac().any(|e| !e.language.is_some_and(LanguageTag::is_accessibility));
+    let eligible =
+        || aac().filter(|e| !has_primary || !e.language.is_some_and(LanguageTag::is_accessibility));
+    let chosen = preferred_languages
+        .iter()
+        .find_map(|language| eligible().find(|e| e.language.map(|tag| tag.code) == Some(*language)))
+        .or_else(|| eligible().next())?;
+    Some(SelectedAudio {
+        pid: chosen.pid,
+        codec: AudioCodec::AdtsAac,
+    })
+}
+
 #[derive(Default)]
 struct DescriptorCodecs {
     // Native selection historically uses the first recognized signal.
     first: Option<AudioCodec>,
+    language: Option<LanguageTag>,
     conflicting: bool,
 }
 
 /// Validate once, retaining both legacy first-match and strict ambiguity evidence.
 fn descriptors(mut bytes: &[u8]) -> Option<DescriptorCodecs> {
     let mut codec = None;
+    let mut language = None;
     let mut conflicting = false;
     while !bytes.is_empty() {
         let len = *bytes.get(1)? as usize;
         let body = bytes.get(2..2 + len)?;
+        // A descriptor consists of four-byte language/audio_type entries. Use its first
+        // language as the track's label; malformed language metadata supplies no preference.
+        if bytes[0] == 0x0a && body.len() >= 4 && body.len() % 4 == 0 && language.is_none() {
+            language = Some(LanguageTag {
+                code: [
+                    body[0].to_ascii_lowercase(),
+                    body[1].to_ascii_lowercase(),
+                    body[2].to_ascii_lowercase(),
+                ],
+                audio_type: body[3],
+            });
+        }
         let signal = match bytes[0] {
             0x6a if body
                 .first()
@@ -86,19 +147,26 @@ fn descriptors(mut bytes: &[u8]) -> Option<DescriptorCodecs> {
     }
     Some(DescriptorCodecs {
         first: codec,
+        language,
         conflicting,
     })
 }
 
 fn audio_codec(ty: u8, desc: &[u8]) -> Option<DescriptorCodecs> {
     let mut private = descriptors(desc)?;
-    private.first = match ty {
+    let implied = match ty {
         0x0f => Some(AudioCodec::AdtsAac),
         0x11 => Some(AudioCodec::LatmAac),
         0x03 | 0x04 => Some(AudioCodec::MpegAudio),
         0x06 => private.first,
         _ => None,
     };
+    // Typed audio and private codec descriptors must agree. Private streams (0x06)
+    // deliberately take their codec from the descriptor instead.
+    if matches!(ty, 0x0f | 0x11 | 0x03 | 0x04) {
+        private.conflicting |= private.first.is_some_and(|codec| Some(codec) != implied);
+    }
+    private.first = implied;
     Some(private)
 }
 
@@ -169,6 +237,7 @@ pub struct AudioPacket {
 
 #[derive(Default)]
 pub struct LiveAudioSelection {
+    preferred_languages: Vec<[u8; 3]>,
     layout: LayoutDecision,
     mapping: Option<(u16, u16)>,
     transport_stream_id: Option<u16>,
@@ -184,12 +253,22 @@ pub struct LiveAudioSelection {
 }
 
 impl LiveAudioSelection {
+    /// Immutable per-stream preference, in priority order, for native ADTS AAC tracks.
+    /// Absent matches fall back to the first primary AAC track in PMT order.
+    pub fn with_preferred_languages(languages: Vec<[u8; 3]>) -> Self {
+        Self {
+            preferred_languages: languages,
+            ..Self::default()
+        }
+    }
+
     pub fn layout(&self) -> LayoutDecision {
         self.layout.clone()
     }
 
     pub fn reset(&mut self) {
-        *self = Self::default();
+        let preferred_languages = std::mem::take(&mut self.preferred_languages);
+        *self = Self::with_preferred_languages(preferred_languages);
     }
 
     pub fn pcr_pid(&self) -> Option<u16> {
@@ -352,10 +431,16 @@ impl LiveAudioSelection {
             let codec = audio_codec(h[0], &s[pos + 5..next]).ok_or(Invalid)?;
             conflicting |= codec.conflicting;
             let es_pid = pid(&h[1..]);
-            if entries.iter().any(|(_, _, p, _)| *p == es_pid) {
+            if entries.iter().any(|entry: &EsEntry| entry.pid == es_pid) {
                 return Err(Unsupported);
             }
-            entries.push((pos, next, es_pid, codec.first));
+            entries.push(EsEntry {
+                start: pos,
+                end: next,
+                pid: es_pid,
+                codec: codec.first,
+                language: codec.language,
+            });
             pos = next;
         }
         self.layout = if conflicting {
@@ -363,19 +448,17 @@ impl LiveAudioSelection {
         } else {
             self.decide_layout(s, &entries)
         };
-        let selected = entries
-            .iter()
-            .find(|e| e.3 == Some(AudioCodec::AdtsAac))
-            .map(|e| e.2);
+        let selected =
+            natively_copied_audio(&entries, &self.preferred_languages).map(|audio| audio.pid);
         let removed: Vec<_> = entries
             .iter()
-            .filter(|e| selected.is_some() && e.3.is_some() && Some(e.2) != selected)
-            .map(|e| e.2)
+            .filter(|e| selected.is_some() && e.codec.is_some() && Some(e.pid) != selected)
+            .map(|e| e.pid)
             .collect();
         let mut out = s[..begin].to_vec();
-        for (a, b, p, _) in entries {
-            if !removed.contains(&p) {
-                out.extend_from_slice(&s[a..b]);
+        for entry in entries {
+            if !removed.contains(&entry.pid) {
+                out.extend_from_slice(&s[entry.start..entry.end]);
             }
         }
         let len = out.len() + 1; // excludes first three bytes, includes CRC
@@ -415,11 +498,7 @@ impl LiveAudioSelection {
     }
 
     /// Consume the same validated descriptor/ES parse as the native rewriter.
-    fn decide_layout(
-        &self,
-        s: &[u8],
-        entries: &[(usize, usize, u16, Option<AudioCodec>)],
-    ) -> LayoutDecision {
+    fn decide_layout(&self, s: &[u8], entries: &[EsEntry]) -> LayoutDecision {
         use LayoutDecision::*;
         let (Some((program_id, pmt_pid)), Some(transport_stream_id)) =
             (self.mapping, self.transport_stream_id)
@@ -430,19 +509,20 @@ impl LiveAudioSelection {
             return Unsupported;
         }
         let pcr_pid = pid(&s[8..]);
-        if !entries.iter().any(|e| e.2 == pcr_pid)
+        if !entries.iter().any(|e| e.pid == pcr_pid)
             || entries
                 .iter()
-                .any(|e| e.2 < 0x20 || e.2 == 0x1fff || e.2 == pmt_pid)
+                .any(|e| e.pid < 0x20 || e.pid == 0x1fff || e.pid == pmt_pid)
         {
             return Unsupported;
         }
         let mut video = None;
         let mut first_audio = None;
-        let mut aac = None;
         let mut has_audio = false;
-        for &(a, _, es_pid, codec) in entries {
-            let ty = s[a];
+        for entry in entries {
+            let es_pid = entry.pid;
+            let codec = entry.codec;
+            let ty = s[entry.start];
             if matches!(ty, 0x02 | 0x1b | 0x24) {
                 if video.replace((es_pid, ty)).is_some() {
                     return Unsupported;
@@ -459,9 +539,6 @@ impl LiveAudioSelection {
             }
             if let Some(codec) = codec {
                 has_audio = true;
-                if codec == AudioCodec::AdtsAac && aac.is_none() {
-                    aac = Some(SelectedAudio { pid: es_pid, codec });
-                }
                 if matches!(codec, AudioCodec::MpegAudio | AudioCodec::Ac3) && first_audio.is_none()
                 {
                     first_audio = Some(SelectedAudio { pid: es_pid, codec });
@@ -471,7 +548,7 @@ impl LiveAudioSelection {
         let Some((video_pid, video_type)) = video else {
             return Unsupported;
         };
-        let audio = aac.or(first_audio);
+        let audio = natively_copied_audio(entries, &self.preferred_languages).or(first_audio);
         if has_audio && audio.is_none() {
             return Unsupported;
         }
@@ -904,6 +981,140 @@ mod tests {
 
     fn normalization_policy_layout(entries: &[(u8, u16, &[u8])]) -> LayoutDecision {
         layout_state(entries).layout()
+    }
+
+    const ENG: &[u8] = &[0x0a, 4, b'e', b'n', b'g', 0];
+    const RUS: &[u8] = &[0x0a, 4, b'r', b'u', b's', 0];
+    const ENG_ACCESSIBLE: &[u8] = &[0x0a, 4, b'e', b'n', b'g', 2];
+
+    fn selected_aac_pid(state: &LiveAudioSelection) -> u16 {
+        let LayoutDecision::Supported(layout) = state.layout() else {
+            panic!("expected a supported layout");
+        };
+        let audio = layout.audio.expect("selected audio");
+        assert_eq!(audio.codec, AudioCodec::AdtsAac);
+        audio.pid
+    }
+
+    #[test]
+    fn aac_language_selection_keeps_layout_packets_and_rewritten_pmt_consistent() {
+        let tracks: &[(u8, u16, &[u8])] = &[(0x1b, 257, &[]), (0x0f, 300, RUS), (0x0f, 258, ENG)];
+        for (languages, expected) in [
+            (vec![], 300),
+            (vec![*b"eng"], 258),
+            (vec![*b"rus", *b"eng"], 300),
+            (vec![*b"deu", *b"eng"], 258),
+            (vec![*b"deu"], 300),
+        ] {
+            let mut state = LiveAudioSelection::with_preferred_languages(languages);
+            // Recovery clears media state, but must retain the operator's preference.
+            for _ in 0..2 {
+                state.observe(pat(1, 256));
+                let output = state.observe(pmt(0, tracks)).packet.unwrap();
+                assert_eq!(selected_aac_pid(&state), expected);
+                assert_eq!(es_pids(&output), vec![257, expected]);
+                for pid in [258, 300] {
+                    assert_eq!(
+                        state.observe(elementary(pid)).packet.is_some(),
+                        pid == expected
+                    );
+                }
+                state.reset();
+            }
+        }
+    }
+
+    #[test]
+    fn aac_preference_survives_pmt_reordering_and_moves_only_when_the_track_changes() {
+        let mut state = LiveAudioSelection::with_preferred_languages(vec![*b"eng"]);
+        state.observe(pat(1, 256));
+        let original = [(0x1b, 257, &[][..]), (0x0f, 300, RUS), (0x0f, 258, ENG)];
+        assert!(state.observe(pmt(0, &original)).changed);
+        assert_eq!(selected_aac_pid(&state), 258);
+        assert!(
+            !state.observe(pmt(1, &original)).changed,
+            "version-only PMT does not reset media"
+        );
+        let reordered = [(0x1b, 257, &[][..]), (0x0f, 258, ENG), (0x0f, 300, RUS)];
+        assert!(state.observe(pmt(2, &reordered)).changed);
+        assert_eq!(selected_aac_pid(&state), 258);
+        let moved = [(0x1b, 257, &[][..]), (0x0f, 260, ENG), (0x0f, 300, RUS)];
+        assert!(state.observe(pmt(3, &moved)).changed);
+        assert_eq!(selected_aac_pid(&state), 260);
+        assert_eq!(es_pids(&state.pmt.unwrap()), vec![257, 260]);
+        // A removed preferred track falls back to an available AAC stream.
+        assert!(
+            state
+                .observe(pmt(4, &[(0x1b, 257, &[]), (0x0f, 300, RUS)]))
+                .changed
+        );
+        assert_eq!(selected_aac_pid(&state), 300);
+    }
+
+    #[test]
+    fn aac_primary_fallback_and_accessibility_only_selection_are_explicit() {
+        let mut state = LiveAudioSelection::with_preferred_languages(vec![*b"eng"]);
+        state.observe(pat(1, 256));
+        state.observe(pmt(
+            0,
+            &[
+                (0x1b, 257, &[]),
+                (0x0f, 258, ENG_ACCESSIBLE),
+                (0x0f, 300, RUS),
+            ],
+        ));
+        assert_eq!(
+            selected_aac_pid(&state),
+            300,
+            "primary mix takes precedence"
+        );
+        state.observe(pmt(1, &[(0x1b, 257, &[]), (0x0f, 258, ENG_ACCESSIBLE)]));
+        assert_eq!(
+            selected_aac_pid(&state),
+            258,
+            "accessibility-only stream keeps audio"
+        );
+        // No ISO descriptor, or a malformed language descriptor, falls back to PMT order.
+        state.observe(pmt(
+            2,
+            &[
+                (0x1b, 257, &[]),
+                (0x0f, 300, &[0x0a, 3, b'e', b'n', b'g']),
+                (0x0f, 258, &[]),
+            ],
+        ));
+        assert_eq!(selected_aac_pid(&state), 300);
+        // Recognize case consistently with operator configuration.
+        state.observe(pmt(
+            3,
+            &[
+                (0x1b, 257, &[]),
+                (0x0f, 300, RUS),
+                (0x0f, 258, &[0x0a, 4, b'E', b'N', b'G', 0]),
+            ],
+        ));
+        assert_eq!(selected_aac_pid(&state), 258);
+    }
+
+    #[test]
+    fn typed_audio_cannot_contradict_private_codec_descriptors() {
+        for ty in [0x0f, 0x11, 0x03, 0x04] {
+            for descriptor in [&[0x6a, 1, 0][..], &[5, 4, b'A', b'C', b'-', b'3'][..]] {
+                assert_eq!(
+                    normalization_policy_layout(&[(0x1b, 257, &[]), (ty, 258, descriptor)]),
+                    LayoutDecision::Unsupported,
+                    "stream type {ty:#x} contradicts {descriptor:?}"
+                );
+            }
+        }
+        assert_eq!(
+            selected_aac_pid(&layout_state(&[(0x1b, 257, &[]), (0x0f, 258, ENG)])),
+            258
+        );
+        assert!(matches!(
+            normalization_policy_layout(&[(0x1b, 257, &[]), (0x06, 258, &[0x6a, 1, 0])]),
+            LayoutDecision::Supported(_)
+        ));
     }
 
     #[test]

@@ -5,6 +5,10 @@
 //!   + `00 02` (2-byte version)
 //!   + body = AES-128-CBC(PKCS#7(bencode(descriptor dict)))
 //!
+//! The fixed public key/IV are legacy format constants, not secrets. This wrapper
+//! provides no confidentiality or authenticity: successful decoding does not make
+//! a descriptor trusted. Source trust and piece-signature verification are separate.
+//!
 //! See `docs/protocol/transport-file.md` for the full spec.
 
 use crate::bencode::Bencode;
@@ -276,6 +280,9 @@ pub fn decode_transport_source_with_key(
 /// [`decode_transport`]: PKCS#7 + AES-128-CBC under the global key/IV, prefixed with the
 /// 18-byte magic + 2-byte version. Round-trips with the decoder. `descriptor` should be a
 /// `Bencode::Dict`.
+///
+/// This is a compatibility encoding, not secret storage. Do not rely on the wrapper
+/// to protect credentials, private signing keys, or signed URLs in the descriptor.
 pub fn encode_transport(descriptor: &Bencode) -> Vec<u8> {
     encode_transport_with_key(descriptor, &TRANSPORT_KEY, &TRANSPORT_IV)
 }
@@ -284,9 +291,7 @@ pub fn encode_transport(descriptor: &Bencode) -> Vec<u8> {
 pub fn encode_transport_with_key(descriptor: &Bencode, key: &[u8; 16], iv: &[u8; 16]) -> Vec<u8> {
     use cbc::cipher::{block_padding::Pkcs7, BlockModeEncrypt, KeyIvInit};
     type Enc = cbc::Encryptor<aes::Aes128>;
-    let ct = Enc::new_from_slices(key, iv)
-        .expect("16-byte key/iv")
-        .encrypt_padded_vec::<Pkcs7>(&descriptor.encode());
+    let ct = Enc::new(key.into(), iv.into()).encrypt_padded_vec::<Pkcs7>(&descriptor.encode());
     let mut out = b"AceStreamTransport\x00\x02".to_vec();
     out.extend_from_slice(&ct);
     out

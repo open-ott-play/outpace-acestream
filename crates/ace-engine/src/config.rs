@@ -244,6 +244,8 @@ impl HlsConfig {
 pub struct HlsAudioConfig {
     pub normalize: bool,
     pub ffmpeg_path: PathBuf,
+    /// Ordered ISO 639 three-letter preferences for native ADTS AAC tracks.
+    pub preferred_languages: Vec<String>,
 }
 
 impl Default for HlsAudioConfig {
@@ -251,6 +253,7 @@ impl Default for HlsAudioConfig {
         Self {
             normalize: false,
             ffmpeg_path: PathBuf::from("ffmpeg"),
+            preferred_languages: Vec::new(),
         }
     }
 }
@@ -262,7 +265,29 @@ impl HlsAudioConfig {
                 "OUTPACE_FFMPEG_PATH must not be empty when normalization is enabled".into(),
             );
         }
+        if self.preferred_language_tags().is_none() {
+            return Err(
+                "OUTPACE_HLS_AUDIO_LANGUAGE must list three-letter ISO 639 codes or be unset"
+                    .into(),
+            );
+        }
         Ok(())
+    }
+
+    pub(crate) fn preferred_language_tags(&self) -> Option<Vec<[u8; 3]>> {
+        self.preferred_languages
+            .iter()
+            .map(|language| {
+                let bytes = language.trim().as_bytes();
+                (bytes.len() == 3 && bytes.iter().all(u8::is_ascii_alphabetic)).then(|| {
+                    [
+                        bytes[0].to_ascii_lowercase(),
+                        bytes[1].to_ascii_lowercase(),
+                        bytes[2].to_ascii_lowercase(),
+                    ]
+                })
+            })
+            .collect()
     }
 }
 
@@ -515,17 +540,41 @@ mod tests {
         assert_eq!(default.ffmpeg_path, PathBuf::from("ffmpeg"));
         assert!(HlsAudioConfig {
             normalize: false,
-            ffmpeg_path: PathBuf::new()
+            ffmpeg_path: PathBuf::new(),
+            ..HlsAudioConfig::default()
         }
         .validate()
         .is_ok());
         assert!(HlsAudioConfig {
             normalize: true,
-            ffmpeg_path: PathBuf::new()
+            ffmpeg_path: PathBuf::new(),
+            ..HlsAudioConfig::default()
         }
         .validate()
         .unwrap_err()
         .contains("OUTPACE_FFMPEG_PATH"));
+    }
+
+    #[test]
+    fn audio_language_config_validates_each_iso639_tag() {
+        let mut config = HlsAudioConfig::default();
+        assert_eq!(config.preferred_language_tags(), Some(Vec::new()));
+        config.preferred_languages = vec![" ENG ".into(), "rus".into()];
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            config.preferred_language_tags(),
+            Some(vec![*b"eng", *b"rus"])
+        );
+        for invalid in ["", "en", "english", "e1g", "ééé", "eng,rus"] {
+            config.preferred_languages = vec!["eng".into(), invalid.into()];
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .contains("OUTPACE_HLS_AUDIO_LANGUAGE"),
+                "{invalid:?}"
+            );
+        }
     }
 
     #[test]

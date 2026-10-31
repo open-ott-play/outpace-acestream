@@ -230,6 +230,13 @@ impl Classifier {
         Self::default()
     }
 
+    fn with_preferred_languages(languages: Vec<[u8; 3]>) -> Self {
+        Self {
+            selector: LiveAudioSelection::with_preferred_languages(languages),
+            ..Self::default()
+        }
+    }
+
     pub fn observe(&mut self, packet: [u8; 188]) -> Result<Option<ClassifiedOpening>, HlsFailure> {
         self.scanned += 188;
         if self.scanned > process::INPUT_BYTES {
@@ -365,6 +372,7 @@ pub(crate) fn spawn_worker(
     config: HlsConfig,
     prepared: Option<PreparedNormalizer>,
     tracker: &CleanupTracker,
+    audio_languages: Vec<[u8; 3]>,
 ) -> WorkerControl {
     let rx = session.raw_receiver();
     let deadline = Instant::now() + Duration::from_millis(config.startup_timeout_ms);
@@ -381,6 +389,7 @@ pub(crate) fn spawn_worker(
                     deadline,
                     seed: None,
                     budget: InputBudget::new(),
+                    audio_languages,
                 };
                 match worker.run(cancel).await {
                     Err(reason) => media.fail_generation(worker.recovery.generation, reason),
@@ -502,6 +511,7 @@ struct EnabledWorker {
     deadline: Instant,
     seed: Option<[u8; 188]>,
     budget: InputBudget,
+    audio_languages: Vec<[u8; 3]>,
 }
 #[derive(Debug, PartialEq, Eq)]
 enum WorkerEnd {
@@ -556,7 +566,7 @@ impl EnabledWorker {
         self.media
             .begin_generation(self.recovery.generation, self.deadline, false);
         loop {
-            let mut classifier = Classifier::new();
+            let mut classifier = Classifier::with_preferred_languages(self.audio_languages.clone());
             let opening = loop {
                 if *cancel.borrow() {
                     return Ok(WorkerEnd::Cancelled);
@@ -575,13 +585,16 @@ impl EnabledWorker {
                     SourceItem::Closed => return Ok(WorkerEnd::Eof),
                     SourceItem::Recovery(reason) => {
                         self.invalidate(reason, None)?;
-                        classifier = Classifier::new();
+                        classifier =
+                            Classifier::with_preferred_languages(self.audio_languages.clone());
                     }
                     SourceItem::Packet(mut packet) => {
                         if validate_packet(&packet)? && ts_timing(&packet).discontinuity {
                             if !self.recovery.marker_is_paired() {
                                 self.invalidate(RecoveryReason::Transport, None)?;
-                                classifier = Classifier::new();
+                                classifier = Classifier::with_preferred_languages(
+                                    self.audio_languages.clone(),
+                                );
                             }
                             clear_marker(&mut packet);
                         }
@@ -732,7 +745,7 @@ impl EnabledWorker {
                     if ts_timing(&packet).discontinuity {
                         return Ok(Turn::Recover(RecoveryReason::Transport, None));
                     }
-                    selector.observe(packet);
+                    let selected = selector.observe(packet);
                     match selector.layout() {
                         LayoutDecision::Unsupported => return Err(HlsFailure::Unsupported),
                         LayoutDecision::Supported(current) if current == *layout => {}
@@ -751,9 +764,13 @@ impl EnabledWorker {
                             _ = process::cancelled(cancel) => return Ok(Turn::Stop),
                             sent = sender.send(input) => sent.map_err(|_|HlsFailure::Pipe)?,
                         }
-                    } else {
+                    } else if let Some(mut selected_packet) = selected.packet {
+                        // The opening PMT already omits unselected audio PIDs. Preserve
+                        // that filter for subsequent payload too: the downstream packager
+                        // cannot identify a removed PID from the rewritten PMT alone.
+                        clear_marker(&mut selected_packet);
                         self.media
-                            .feed_generation(self.recovery.generation, &packet);
+                            .feed_generation(self.recovery.generation, &selected_packet);
                     }
                 }
             }
@@ -818,6 +835,7 @@ mod task4_tests {
             deadline: Instant::now() + Duration::from_secs(5),
             seed: None,
             budget: InputBudget::new(),
+            audio_languages: Vec::new(),
         };
         (worker, session, counters)
     }
@@ -887,6 +905,7 @@ mod task4_tests {
             deadline: Instant::now() + Duration::from_secs(15),
             seed: None,
             budget: InputBudget::new(),
+            audio_languages: Vec::new(),
         };
         (worker, session, counters, probe)
     }
@@ -1372,6 +1391,7 @@ mod task4_tests {
         let config = crate::config::HlsAudioConfig {
             normalize: false,
             ffmpeg_path: std::path::PathBuf::new(),
+            ..Default::default()
         };
         assert!(preflight(&config).await.unwrap().is_none());
     }
@@ -1441,6 +1461,7 @@ mod task4_tests {
         let config = crate::config::HlsAudioConfig {
             normalize: true,
             ffmpeg_path: "ffmpeg".into(),
+            ..Default::default()
         };
         let prepared = preflight(&config)
             .await

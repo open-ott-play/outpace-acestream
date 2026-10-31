@@ -1384,7 +1384,10 @@ pub(crate) mod test_support {
             INPUT_BYTES,
             "queue plus active write is charged in aggregate"
         );
-        tokio::time::advance(Duration::from_secs(1)).await;
+        // `advance` moves the clock but does not wait for due timers to run. Await
+        // the final second instead, so the timer driver crosses the 45-second
+        // deadline (including its millisecond granularity) before inspecting it.
+        tokio::time::sleep(Duration::from_secs(1)).await;
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }

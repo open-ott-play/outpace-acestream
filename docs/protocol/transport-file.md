@@ -22,10 +22,19 @@ descriptor = bencode_parse(plaintext)          # a single dict
 - **KEY/IV** are 16-byte **fixed global constants** embedded in the engine
   (`core/src/Crypto.pyx`: `m2_AES_decrypt`/`block_decrypt`). The same pair decrypts
   all transports → they are effectively protocol constants required for interop.
-  Captured value lives git-ignored at `re/captures/transport_keys.txt` (not committed
-  as raw bytes); it must be embedded in `ace-wire`'s transport decoder to interoperate.
+  The public constants are embedded as `TRANSPORT_KEY` and `TRANSPORT_IV` in
+  `crates/ace-wire/src/transport.rs`; they are not application secrets.
 - Validated: decoding both committed vectors yields well-formed bencode with valid
   PKCS#7 padding and sensible fields (below).
+
+This legacy wrapper provides **no confidentiality or authenticity**. Anyone with
+the public constants can decode or construct it, and valid padding does not make
+the descriptor trusted. Do not rely on it to protect credentials, private signing
+keys, or signed URLs; their protection depends on separate transport, storage and
+access controls. Source trust and piece-signature verification are separate from
+this encoding. Outpace's broadcast descriptor includes the public RSA key, not
+the private signing key. Rotating these format constants would break compatibility
+without making the existing format suitable for secret storage.
 
 ### Descriptor fields (bencode dict)
 | key | meaning |

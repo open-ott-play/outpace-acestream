@@ -214,9 +214,18 @@ fn worker(shared: Arc<Shared>) {
 // potentially stalled NSS call during async stream/runtime shutdown, and never replaces one.
 impl Drop for Service {
     fn drop(&mut self) {
-        self.shared.state.lock().unwrap().stop = true;
+        // Teardown only needs to stop and wake workers, even if an earlier panic poisoned
+        // their bookkeeping. Do not clear the poison or resume requests from that state.
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stop = true;
         self.shared.wake.notify_all();
-        let handles = self.handles.get_mut().unwrap();
+        let handles = self
+            .handles
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for index in (0..handles.len()).rev() {
             if handles[index].is_finished() {
                 let _ = handles.swap_remove(index).join();
@@ -230,9 +239,106 @@ impl Drop for Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn service_drop_stops_after_poison_without_repairing_or_running_requests() {
+        let (reply, mut receive) = tokio::sync::oneshot::channel();
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State {
+                queue: VecDeque::from([Request {
+                    id: 0,
+                    host: "queued.invalid:7".into(),
+                    reply,
+                }]),
+                ..State::default()
+            }),
+            wake: Condvar::new(),
+            operation: Arc::new(|_| panic!("shutdown must not run queued work")),
+        });
+        let service = Service {
+            shared: shared.clone(),
+            handles: Mutex::new(Vec::new()),
+        };
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            let mut state = shared.state.lock().unwrap();
+            // Model an interrupted bookkeeping update, not merely a clean poisoned lock.
+            state.running = 1;
+            panic!("injected interrupted state update");
+        }))
+        .is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            let _handles = service.handles.lock().unwrap();
+            panic!("injected handle-lock poison");
+        }))
+        .is_err());
+
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(service))).is_ok());
+        assert!(shared.state.is_poisoned(), "shutdown must not clear poison");
+        let state = shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(state.stop);
+        assert_eq!(state.running, 1, "shutdown does not invent repaired counts");
+        assert_eq!(
+            state.queue.len(),
+            1,
+            "shutdown does not dispatch queued work"
+        );
+        drop(state);
+        assert!(matches!(
+            receive.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        drop(shared);
+        assert!(matches!(
+            receive.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+    }
+
+    #[test]
+    fn service_drop_notifies_waiters_after_poison() {
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State::default()),
+            wake: Condvar::new(),
+            operation: Arc::new(|_| panic!("shutdown must not run queued work")),
+        });
+        let service = Service {
+            shared: shared.clone(),
+            handles: Mutex::new(Vec::new()),
+        };
+        let (ready, receive) = std::sync::mpsc::channel();
+        let waiter = {
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                let mut state = shared.state.lock().unwrap();
+                ready.send(()).unwrap();
+                while !state.stop {
+                    let (next, timeout) = shared
+                        .wake
+                        .wait_timeout(state, Duration::from_secs(2))
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state = next;
+                    assert!(!timeout.timed_out(), "shutdown did not notify waiter");
+                }
+            })
+        };
+        receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        // The waiter sends while holding the mutex, so acquiring it here proves the waiter
+        // has released it into Condvar::wait_timeout before shutdown's notification.
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            let _state = shared.state.lock().unwrap();
+            panic!("injected state-lock poison");
+        }))
+        .is_err());
+        drop(service);
+        waiter.join().unwrap();
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_tracker_and_dht_generations_keep_native_resolver_capacity() {

@@ -135,11 +135,10 @@ pub(super) async fn download_vod_pieces_with_policy(
             break Err(VodError::ConsumerGone);
         }
         // Do not admit more work while caller capacity is unavailable. Bytes move, never clone.
-        if credits
-            .get(&cursor)
-            .is_some_and(|credit| credit.bytes.is_some())
+        if let Some(bytes) = credits
+            .get_mut(&cursor)
+            .and_then(|credit| credit.bytes.take())
         {
-            let bytes = credits.get_mut(&cursor).unwrap().bytes.take().unwrap();
             if tx.send(bytes).await.is_err() {
                 break Err(VodError::ConsumerGone);
             }

@@ -665,9 +665,20 @@ fn discontinuity_packet(pid: u16, continuity_counter: u8) -> [u8; TS_PACKET_LEN]
     packet
 }
 
-/// PID (13-bit) of a TS packet.
+/// Read the 13-bit PID field from a TS packet header, or return `None` if that field is
+/// truncated. A three-byte header prefix is sufficient; this does not validate the sync byte
+/// or require a complete 188-byte packet.
+pub fn try_ts_pid(pkt: &[u8]) -> Option<u16> {
+    let high = *pkt.get(1)?;
+    let low = *pkt.get(2)?;
+    Some((((high & 0x1F) as u16) << 8) | low as u16)
+}
+
+/// PID (13-bit) of a TS packet, or the null-packet PID (`0x1fff`) if the PID field is
+/// truncated. Use [`try_ts_pid`] to distinguish truncated input from an actual null packet.
+/// Like [`try_ts_pid`], this reads only the PID field and does not validate the full packet.
 pub fn ts_pid(pkt: &[u8]) -> u16 {
-    (((pkt[1] & 0x1F) as u16) << 8) | pkt[2] as u16
+    try_ts_pid(pkt).unwrap_or(0x1fff)
 }
 
 /// True iff the payload_unit_start_indicator is set.
@@ -2613,6 +2624,31 @@ mod tests {
         let mut s = packet(0);
         s.truncate(100);
         assert!(!is_aligned(&s));
+    }
+
+    #[test]
+    fn pid_helpers_distinguish_truncation_from_null_packets() {
+        let header = [TS_SYNC, 0xff, 0xff];
+        for length in 0..header.len() {
+            assert_eq!(try_ts_pid(&header[..length]), None);
+            assert_eq!(ts_pid(&header[..length]), 0x1fff);
+        }
+        assert_eq!(try_ts_pid(&header), Some(0x1fff));
+        assert_eq!(ts_pid(&header), 0x1fff);
+        assert_eq!(try_ts_pid(&discontinuity_packet(0x1fff, 0)), Some(0x1fff));
+    }
+
+    #[test]
+    fn pid_helpers_preserve_all_pid_bits_and_header_prefix_support() {
+        for pid in 0..=0x1fff {
+            // All non-PID header flags are set and must be ignored by the field reader.
+            let header = [TS_SYNC, 0xe0 | ((pid >> 8) as u8), pid as u8];
+            assert_eq!(try_ts_pid(&header), Some(pid));
+            assert_eq!(ts_pid(&header), pid);
+            assert_eq!(try_ts_pid(&discontinuity_packet(pid, 0)), Some(pid));
+        }
+        // PID reading is deliberately independent of complete-packet validation.
+        assert_eq!(try_ts_pid(&[0, 0x01, 0x23]), Some(0x0123));
     }
 
     #[test]

@@ -172,12 +172,17 @@ impl BroadcastCursor {
         Ok(())
     }
 
-    fn record(&self, reserved_until: u64) -> Option<PersistedBroadcast> {
-        self.sink.as_ref().map(|sink| PersistedBroadcast {
-            transport: sink.transport.clone(),
-            key_pkcs1_pem: sink.key_pkcs1_pem.clone(),
-            next_piece: self.start_piece(),
-            reserved_until: Some(reserved_until),
+    fn record(&self, reserved_until: u64) -> Option<(CursorSink, PersistedBroadcast)> {
+        self.sink.as_ref().map(|sink| {
+            (
+                sink.clone(),
+                PersistedBroadcast {
+                    transport: sink.transport.clone(),
+                    key_pkcs1_pem: sink.key_pkcs1_pem.clone(),
+                    next_piece: self.start_piece(),
+                    reserved_until: Some(reserved_until),
+                },
+            )
         })
     }
 
@@ -185,10 +190,9 @@ impl BroadcastCursor {
     // write an older reservation after it. The blocking guard also fences deletion.
     async fn save(&self, reservation: u64) -> Result<(), BroadcastError> {
         self.check()?;
-        let Some(rec) = self.record(reservation) else {
+        let Some((sink, rec)) = self.record(reservation) else {
             return Ok(());
         };
-        let sink = self.sink.as_ref().unwrap().clone();
         let io = self.io.clone().lock_owned().await;
         self.check()?;
         let poison = self.poisoned.clone();

@@ -15,7 +15,8 @@ names because branch protection requires those exact check contexts:
 - **Rust test** runs the offline workspace tests and deterministic fuzz seed
   replay. Mutational fuzzing does not run on a pull request or every beta.
 - **A/B harness test** runs the Python capture/analysis, source-isolation and
-  release-archive verification and workflow-contract tests. The YAML parser for
+  release-archive verification, audio-inventory isolation and workflow-contract
+  tests. The YAML parser for
   contract tests lives in a disposable virtual environment. Network fixtures use
   loopback only.
 - **HLS audio synthetic** requires FFmpeg/FFprobe and checks synthetic codec and

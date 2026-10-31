@@ -115,6 +115,9 @@ jobs:
       - name: Test release archive verification
         run: python3 -m unittest discover -s tools/release -v
 
+      - name: Test audio inventory and scanner isolation
+        run: python3 -m unittest discover -s tools/audioscan -v
+
   hls-audio-synthetic:
     name: HLS audio synthetic
     runs-on: ubuntu-24.04

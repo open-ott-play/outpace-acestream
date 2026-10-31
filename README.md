@@ -16,7 +16,7 @@ Stream product. The executable remains `outpace`; configuration uses `OUTPACE_*`
 
 [v0.9.0 release](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.0)
 · [0.9.0 changes](docs/releases/v0.9.0.md)
-· [0.9.1-beta.11 changes](docs/releases/v0.9.1-beta.11.md)
+· [0.9.1-beta.12 changes](docs/releases/v0.9.1-beta.12.md)
 · [Previous stable v0.8.1](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.8.1)
 · [Beta.8 history](docs/releases/v0.9.0-beta.8.md)
 · [Retained replay](docs/timeshift.md)
@@ -46,7 +46,7 @@ product archive or runtime acceptance.
 | Docker or Docker Compose | [Containers, storage, ports and upgrades](docs/containers.md) |
 | Kubernetes or k3s | [Cluster deployment and example manifests](docs/kubernetes.md) |
 | VLC, hls-proxy or another player | [Playback routes and integration](docs/playback.md) |
-| Tuning and operations | [Configuration](docs/configuration.md) · [Troubleshooting](docs/troubleshooting.md) |
+| Tuning and operations | [Configuration](docs/configuration.md) · [Troubleshooting](docs/troubleshooting.md) · [Audio inventory](tools/audioscan/README.md) |
 | Development and source distribution | [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Licensing](docs/licensing.md) |
 
 The installation examples target **v0.9.0**; verify its published assets before

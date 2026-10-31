@@ -108,6 +108,9 @@ impl LiveMetrics {
     fn sample(&self) {
         let now = Instant::now();
         let mut measured = self.measured.lock().unwrap();
+        self.sample_measurement(&mut measured, now);
+    }
+    fn sample_measurement(&self, measured: &mut Measurement, now: Instant) {
         measured
             .down
             .observe(now, self.received.load(Ordering::Relaxed));
@@ -194,8 +197,13 @@ pub(crate) struct MetricsSampler {
 }
 impl Drop for MetricsSampler {
     fn drop(&mut self) {
-        self.metrics.sample();
+        // Cancellation is mandatory; the final telemetry sample is best effort. Never resume
+        // poisoned measurements or wait for a competing reader while tearing the source down.
         self.task.abort();
+        if let Ok(mut measured) = self.metrics.measured.try_lock() {
+            self.metrics
+                .sample_measurement(&mut measured, Instant::now());
+        }
     }
 }
 pub(crate) fn spawn_sampler(metrics: Arc<LiveMetrics>) -> MetricsSampler {
@@ -376,6 +384,64 @@ mod tests {
         drop(sampler);
         tokio::task::yield_now().await;
         assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn sampler_drop_cancels_worker_with_poisoned_measurements() {
+        let metrics = LiveMetrics::new(
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
+        );
+        let weak = Arc::downgrade(&metrics);
+        let sampler = spawn_sampler(metrics.clone());
+        let task = sampler.task.abort_handle();
+        tokio::task::yield_now().await;
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = metrics.measured.lock().unwrap();
+            panic!("injected measurement poison");
+        }))
+        .is_err());
+        assert!(metrics.measured.is_poisoned());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(sampler))).is_ok());
+        drop(metrics);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("sampler cancellation must finish");
+        assert!(
+            weak.upgrade().is_none(),
+            "cancelled sampler must release its measurements"
+        );
+    }
+
+    #[tokio::test]
+    async fn sampler_drop_does_not_wait_for_a_measurement_reader() {
+        let metrics = LiveMetrics::new(
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(AtomicU32::new(0)),
+        );
+        let sampler = spawn_sampler(metrics.clone());
+        let task = sampler.task.abort_handle();
+        {
+            let _held = metrics.measured.lock().unwrap();
+            drop(sampler);
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("sampler cancellation must finish");
     }
 
     #[tokio::test(start_paused = true)]

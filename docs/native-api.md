@@ -80,6 +80,10 @@ descriptors, and networks without VOD support), `404` for an unknown network or 
 and `502` for upstream resolution or range-opening failures. The response body carries
 the provider's reason.
 
+For Ace VOD, hexadecimal letter case in a valid `cid:` selector does not create a
+separate cached descriptor or resolution lock. This normalization does not change
+transport URLs or identifiers belonging to other providers.
+
 VOD response startup shares the `OUTPACE_HLS_STARTUP_TIMEOUT_MS` budget (45 seconds by
 default) across descriptor resolution, waits behind another resolver or range reader,
 range opening, and the HLS container probe. Expiry returns `504` with `Retry-After: 1`,

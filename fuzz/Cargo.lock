@@ -4,11 +4,11 @@ version = 4
 
 [[package]]
 name = "ace-media"
-version = "0.9.1-beta.11"
+version = "0.9.1-beta.12"
 
 [[package]]
 name = "ace-tracker"
-version = "0.9.1-beta.11"
+version = "0.9.1-beta.12"
 dependencies = [
  "rand 0.10.3",
  "tokio",
@@ -16,7 +16,7 @@ dependencies = [
 
 [[package]]
 name = "ace-wire"
-version = "0.9.1-beta.11"
+version = "0.9.1-beta.12"
 dependencies = [
  "aes",
  "cbc",

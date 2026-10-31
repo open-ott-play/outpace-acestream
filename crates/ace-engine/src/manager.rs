@@ -519,7 +519,18 @@ impl StreamManager {
         network: &str,
         id: &str,
     ) -> Result<Arc<dyn VodContent>, ProviderError> {
-        let key = (network.to_string(), id.to_string());
+        // Only AceStream content-id hex is case-insensitive. Canonicalize before both the
+        // cache and resolution lock so direct manager callers share the HTTP route's handle.
+        // Other provider IDs and transport URL payloads keep their exact spelling.
+        let id = if network == "ace"
+            && id.strip_prefix("cid:").is_some_and(|hex| {
+                hex.len() == 40 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }) {
+            id.to_ascii_lowercase()
+        } else {
+            id.to_owned()
+        };
+        let key = (network.to_owned(), id);
         if let Some(v) = self.cached_vod(&key).await {
             return Ok(v);
         }
@@ -531,7 +542,7 @@ impl StreamManager {
             return Ok(v);
         }
         let provider = self.registry.get(network).ok_or(ProviderError::NotFound)?;
-        let vod: Arc<dyn VodContent> = Arc::from(provider.resolve_vod(id).await?);
+        let vod: Arc<dyn VodContent> = Arc::from(provider.resolve_vod(&key.1).await?);
         let _finalizing = self.hls_finalization.lock().await;
         if self
             .shutting_down
@@ -1001,7 +1012,14 @@ impl Drop for StreamManager {
         for session in self.sessions.get_mut().values() {
             session.stop();
         }
-        if let Some(reaper) = self.reaper.get_mut().unwrap().as_ref() {
+        // Destruction only cancels the surviving control; it never resumes poisoned state.
+        // Continue stopping media even if an earlier reaper operation panicked.
+        if let Some(reaper) = self
+            .reaper
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
             reaper.cancel();
         }
         for entry in self.packagers.get_mut().values() {
@@ -2166,6 +2184,7 @@ mod tests {
     }
 
     struct ParallelVodProvider {
+        network: &'static str,
         entered: tokio::sync::mpsc::UnboundedSender<String>,
         release: Arc<Notify>,
     }
@@ -2190,7 +2209,7 @@ mod tests {
     #[async_trait]
     impl StreamProvider for ParallelVodProvider {
         fn network(&self) -> &'static str {
-            "parallel-vod"
+            self.network
         }
 
         async fn open(&self, _: &str) -> Result<Box<dyn TsSource>, ProviderError> {
@@ -2209,10 +2228,21 @@ mod tests {
         tokio::sync::mpsc::UnboundedReceiver<String>,
         Arc<Notify>,
     ) {
+        parallel_vod_manager_for("parallel-vod")
+    }
+
+    fn parallel_vod_manager_for(
+        network: &'static str,
+    ) -> (
+        Arc<StreamManager>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+        Arc<Notify>,
+    ) {
         let (entered, events) = tokio::sync::mpsc::unbounded_channel();
         let release = Arc::new(Notify::new());
         let mut registry = ProviderRegistry::new();
         registry.register(Arc::new(ParallelVodProvider {
+            network,
             entered,
             release: release.clone(),
         }));
@@ -2254,6 +2284,101 @@ mod tests {
         let second = second.await.unwrap();
         assert!(Arc::ptr_eq(&first, &second));
         assert!(entered.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ace_vod_cid_case_variants_share_pending_resolution_and_cached_handle() {
+        const LOWER: &str = "cid:0123456789abcdef0123456789abcdef01234567";
+        const UPPER: &str = "cid:0123456789ABCDEF0123456789ABCDEF01234567";
+        let (manager, mut entered, release) = parallel_vod_manager_for("ace");
+        let first = manager.resolve_vod("ace", UPPER);
+        let second = manager.resolve_vod("ace", LOWER);
+        tokio::pin!(first, second);
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        assert_eq!(entered.try_recv().unwrap(), LOWER);
+        assert!(
+            entered.try_recv().is_err(),
+            "same content-id must share the resolution lock"
+        );
+        release.notify_waiters();
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(
+            &first,
+            &manager.resolve_vod("ace", UPPER).await.unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &first,
+            &manager.resolve_vod("ace", LOWER).await.unwrap()
+        ));
+        assert!(
+            entered.try_recv().is_err(),
+            "cached case variants must not resolve again"
+        );
+        assert_eq!(manager.vod_cache.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn vod_canonicalization_preserves_other_providers_and_non_content_ids() {
+        struct RecordingProvider {
+            network: &'static str,
+            calls: Arc<StdMutex<Vec<(String, String)>>>,
+        }
+        #[async_trait]
+        impl StreamProvider for RecordingProvider {
+            fn network(&self) -> &'static str {
+                self.network
+            }
+            async fn open(&self, _: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+                Err(ProviderError::NotFound)
+            }
+            async fn resolve_vod(&self, id: &str) -> Result<Box<dyn VodContent>, ProviderError> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((self.network.into(), id.into()));
+                Ok(Box::new(EmptyParallelVod))
+            }
+        }
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let mut registry = ProviderRegistry::new();
+        for network in ["ace", "other"] {
+            registry.register(Arc::new(RecordingProvider {
+                network,
+                calls: calls.clone(),
+            }));
+        }
+        let manager = StreamManager::new(registry);
+        // Only valid lowercase-prefix cid hex belongs to this policy. Even malformed or
+        // unsupported values reach the provider unchanged so its validation remains authoritative.
+        let cases = [
+            ("ace", "cid:0123456789abcdef0123456789abcdef01234567"),
+            ("other", "cid:0123456789abcdef0123456789abcdef01234567"),
+            ("other", "cid:0123456789ABCDEF0123456789ABCDEF01234567"),
+            ("ace", "CID:0123456789ABCDEF0123456789ABCDEF01234567"),
+            ("ace", "cid:ABC"),
+            ("ace", "cid:0123456789ABCDEG0123456789ABCDEG01234567"),
+            ("ace", "turl-AbCd"),
+            ("ace", "turl-abcd"),
+            ("ace", "https://origin.invalid/Path?Token=AbCd"),
+        ];
+        let mut handles = Vec::new();
+        for (network, id) in cases {
+            let handle = manager.resolve_vod(network, id).await.unwrap();
+            assert!(handles.iter().all(|old| !Arc::ptr_eq(old, &handle)));
+            assert!(Arc::ptr_eq(
+                &handle,
+                &manager.resolve_vod(network, id).await.unwrap()
+            ));
+            handles.push(handle);
+        }
+        assert_eq!(
+            *calls.lock().unwrap(),
+            cases.map(|(n, id)| (n.to_owned(), id.to_owned()))
+        );
+        assert_eq!(manager.vod_cache.lock().await.len(), cases.len());
     }
 
     #[tokio::test]
@@ -2589,6 +2714,44 @@ mod tests {
             weak.upgrade().is_none(),
             "reaper must not keep manager alive while sleeping"
         );
+    }
+
+    #[tokio::test]
+    async fn hls_owned_drop_cancels_reaper_and_media_after_reaper_lock_poison() {
+        let manager = StreamManager::new(registry());
+        let media = manager
+            .get_or_start_hls("test", "poisoned-reaper")
+            .await
+            .unwrap();
+        manager.spawn_reaper();
+        let mut completed = manager
+            .reaper
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .completed
+            .clone();
+        let weak = Arc::downgrade(&manager);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = manager.reaper.lock().unwrap();
+            panic!("injected reaper lock poison");
+        }))
+        .is_err());
+        assert!(manager.reaper.is_poisoned());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(manager))).is_ok());
+        assert_eq!(media.status(), crate::hls::HlsStatus::Stopped);
+        assert!(weak.upgrade().is_none());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !*completed.borrow_and_update() {
+                completed
+                    .changed()
+                    .await
+                    .expect("reaper must publish joined completion");
+            }
+        })
+        .await
+        .expect("poisoned reaper must still be cancelled and joined");
     }
 
     #[tokio::test]

@@ -418,6 +418,7 @@ def deadline_connection(host: str, port: int, deadline: float):
             try:
                 sock.shutdown(socket.SHUT_RDWR)
             except OSError:
+                # The response may have closed this socket before the watchdog fired.
                 pass
         remaining = stop_at - time.monotonic()
         if remaining <= 0:
@@ -449,6 +450,8 @@ def probe_stream(host: str, port: int, hexid: str, deadline: float) -> tuple[lis
                     if not chunk or probe.push(chunk):
                         break
     except (OSError, http.client.HTTPException):
+        # Connection loss or expiry is an unavailable observation, not a batch failure.
+        # Return the bounded probe's status below without exposing its URL in diagnostics.
         pass
     return probe.tracks, probe.note
 
@@ -510,6 +513,8 @@ class Daemon:
                         if response.status == 200 and self.proc.poll() is None:
                             return
             except (OSError, http.client.HTTPException):
+                # The child may still be binding its listener. Retry only until stop_at;
+                # the constructor terminates and reaps it if readiness never succeeds.
                 pass
             time.sleep(0.2)
         raise SystemExit("scan: isolated daemon did not become ready")
@@ -625,6 +630,8 @@ def write_summary(path: str, payload: dict, *, replace: bool = True) -> None:
         try:
             os.unlink(temporary)
         except OSError:
+            # The temporary file may already have moved or been removed. Preserve the
+            # original write/publish exception rather than replace it with cleanup failure.
             pass
         raise
 

@@ -152,6 +152,7 @@ class HttpSafety(unittest.TestCase):
         listener.settimeout(3)
         port = listener.getsockname()[1]
         observed = []
+        errors = []
         def serve():
             try:
                 conn, _ = listener.accept()
@@ -159,13 +160,23 @@ class HttpSafety(unittest.TestCase):
                     conn.settimeout(2)
                     observed.append(conn.recv(4096))
                     writer(conn)
-            except OSError:
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                # Deadline tests intentionally close the peer during writes; the test
+                # still asserts its observed request and bounded client completion.
                 pass
+            except BaseException as error:
+                # Thread exceptions do not otherwise fail unittest's owning test.
+                errors.append(error)
             finally:
                 listener.close()
         worker = threading.Thread(target=serve, daemon=True)
         worker.start()
-        self.addCleanup(worker.join, 3)
+        def finish():
+            worker.join(3)
+            self.assertFalse(worker.is_alive(), "HTTP test worker did not stop")
+            if errors:
+                raise errors[0]
+        self.addCleanup(finish)
         return port, observed
 
     def test_existing_daemon_is_get_only_even_on_success(self):
@@ -191,6 +202,20 @@ class HttpSafety(unittest.TestCase):
                 started = time.monotonic()
                 self.assertEqual(scan.probe_stream("127.0.0.1", port, SYNTHETIC_ID, 0.15), (None, "no-pmt"))
                 self.assertLess(time.monotonic() - started, 0.8)
+
+    def test_unexpected_server_failure_is_surfaced_from_joined_cleanup(self):
+        class BrokenServerCase(HttpSafety):
+            def runTest(self):
+                def fail(conn):
+                    raise OSError("injected unexpected HTTP server failure")
+                port, _ = self.serve_once(fail)
+                scan.probe_stream("127.0.0.1", port, SYNTHETIC_ID, 0.2)
+        result = unittest.TestResult()
+        BrokenServerCase().run(result)
+        self.assertEqual(result.testsRun, 1)
+        self.assertEqual(len(result.failures), 0)
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn("OSError: injected unexpected HTTP server failure", result.errors[0][1])
 
     def test_base_rejects_credentials_paths_and_remote_hosts(self):
         for base in ["http://user:secret@127.0.0.1", "http://127.0.0.1/foo", "http://127.0.0.1?token=secret", "http://example.com", "http://127.0.0.1:bad"]:

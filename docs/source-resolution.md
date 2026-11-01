@@ -64,6 +64,16 @@ segments fail explicitly. A session keeps at most 1,024 URL entries and 512 KiB 
 URL text. Idle playback expires after sixty seconds and every playback after six
 hours, even if active. At most sixty-four playbacks coexist.
 
+Origin playlists may use HTTP `Content-Encoding: gzip`. The relay bounds both
+the compressed wire body and the decoded playlist independently to 1 MiB, checks
+the original Content-Length before decoding, and validates every gzip checksum
+and footer. Up to sixteen concatenated gzip members are accepted; truncated
+members, trailing junk, unsupported or stacked encodings fail explicitly.
+Decoding shares the request's cancellation and thirty-second deadline, including
+time spent queueing. Rewritten playlists are served uncompressed with their new
+length. Media and byte-range resources continue to require identity encoding;
+they are never transparently decompressed.
+
 Only media with explicit fresh origin cache permission is cached, up to 16 MiB
 and 1,024 entries globally, for at most thirty seconds. Age, Date, max-age and
 s-maxage reduce freshness; private/no-cache/no-store, Vary, Set-Cookie and ranges

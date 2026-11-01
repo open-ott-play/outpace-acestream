@@ -41,6 +41,16 @@ JSON with `is_direct: true`, `managed_origin: true`, `playback_url`, `command_ur
 and `stop_url`.
 Follow the returned URL; `DELETE stop_url` cancels only that viewer. The managed
 relay has no swarm statistics, peer controls or native audio conversion.
+Finite managed HLS requests reuse a bounded pool of HTTP/1 connections. Every
+request and redirect still validates the URL and resolves DNS afresh; a changed
+address retires the previous pinned client. Each relay's pool stores at most 16
+reusable client entries, with one idle connection per client, a 15-second idle
+connection timeout and a fixed 60-second reuse lifetime. In-flight responses may
+outlive eviction and remain subject to the existing four-response bound.
+Pool reuse does not change request deadlines,
+Range or encoding validation, cache policy, or the response-memory bound. It is
+not used for continuous source streams and does not enable proxy environment
+variables, automatic redirects, retries, or cross-origin HTTP/2 coalescing.
 With history explicitly enabled, eligible single-playlist TS origins also expose
 [bounded retained replay](timeshift.md#managed-origin-ts-replay).
 Metadata/discovery responses still describe the origin; they do not start
@@ -104,6 +114,16 @@ media remains opaque and is not qualified for players requiring filename extensi
 Initialization maps with implicit byte-range offsets remain unsupported.
 `GET /origin-hls/status` reports only `enabled` and `active_sessions`, including lazy
 admissions; operational idle checks must examine it as well as `/streams`.
+
+An origin HTTP rejection retains the gateway's `502` response and adds the numeric
+`X-Outpace-Upstream-Status` header. For example, an upstream `403` produces that
+header with value `403` and the body `origin_upstream_forbidden`. Statuses `401`,
+`404`, `410`, `429`, and `503` use `origin_upstream_unauthorized`,
+`origin_upstream_not_found`, `origin_upstream_gone`, `origin_upstream_rate_limited`,
+and `origin_upstream_unavailable`; other rejected statuses use
+`origin_upstream_http_status`. Origin URLs, headers, and error bodies are never
+forwarded. Transport failures and invalid successful responses have no upstream
+status header; their existing error codes and gateway statuses remain unchanged.
 
 Encrypted keys, content steering, variable substitution and low-latency HLS parts,
 preload hints, delta updates and server controls are explicitly unsupported.

@@ -130,7 +130,9 @@ controls. Explicit history configuration can enable the restricted
 `command_url`; status reports disabled or unsupported states truthfully.
 Expired/unknown resources return 404, invalid ranges
 400, exhausted admission 503, acquisition deadlines 504, unsupported HLS 415 and
-other invalid/failed origin resources 502. Query-based playlist extensions and
+other invalid/failed origin resources 502. A failed upstream HTTP response also supplies its numeric status in
+`X-Outpace-Upstream-Status` and a sanitized `origin_upstream_*` error code;
+upstream response bodies, URLs and credentials are not returned. Query-based playlist extensions and
 If-Range are unsupported. Valid playlist probe ranges receive a complete 200
 rewritten manifest; media range responses retain validated Content-Range.
 `GET /origin-hls/status` returns `enabled` and an aggregate `active_sessions` count,

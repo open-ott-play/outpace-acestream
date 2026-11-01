@@ -50,7 +50,10 @@ outlive eviction and remain subject to the existing four-response bound.
 Pool reuse does not change request deadlines,
 Range or encoding validation, cache policy, or the response-memory bound. It is
 not used for continuous source streams and does not enable proxy environment
-variables, automatic redirects, retries, or cross-origin HTTP/2 coalescing.
+variables, automatic redirects, or cross-origin HTTP/2 coalescing. Reqwest policy
+retries remain disabled. Hyper may transparently reopen an unusable reused
+connection only before the request starts writing; failed or partially received
+responses are not replayed.
 With history explicitly enabled, eligible single-playlist TS origins also expose
 [bounded retained replay](timeshift.md#managed-origin-ts-replay).
 Metadata/discovery responses still describe the origin; they do not start

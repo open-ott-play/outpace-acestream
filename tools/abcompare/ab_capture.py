@@ -209,6 +209,7 @@ class Capture:
         try:
             self.outdir.mkdir(mode=0o700)
         except FileExistsError:
+            # Validate ownership, mode, and symlink status below before reusing it.
             pass
         info = self.outdir.lstat()
         if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or
@@ -251,6 +252,7 @@ class Capture:
                     try:
                         sock.shutdown(socket.SHUT_RDWR)
                     except OSError:
+                        # A capture worker may have closed the socket after the snapshot.
                         pass
             for thread in threads:
                 thread.join(timeout=2)

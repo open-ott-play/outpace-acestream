@@ -109,6 +109,9 @@ jobs:
       - name: Test A/B capture and analysis
         run: python3 -m unittest discover -s tools/abcompare -v
 
+      - name: Test bounded memory-soak lifecycle
+        run: python3 -m unittest discover -s tools/memsoak -v
+
       - name: Test source context isolation
         run: python3 -m unittest discover -s tools/source -v
 

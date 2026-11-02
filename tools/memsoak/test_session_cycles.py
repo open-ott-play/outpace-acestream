@@ -3,15 +3,14 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 import json
 import threading
 import time
-import unittest
-from unittest import mock
+from unittest import TestCase, main, mock
 
 import session_cycles as soak
 
 SELECTOR = "0123456789abcdef0123456789abcdef01234567"
 
 
-class MetricTests(unittest.TestCase):
+class MetricTests(TestCase):
     def test_epoch_field_must_exist_and_be_null(self):
         good = {"allocator": "jemalloc", "epoch_error": None, "allocated": 12}
         self.assertEqual(soak.parse_metric(good, "allocated"), 12)
@@ -59,7 +58,7 @@ class MetricTests(unittest.TestCase):
                 soak.positive_number(value, "timeout", 10)
 
 
-class GuardTests(unittest.TestCase):
+class GuardTests(TestCase):
     def test_hls_rejects_external_and_wrong_route(self):
         for uri in ("https://example.invalid/a.ts", "http://127.0.0.1:8/a.ts", "/elsewhere/a.ts"):
             with self.subTest(uri=uri), self.assertRaises(soak.Inconclusive):
@@ -115,7 +114,7 @@ class GuardTests(unittest.TestCase):
         self.assertIn("bytes", encoded)
 
 
-class FakeApiTests(unittest.TestCase):
+class FakeApiTests(TestCase):
     @classmethod
     def setUpClass(cls):
         class Handler(BaseHTTPRequestHandler):
@@ -195,6 +194,7 @@ class FakeApiTests(unittest.TestCase):
             soak.delete_and_wait(self.base, "/streams/example", SELECTOR, time.monotonic() + 2)
         self.assertEqual(soak.target_clients(self.base, SELECTOR, time.monotonic() + 2), 0)
 
+    @mock.patch.object(soak.sys, "platform", "linux")
     def test_system_allocator_does_not_need_epoch_error(self):
         self.assertEqual(soak.select_metric({"allocator": "system"}, 17), "rss_kib")
 
@@ -214,7 +214,6 @@ class FakeApiTests(unittest.TestCase):
 
     def test_delete_stuck_disconnected_is_failure_but_schema_is_inconclusive(self):
         self.handler.present = True
-        original = soak.streams_present
         with mock.patch.object(soak, "streams_present", return_value=True), \
              mock.patch.object(soak, "target_clients", return_value=0), \
              mock.patch.object(soak, "http", return_value=(204, b"")):
@@ -365,6 +364,7 @@ class FakeApiTests(unittest.TestCase):
                 try:
                     self.wfile.write(body)
                 except (BrokenPipeError, ConnectionResetError):
+                    # The deadline test deliberately closes the client during a write.
                     pass
             def log_message(self, *_): pass
         server = HTTPServer(("127.0.0.1", 0), Source)
@@ -433,6 +433,7 @@ class FakeApiTests(unittest.TestCase):
                 try:
                     self.wfile.write(body)
                 except (BrokenPipeError, ConnectionResetError):
+                    # The deadline test deliberately closes the client during a write.
                     pass
             def log_message(self, *_): pass
         server = HTTPServer(("127.0.0.1", 0), Source)
@@ -443,6 +444,24 @@ class FakeApiTests(unittest.TestCase):
                               time.monotonic() + .5, None, .04, .1)
         finally:
             server.shutdown(); thread.join(timeout=2); server.server_close()
+
+    def test_expired_playback_timer_uses_its_classification(self):
+        with mock.patch.object(soak.time, "monotonic", return_value=10):
+            with self.assertRaises(soak.PlaybackIntervalComplete):
+                with soak.deadline_watch(9, soak.PlaybackIntervalComplete):
+                    self.fail("expired operation must not start")
+
+    def test_completed_http_window_accepts_socket_timeout(self):
+        window = mock.Mock()
+        window.end = 10
+        window.operation_deadline.return_value = 10
+        window.complete.return_value = True
+        with mock.patch.object(soak, "http", side_effect=soak.PlaybackIntervalComplete):
+            self.assertIsNone(soak.playback_http(window, "http://127.0.0.1/"))
+        window.complete.return_value = False
+        with mock.patch.object(soak, "http", side_effect=soak.PlaybackIntervalComplete):
+            with self.assertRaises(soak.Inconclusive):
+                soak.playback_http(window, "http://127.0.0.1/")
 
     def test_interrupt_during_ts_open_propagates(self):
         with mock.patch.object(soak.OPENER, "open", side_effect=KeyboardInterrupt):
@@ -504,6 +523,7 @@ class FakeApiTests(unittest.TestCase):
                               started + 2, [1, 2], [False])
         self.assertGreaterEqual(time.monotonic() - started, .095)
 
+    @mock.patch.object(soak.sys, "platform", "linux")
     def test_interrupted_run_finally_cleans_only_its_child(self):
         import os
         from pathlib import Path
@@ -577,16 +597,19 @@ class FakeApiTests(unittest.TestCase):
                 soak.run_workload(self.base, "/streams/ace/cid:x", SELECTOR, args, proc, (), "hash",
                                   time.monotonic() + 4, [1, 2], [False])
 
+    @mock.patch.object(soak.sys, "platform", "linux")
     def test_cycle_uses_exact_window_samples_after_warmup(self):
         import os
         from pathlib import Path
         binary = Path(soak.sys.executable).resolve()
         args = type("Args", (), {"binary": binary, "budget_mib": 1, "warmups": 1, "cycles": 1,
                                       "baseline_samples": 2, "window_samples": 3, "playback_duration": 1,
-                                      "idle_grace": 65, "reap_timeout": 2, "postclose_grace": .001, "timeout": 1,
+                                      "idle_grace": 65, "reap_timeout": 2, "postclose_grace": .001,
                                       "timeout": 1, "overall_timeout": 10, "media": "ts", "teardown": "delete"})()
         events = []
         proc = mock.Mock(); proc.pid = os.getpid(); proc.poll.return_value = None
+        real_stat = soak.os.stat
+        binary_stat = binary.stat()
         def workload(*_args): events.append("workload"); _args[-1][0] = True
         def json_value(*_args): events.append("memstats"); return {"allocator": "system"}
         windows = []
@@ -594,6 +617,7 @@ class FakeApiTests(unittest.TestCase):
             count = _args[-2]; windows.append(count); return [100] * count
         with mock.patch.dict(os.environ, {"ACE_CONTENT_ID": SELECTOR}), \
                  mock.patch.object(soak, "free_port", side_effect=[11001, 11002, 11003]), \
+                 mock.patch.object(soak.os, "stat", side_effect=lambda path, **kwargs: binary_stat if str(path).startswith("/proc/") else real_stat(path, **kwargs)), \
                  mock.patch.object(soak.subprocess, "Popen", return_value=proc), \
                  mock.patch.object(soak.subprocess, "run", return_value=mock.Mock(stdout="outpace 1.2.3\n")), \
                  mock.patch.object(soak, "read_version", return_value="outpace 1.2.3"), \
@@ -612,6 +636,7 @@ class FakeApiTests(unittest.TestCase):
         self.assertEqual(report["version"], "outpace 1.2.3")
         self.assertEqual(len(report["cycles"]), 1)
 
+    @mock.patch.object(soak.sys, "platform", "linux")
     def test_run_full_fake_api_lifecycle_from_empty_through_delete_and_idle_sample(self):
         self.handler.present = False
         args = type("Args", (), {"binary": __import__("pathlib").Path(soak.sys.executable).resolve(),
@@ -654,4 +679,4 @@ class FakeApiTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    main()

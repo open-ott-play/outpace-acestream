@@ -47,10 +47,10 @@ def positive_number(value, name, maximum):
     return result
 
 
-def remaining(deadline):
+def remaining(deadline, expiry=Inconclusive):
     value = deadline - time.monotonic()
     if value <= 0:
-        raise Inconclusive("operation deadline expired")
+        raise expiry("operation deadline expired")
     return value
 
 
@@ -72,13 +72,14 @@ def deadline_watch(deadline, expiry=Inconclusive):
     if not main_thread:
         yield
         return
+    delay = remaining(deadline, expiry)
     prior = signal.getsignal(signal.SIGALRM)
     old_timer = signal.getitimer(signal.ITIMER_REAL)
     def expired(_sig, _frame):
         raise expiry("HTTP operation deadline expired")
     signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, remaining(deadline))
     try:
+        signal.setitimer(signal.ITIMER_REAL, delay)
         yield
     finally:
         signal.setitimer(signal.ITIMER_REAL, *old_timer)
@@ -178,17 +179,21 @@ def _read_limited(response, deadline, limit=MAX_BODY):
     return bytes(body)
 
 
-def http(url, deadline, method="GET", body_limit=MAX_BODY):
+def http(url, deadline, method="GET", body_limit=MAX_BODY, timeout_error=Inconclusive):
     request = urllib.request.Request(url, method=method)
     try:
-        with deadline_watch(deadline):
-            with OPENER.open(request, timeout=remaining(deadline)) as response:
+        with deadline_watch(deadline, timeout_error):
+            with OPENER.open(request, timeout=remaining(deadline, timeout_error)) as response:
                 body = _read_limited(response, deadline, body_limit) if method != "DELETE" else b""
                 return response.status, body
     except urllib.error.HTTPError as exc:
         code = exc.code
         exc.close()
         return code, b""
+    except TimeoutError as exc:
+        raise timeout_error("HTTP request timed out before completion") from exc
+    except OSError as exc:
+        raise Inconclusive("HTTP request failed before completion") from exc
 
 
 def threading_is_main_thread():
@@ -400,9 +405,10 @@ def play_ts(url, deadline, guard=None, operation_timeout=5, playback_duration=No
             if response.isclosed():
                 raise Inconclusive("TS source ended before playback duration")
             read_deadline = window.operation_deadline()
-            response.fp.raw._sock.settimeout(remaining(read_deadline))
+            expiry = PlaybackIntervalComplete if read_deadline == window.end else Inconclusive
             try:
-                with deadline_watch(read_deadline, PlaybackIntervalComplete if read_deadline == window.end else Inconclusive):
+                response.fp.raw._sock.settimeout(remaining(read_deadline, expiry))
+                with deadline_watch(read_deadline, expiry):
                     block = response.read1(64 * 1024)
             except PlaybackIntervalComplete:
                 # Only the active-window timer can finish a healthy observation.
@@ -410,12 +416,31 @@ def play_ts(url, deadline, guard=None, operation_timeout=5, playback_duration=No
                     return total
                 raise
             except (socket.timeout, TimeoutError) as exc:
+                # The socket timer and SIGALRM can expire in either order. Apply
+                # the same progress checks when the active-window timer wins.
+                if read_deadline == window.end and window.complete():
+                    return total
                 raise Inconclusive("TS source stalled before playback duration") from exc
             if not block:
                 raise Inconclusive("TS source ended before playback duration")
+            if window.complete():
+                return total
             window.progress()
             total += len(block)
     return total
+
+
+def playback_http(window, url):
+    deadline = window.operation_deadline()
+    expiry = PlaybackIntervalComplete if deadline == window.end else Inconclusive
+    try:
+        result = http(url, deadline, timeout_error=expiry)
+    except PlaybackIntervalComplete:
+        if deadline == window.end and window.complete():
+            return None
+        raise Inconclusive("HTTP ended before a complete playback interval") from None
+    # Do not count bytes returned after the observation window as media progress.
+    return None if window.complete() else result
 
 
 def play_hls(base, prefix, deadline, guard=None, progress_timeout=5, playback_duration=None):
@@ -427,7 +452,10 @@ def play_hls(base, prefix, deadline, guard=None, progress_timeout=5, playback_du
     while not window.complete():
         if guard:
             guard()
-        status, body = http(base + prefix + ".m3u8", window.operation_deadline())
+        result = playback_http(window, base + prefix + ".m3u8")
+        if result is None:
+            break
+        status, body = result
         if status != 200:
             raise Inconclusive("HLS playlist HTTP status")
         try:
@@ -456,7 +484,10 @@ def play_hls(base, prefix, deadline, guard=None, progress_timeout=5, playback_du
                 continue
             if not urllib.parse.urlsplit(url).path.endswith(".ts"):
                 raise Inconclusive("unsupported HLS segment URI")
-            code, data = http(url, window.operation_deadline())
+            result = playback_http(window, url)
+            if result is None:
+                break
+            code, data = result
             if code != 200 or not data:
                 raise Inconclusive("HLS segment did not progress")
             window.progress()
@@ -506,10 +537,12 @@ def stop_child(proc):
         try:
             proc.kill()
         except KeyboardInterrupt:
+            # Continue bounded cleanup even if the operator interrupts kill().
             pass
         try:
             proc.wait(timeout=5)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            # Cleanup must remain bounded after the kill request, including on Ctrl-C.
             pass
         return
     try:
@@ -519,10 +552,12 @@ def stop_child(proc):
         try:
             proc.kill()
         except KeyboardInterrupt:
+            # Continue bounded cleanup even if the operator interrupts kill().
             pass
         try:
             proc.wait(timeout=5)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            # Cleanup must remain bounded after the kill request, including on Ctrl-C.
             pass
 
 
@@ -626,6 +661,7 @@ def run(args):
                     http(base + "/healthz", min(ready_deadline, time.monotonic() + 1))
                     break
                 except Exception:
+                    # Readiness may fail until the owned daemon finishes starting.
                     pass
             time.sleep(min(0.1, remaining(ready_deadline)))
         else:

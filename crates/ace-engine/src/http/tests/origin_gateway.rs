@@ -16,6 +16,24 @@ impl Origin {
             let calls = captured.clone();
             async move {
                 calls.lock().unwrap().push(request.uri().to_string());
+                if let Some(status) = request.uri().path().strip_prefix("/status/") {
+                    let status = StatusCode::from_u16(status.parse().unwrap()).unwrap();
+                    return (
+                        status,
+                        [
+                            (header::SET_COOKIE, "synthetic-origin-cookie"),
+                            (header::LOCATION, "https://example.invalid/synthetic-origin-location"),
+                            (header::CONTENT_ENCODING, "br"),
+                        ],
+                        "synthetic-origin-body",
+                    ).into_response();
+                }
+                if let Some(status) = request.uri().path().strip_prefix("/status-manifest/") {
+                    return (
+                        [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
+                        format!("#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n../status/{status}?token=synthetic-origin-query\n#EXT-X-ENDLIST\n"),
+                    ).into_response();
+                }
                 match request.uri().path() {
                     "/entry" => (StatusCode::FOUND, [(header::LOCATION, "/dir/master.m3u8")]).into_response(),
                     "/dir/master.m3u8" => (
@@ -112,6 +130,80 @@ fn media_uri(playlist: &str) -> &str {
         .lines()
         .find(|line| !line.is_empty() && !line.starts_with('#'))
         .unwrap()
+}
+
+#[tokio::test]
+async fn gateway_reports_sanitized_upstream_status_for_playlists_and_media() {
+    let origin = Origin::start().await;
+    let state = gateway_state(true);
+    let app = router(state.clone());
+    for (status, code) in [
+        (401, "origin_upstream_unauthorized"),
+        (403, "origin_upstream_forbidden"),
+        (404, "origin_upstream_not_found"),
+        (410, "origin_upstream_gone"),
+        (429, "origin_upstream_rate_limited"),
+        (503, "origin_upstream_unavailable"),
+        (418, "origin_upstream_http_status"),
+    ] {
+        for is_media in [false, true] {
+            let path = if is_media {
+                "status-manifest"
+            } else {
+                "status"
+            };
+            let root = start(
+                &app,
+                &format!(
+                    "{}/{path}/{status}?token=synthetic-origin-query",
+                    origin.url
+                ),
+            )
+            .await;
+            let resource = if is_media {
+                let response = request(&app, &root).await;
+                assert!(!response.headers().contains_key("x-outpace-upstream-status"));
+                media_uri(&text(response).await).to_owned()
+            } else {
+                root.clone()
+            };
+            let response = request(&app, &resource).await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                response.headers()["x-outpace-upstream-status"],
+                status.to_string()
+            );
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert!(!format!("{:?}", response.headers()).contains("synthetic-origin"));
+            assert!(!response.headers().contains_key(header::SET_COOKIE));
+            assert!(!response.headers().contains_key(header::LOCATION));
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(body.as_ref(), code.as_bytes());
+            let stop = root.rsplit_once('/').unwrap().0;
+            let response = app
+                .clone()
+                .oneshot(Request::delete(stop).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+    }
+    let root = start(&app, &format!("{}/unsupported", origin.url)).await;
+    let response = request(&app, &root).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(!response.headers().contains_key("x-outpace-upstream-status"));
+    let stop = root.rsplit_once('/').unwrap().0;
+    let response = app
+        .clone()
+        .oneshot(Request::delete(stop).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(state.origin_hls.as_ref().unwrap().active_count(), 0);
+    assert!(state.manager.list().await.is_empty());
+    assert_eq!(state.ace_sessions.active_count(), 0);
 }
 
 #[tokio::test]

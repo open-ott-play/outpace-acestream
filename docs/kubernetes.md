@@ -3,13 +3,13 @@
 The [checked-in example](../examples/kubernetes/README.md) deploys one Outpace
 instance with a persistent identity and an internal HTTP Service. It is a
 portable baseline for Kubernetes or k3s, not a copy of any private cluster.
-It targets the **v0.9.0** multi-platform image:
+It targets the **v0.9.1** multi-platform image:
 
 ```text
-ghcr.io/open-ott-play/outpace-acestream:0.9.0
+ghcr.io/open-ott-play/outpace-acestream:0.9.1
 ```
 
-Verify the [release assets](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.0)
+Verify the [release assets](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.1)
 and source metadata first. For production, replace the example tag in
 `deployment.yaml` with the verified multi-platform index digest before rendering
 or applying. The [container guide](containers.md) shows image inspection;

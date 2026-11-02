@@ -2,6 +2,13 @@
 use super::*;
 use reqwest::header::{self, HeaderMap};
 
+/// Validated wire encoding. The caller still receives the original, encoded bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceEncoding {
+    Identity,
+    Gzip,
+}
+
 #[derive(Debug)]
 pub struct ResourceResponse {
     pub final_url: FetchUrl,
@@ -9,6 +16,9 @@ pub struct ResourceResponse {
     pub content_type: Option<String>,
     pub content_range: Option<String>,
     pub content_length: Option<u64>,
+    pub content_encoding: ResourceEncoding,
+    /// The original DNS/redirect/body deadline, also applicable to caller decoding.
+    pub deadline: tokio::time::Instant,
     pub cache_ttl: Option<Duration>,
     pub body: GuardedBody,
 }
@@ -22,6 +32,129 @@ pub async fn open_resource(
     range: Option<&str>,
     cancel: watch::Receiver<bool>,
 ) -> Result<ResourceResponse, FetchError> {
+    open_resource_inner(
+        url,
+        policy,
+        limits,
+        range,
+        cancel,
+        ResourceOptions::default(),
+    )
+    .await
+}
+
+/// Fetch a full HLS playlist, allowing one gzip content coding. No Range requests
+/// are permitted. Wire size/length and bounded decoding remain the caller's job.
+/// Other resources must use `open_resource`, which continues to require identity.
+pub async fn open_playlist_resource(
+    url: &FetchUrl,
+    policy: FetchPolicy,
+    limits: FetchLimits,
+    cancel: watch::Receiver<bool>,
+) -> Result<ResourceResponse, FetchError> {
+    open_resource_inner(
+        url,
+        policy,
+        limits,
+        None,
+        cancel,
+        ResourceOptions {
+            playlist: true,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+impl ResourceClientPool {
+    /// Fetch a finite resource after fresh URL/DNS validation, reusing only a client
+    /// pinned to the same permitted authority and address. Range/encoding rules are
+    /// identical to the unpooled `open_resource` function.
+    pub async fn open_resource(
+        &self,
+        url: &FetchUrl,
+        policy: FetchPolicy,
+        limits: FetchLimits,
+        range: Option<&str>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<ResourceResponse, FetchError> {
+        open_resource_inner(
+            url,
+            policy,
+            limits,
+            range,
+            cancel,
+            ResourceOptions {
+                pool: Some(self.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Fetch a full finite playlist, with the same guarded gzip policy as the
+    /// unpooled `open_playlist_resource` function.
+    pub async fn open_playlist_resource(
+        &self,
+        url: &FetchUrl,
+        policy: FetchPolicy,
+        limits: FetchLimits,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<ResourceResponse, FetchError> {
+        open_resource_inner(
+            url,
+            policy,
+            limits,
+            None,
+            cancel,
+            ResourceOptions {
+                playlist: true,
+                pool: Some(self.clone()),
+                #[cfg(test)]
+                hooks: None,
+            },
+        )
+        .await
+    }
+}
+
+#[derive(Default)]
+struct ResourceOptions {
+    playlist: bool,
+    pool: Option<ResourceClientPool>,
+    #[cfg(test)]
+    hooks: Option<test_support::TestHooks>,
+}
+
+impl ResourceOptions {
+    async fn resolve(
+        &self,
+        url: &FetchUrl,
+        policy: FetchPolicy,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<SocketAddr, FetchError> {
+        #[cfg(test)]
+        if let Some(hooks) = &self.hooks {
+            return hooks.resolve(policy, cancel).await;
+        }
+        resolve_addr(
+            normalized_host(&url.0)?,
+            url.0.port_or_known_default().ok_or(FetchError::NoPort)?,
+            policy,
+            cancel,
+        )
+        .await
+    }
+}
+
+async fn open_resource_inner(
+    url: &FetchUrl,
+    policy: FetchPolicy,
+    limits: FetchLimits,
+    range: Option<&str>,
+    cancel: watch::Receiver<bool>,
+    options: ResourceOptions,
+) -> Result<ResourceResponse, FetchError> {
     if limits.connect_timeout.is_zero() || limits.headers_timeout.is_zero() {
         return Err(FetchError::InvalidSourceConfig);
     }
@@ -33,16 +166,8 @@ pub async fn open_resource(
     let mut current = FetchUrl::parse_source(url.0.as_str(), policy)?;
     for hop in 0..=3 {
         let attempt = async {
-            let addr = resolve_addr(
-                normalized_host(&current.0)?,
-                current
-                    .0
-                    .port_or_known_default()
-                    .ok_or(FetchError::NoPort)?,
-                policy,
-                cancel.clone(),
-            )
-            .await?;
+            // Resolve every request and redirect before consulting the client pool.
+            let addr = options.resolve(&current, policy, cancel.clone()).await?;
             open_pinned(
                 &current,
                 addr,
@@ -53,8 +178,11 @@ pub async fn open_resource(
                 cancel.clone(),
                 AttemptOptions {
                     resource: true,
+                    playlist: options.playlist,
                     range: range.map(str::to_owned),
                     deadline: Some(deadline),
+                    pool: options.pool.clone(),
+                    policy,
                     #[cfg(test)]
                     tls_root: None,
                 },
@@ -90,6 +218,8 @@ pub async fn open_resource(
             content_type: header_text(headers, header::CONTENT_TYPE)?.map(str::to_owned),
             content_range: header_text(headers, header::CONTENT_RANGE)?.map(str::to_owned),
             content_length: content_length(headers)?,
+            content_encoding: content_encoding(headers, options.playlist)?,
+            deadline,
             cache_ttl: if status == 200 && range.is_none() {
                 cache_ttl(headers)
             } else {
@@ -126,6 +256,16 @@ fn content_length(headers: &HeaderMap) -> Result<Option<u64>, FetchError> {
     header_text(headers, header::CONTENT_LENGTH)?
         .map(|v| decimal(v).ok_or(FetchError::UnsupportedResponse))
         .transpose()
+}
+
+fn content_encoding(headers: &HeaderMap, playlist: bool) -> Result<ResourceEncoding, FetchError> {
+    let value = header_text(headers, header::CONTENT_ENCODING)?;
+    match value.map(|value| value.trim_matches([' ', '\t'])) {
+        None => Ok(ResourceEncoding::Identity),
+        Some(value) if value.eq_ignore_ascii_case("identity") => Ok(ResourceEncoding::Identity),
+        Some(value) if playlist && value.eq_ignore_ascii_case("gzip") => Ok(ResourceEncoding::Gzip),
+        _ => Err(FetchError::UnsupportedResponse),
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -175,6 +315,18 @@ pub(super) fn validate_response(
     response: &reqwest::Response,
     range: Option<&str>,
 ) -> Result<(), FetchError> {
+    validate_resource_response(response, range, false)
+}
+
+pub(super) fn validate_playlist_response(response: &reqwest::Response) -> Result<(), FetchError> {
+    validate_resource_response(response, None, true)
+}
+
+fn validate_resource_response(
+    response: &reqwest::Response,
+    range: Option<&str>,
+    playlist: bool,
+) -> Result<(), FetchError> {
     let headers = response.headers();
     if headers.len() > MAX_SOURCE_HEADERS
         || headers
@@ -188,14 +340,17 @@ pub(super) fn validate_response(
                 .split(|b| *b == b',')
                 .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"upgrade"))
         })
-        || headers
-            .get_all(header::CONTENT_ENCODING)
-            .iter()
-            .any(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))
     {
         return Err(FetchError::UnsupportedResponse);
     }
-    match response.status().as_u16() {
+    let status = response.status().as_u16();
+    // Error representations are never consumed or decoded. Preserve their status
+    // even when their content coding differs from the requested media encoding.
+    if !matches!(status, 200 | 206 | 301 | 302 | 303 | 307 | 308) {
+        return Err(FetchError::ResourceHttpStatus(status));
+    }
+    content_encoding(headers, playlist)?;
+    match status {
         301 | 302 | 303 | 307 | 308 => {
             header_text(headers, header::LOCATION)?;
             return Ok(());
@@ -237,7 +392,7 @@ pub(super) fn validate_response(
                 return Err(FetchError::UnsupportedResponse);
             }
         }
-        _ => return Err(FetchError::HttpStatus),
+        _ => unreachable!("resource status was checked above"),
     }
     content_length(headers)?;
     header_text(headers, header::CONTENT_TYPE)?;

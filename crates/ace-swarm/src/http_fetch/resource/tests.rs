@@ -1,12 +1,48 @@
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod pooled;
+
 fn response(status: u16, headers: &[(&str, &str)]) -> reqwest::Response {
     let mut response = hyper::Response::builder().status(status);
     for (name, value) in headers {
         response = response.header(*name, *value);
     }
     response.body(Vec::<u8>::new()).unwrap().into()
+}
+
+#[test]
+fn resource_http_errors_retain_only_status_and_preserve_legacy_errors() {
+    for status in [204, 401, 403, 404, 410, 418, 429, 500, 503, 599] {
+        let response = response(
+            status,
+            &[
+                ("content-encoding", "br"),
+                ("set-cookie", "synthetic-origin-secret"),
+                (
+                    "location",
+                    "https://example.invalid/synthetic-origin-secret",
+                ),
+            ],
+        );
+        for error in [
+            validate_response(&response, None).unwrap_err(),
+            validate_playlist_response(&response).unwrap_err(),
+        ] {
+            assert_eq!(error, FetchError::ResourceHttpStatus(status));
+            assert_eq!(error.upstream_status(), Some(status));
+            assert_eq!(error.code(), "resource_http_status");
+            assert!(!format!("{error:?} {error}").contains("synthetic-origin-secret"));
+        }
+        if status >= 400 {
+            for continuous in [false, true] {
+                let error = super::super::validate_response(&response, continuous).unwrap_err();
+                assert_eq!(error, FetchError::HttpStatus);
+                assert_eq!(error.upstream_status(), None);
+                assert_eq!(error.code(), "http_status");
+            }
+        }
+    }
 }
 
 #[test]
@@ -92,6 +128,134 @@ fn resource_ranges_validate_geometry_and_response() {
     assert!(validate_response(&response(200, &[("content-range", "bytes 0-1/2")]), None).is_err());
     assert!(validate_response(&response(204, &[]), None).is_err());
     assert!(validate_response(&response(200, &[("content-encoding", "gzip")]), None).is_err());
+}
+
+#[test]
+fn playlist_gzip_is_explicit_and_rejects_ambiguous_encodings_and_partial_bodies() {
+    for value in ["gzip", "GZIP", " \tgZip\t ", "identity", " IDENTITY "] {
+        assert!(validate_playlist_response(&response(200, &[("content-encoding", value)])).is_ok());
+    }
+    for value in [
+        "",
+        "gzip, identity",
+        "gzip, gzip",
+        "br",
+        "deflate",
+        "zstd",
+        "x-gzip",
+    ] {
+        assert_eq!(
+            validate_playlist_response(&response(200, &[("content-encoding", value)])),
+            Err(FetchError::UnsupportedResponse)
+        );
+    }
+    for value in ["gzip", "identity"] {
+        assert_eq!(
+            validate_playlist_response(&response(
+                200,
+                &[("content-encoding", value), ("content-encoding", value)]
+            )),
+            Err(FetchError::UnsupportedResponse)
+        );
+    }
+    assert_eq!(
+        validate_playlist_response(&response(
+            206,
+            &[
+                ("content-encoding", "gzip"),
+                ("content-range", "bytes 0-9/10"),
+                ("content-length", "10")
+            ]
+        )),
+        Err(FetchError::UnsupportedResponse)
+    );
+    assert_eq!(
+        validate_response(
+            &response(
+                206,
+                &[
+                    ("content-encoding", "gzip"),
+                    ("content-range", "bytes 0-9/10"),
+                    ("content-length", "10")
+                ]
+            ),
+            Some("bytes=0-9")
+        ),
+        Err(FetchError::UnsupportedResponse)
+    );
+}
+
+#[tokio::test]
+async fn playlist_redirects_preserve_raw_encoding_and_wire_length() {
+    let mut origin = fixture_origin(vec![
+        ("HTTP/1.1 302 Found\r\nLocation: /final?sig=a%2Fb\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\n\r\n".into(), Duration::ZERO),
+        ("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 3\r\n\r\nraw".into(), Duration::ZERO),
+    ]).await;
+    let (_tx, cancel) = watch::channel(false);
+    let mut result = open_playlist_resource(
+        &origin.url,
+        FetchPolicy {
+            allow_non_global: true,
+        },
+        limits(),
+        cancel,
+    )
+    .await
+    .unwrap();
+    assert!(result.final_url.0.as_str().ends_with("/final?sig=a%2Fb"));
+    assert_eq!(result.content_encoding, ResourceEncoding::Gzip);
+    assert_eq!(result.content_length, Some(3));
+    let mut bytes = Vec::new();
+    while let Some(chunk) = result.body.next_chunk().await.unwrap() {
+        bytes.extend_from_slice(&chunk);
+    }
+    assert_eq!(bytes, b"raw");
+    for request in (&mut origin.task).await.unwrap() {
+        let request = request.to_ascii_lowercase();
+        assert!(request.contains("accept-encoding: gzip, identity\r\n"));
+        assert!(!request.contains("\r\nrange:"));
+    }
+}
+
+#[tokio::test]
+async fn gzip_playlist_body_retains_cancellation_and_transport_deadline() {
+    for should_cancel in [false, true] {
+        let origin = fixture_origin(vec![(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 1\r\n\r\n".into(),
+            Duration::from_secs(2),
+        )])
+        .await;
+        let (tx, cancel) = watch::channel(false);
+        let mut result = open_playlist_resource(
+            &origin.url,
+            FetchPolicy {
+                allow_non_global: true,
+            },
+            FetchLimits {
+                headers_timeout: Duration::from_millis(100),
+                ..limits()
+            },
+            cancel,
+        )
+        .await
+        .unwrap();
+        if should_cancel {
+            tx.send_replace(true);
+        }
+        let error = tokio::time::timeout(Duration::from_millis(500), result.body.next_chunk())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error,
+            if should_cancel {
+                FetchError::Cancelled
+            } else {
+                FetchError::BodyTimeout
+            }
+        );
+        assert!(result.body.response.is_none());
+    }
 }
 
 #[test]

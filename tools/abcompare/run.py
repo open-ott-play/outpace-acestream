@@ -9,7 +9,6 @@ from pathlib import Path
 import signal
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.request

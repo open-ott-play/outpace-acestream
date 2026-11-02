@@ -14,10 +14,10 @@ preserving its history, attribution and **AGPL-3.0-or-later** license. It does n
 require an original closed-source engine at runtime and is not an official Ace
 Stream product. The executable remains `outpace`; configuration uses `OUTPACE_*`.
 
-[v0.9.0 release](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.0)
-· [0.9.0 changes](docs/releases/v0.9.0.md)
+[v0.9.1 release](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.1)
+· [0.9.1 changes](docs/releases/v0.9.1.md)
 · [0.9.1-beta.14 changes](docs/releases/v0.9.1-beta.14.md)
-· [Previous stable v0.8.1](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.8.1)
+· [Previous stable v0.9.0](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.0)
 · [Beta.8 history](docs/releases/v0.9.0-beta.8.md)
 · [Retained replay](docs/timeshift.md)
 · [Documentation](docs/README.md)
@@ -49,7 +49,7 @@ product archive or runtime acceptance.
 | Tuning and operations | [Configuration](docs/configuration.md) · [Troubleshooting](docs/troubleshooting.md) · [Audio inventory](tools/audioscan/README.md) |
 | Development and source distribution | [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Licensing](docs/licensing.md) |
 
-The installation examples target **v0.9.0**; verify its published assets before
+The installation examples target **v0.9.1**; verify its published assets before
 installing, and pin a verified image digest for production containers.
 Historical version differences remain explicit. In particular, set
 **both `OUTPACE_DATA_DIR` and `OUTPACE_CACHE_DIR`** when moving

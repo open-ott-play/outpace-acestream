@@ -52,6 +52,7 @@ f746d294bbe937dda3df6205e340700d81334f9f  signature/checksum of synthetic catalo
 
 # --- Immutable GitHub Actions revisions (verified upstream version refs) ---
 ecabd13d1c56bd1345c230e542e9144811ad706f  GitHub Actions commit for actions-rust-lang/setup-rust-toolchain@v2
+a188e68d0fd2bd36ad51dccb2b07ba6e75105f30  GitHub Actions commit for actions-rust-lang/setup-rust-toolchain@v2.0.1 (rust-cache v2.9.3 update)
 11d5960a326750d5838078e36cf38b85af677262  GitHub Actions commit for actions/checkout@v4
 3d3c42e5aac5ba805825da76410c181273ba90b1  GitHub Actions commit for actions/checkout@v7
 9000827ccba6bdab643e8b6fd33ac0654aef8333  GitHub Actions commit for actions/download-artifact@v8

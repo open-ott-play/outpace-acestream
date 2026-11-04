@@ -1,5 +1,40 @@
 use super::*;
 
+/// Read one descriptor-bounded internal cache entry. The peer-facing block API
+/// deliberately caps network requests at 16 KiB, while verified VOD pieces may
+/// contain many such chunks. Reject incomplete or short interior chunks instead
+/// of shifting subsequent bytes into the missing range.
+async fn cached_piece(
+    store: &Arc<tokio::sync::Mutex<PieceStore>>,
+    info: &VodInfo,
+    piece: u64,
+) -> Option<Bytes> {
+    let length = info.piece_size(piece);
+    if length == 0 || length > ace_swarm::resolve::MAX_PIECE_LENGTH || info.chunk_length == 0 {
+        return None;
+    }
+    let chunks = length.div_ceil(info.chunk_length);
+    if chunks > u64::from(u16::MAX) {
+        return None;
+    }
+    let (mut bytes, _) = PieceStore::shared_chunk(store, piece, 0).await?;
+    if bytes.len() as u64 != length.min(info.chunk_length) {
+        return None;
+    }
+    // Do not reserve a full piece for a miss: first confirm that its initial
+    // chunk is retained. A one-chunk piece reuses the returned allocation.
+    bytes.reserve_exact(length as usize - bytes.len());
+    for index in 1..chunks {
+        let (chunk, _) = PieceStore::shared_chunk(store, piece, index as u16).await?;
+        let expected = (length - index * info.chunk_length).min(info.chunk_length);
+        if chunk.len() as u64 != expected {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Some(Bytes::from(bytes))
+}
+
 /// The leading run of `[first_piece, end_piece)` already present in `cache`. Returns those pieces'
 /// bytes plus `download_from`, the first index still needing download — so `open_range` serves the
 /// cached prefix from memory and only fetches `[download_from, end_piece)`. For the common
@@ -14,9 +49,9 @@ async fn cached_prefix(
     let mut prefix = Vec::new();
     let mut p = first_piece;
     while p < end_piece {
-        match PieceStore::shared_block(store, p, 0, info.piece_size(p) as u32).await {
+        match cached_piece(store, info, p).await {
             Some(bytes) => {
-                prefix.push(Bytes::from(bytes));
+                prefix.push(bytes);
                 p += 1;
             }
             None => break,
@@ -35,8 +70,8 @@ pub(super) struct AceVodContent {
     pub(super) announce_peer_port: tokio::sync::watch::Receiver<Option<u16>>,
     /// Shared cache/reseed store and the producer lease anchoring its registry lifetime.
     pub(super) store: (Arc<tokio::sync::Mutex<PieceStore>>, SeedLease),
-    /// Peers discovered once and reused by every range read (VOD swarms are stable, unlike the
-    /// live edge). `None` until the first read discovers them.
+    /// Nonempty discovery results reused by every range read (VOD swarms are stable, unlike
+    /// the live edge). `None` until a read successfully discovers peers.
     pub(super) peers: Arc<tokio::sync::Mutex<Option<Vec<SocketAddrV4>>>>,
     /// Serializes cache inspection plus download streams so overlapping requests never fetch
     /// and write the same piece concurrently.
@@ -44,26 +79,41 @@ pub(super) struct AceVodContent {
 }
 
 impl AceVodContent {
-    /// Peers for this VOD, discovered once and cached. Bootstrap peers (tests / explicit config)
-    /// are used directly. VOD swarms are standard BitTorrent, discovered like the live path.
+    /// Peers for this VOD, cached after successful discovery. Bootstrap peers (tests / explicit
+    /// config) are used directly. VOD swarms are discovered like the live path.
     async fn peers(&self) -> Vec<SocketAddrV4> {
+        self.peers_with_discovery(async {
+            if self.bootstrap_peers.is_empty() {
+                let announce_port = self.announce_peer_port.borrow().unwrap_or(0);
+                discover_peers(
+                    &self.info.trackers,
+                    &self.info.infohash,
+                    &random_peer_id(),
+                    announce_port,
+                )
+                .await
+            } else {
+                self.bootstrap_peers.clone()
+            }
+        })
+        .await
+    }
+
+    /// Serialize cache misses while leaving discovery lazy for a cached result.
+    pub(super) async fn peers_with_discovery(
+        &self,
+        discovery: impl std::future::Future<Output = Vec<SocketAddrV4>>,
+    ) -> Vec<SocketAddrV4> {
         let mut guard = self.peers.lock().await;
         if let Some(peers) = guard.as_ref() {
             return peers.clone();
         }
-        let discovered = if self.bootstrap_peers.is_empty() {
-            let announce_port = self.announce_peer_port.borrow().unwrap_or(0);
-            discover_peers(
-                &self.info.trackers,
-                &self.info.infohash,
-                &random_peer_id(),
-                announce_port,
-            )
-            .await
-        } else {
-            self.bootstrap_peers.clone()
-        };
-        *guard = Some(discovered.clone());
+        let discovered = discovery.await;
+        // Empty tracker/DHT results can be transient. Return the miss to this
+        // caller without retrying; the next explicit request may discover again.
+        if !discovered.is_empty() {
+            *guard = Some(discovered.clone());
+        }
         discovered
     }
 }

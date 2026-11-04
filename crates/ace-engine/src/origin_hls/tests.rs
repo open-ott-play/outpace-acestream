@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::TcpListener;
 
 mod gzip;
+mod ownership;
 
 struct Fixture {
     address: std::net::SocketAddr,

@@ -89,6 +89,20 @@ class WorkflowContracts(unittest.TestCase):
                         if ref.startswith("actions/checkout@"):
                             self.assertEqual(step["with"]["persist-credentials"], "false")
 
+    def test_native_allocator_checks_cover_macos_and_release_binaries(self):
+        job = workflow("ci.yml")["jobs"]["macos-allocator"]
+        self.assertEqual(set(job["strategy"]["matrix"]["os"]), {"macos-15", "macos-15-intel"})
+        self.assertNotIn("if", job)
+        self.assertNotIn("continue-on-error", job)
+        self.assertIn("cargo test --locked -p ace-engine --bin outpace --test allocator_startup", steps_text(job))
+        steps = workflow("release.yml")["jobs"]["build-binaries"]["steps"]
+        check = next(step for step in steps if step.get("name") == "Check native release startup")
+        self.assertEqual(check["if"], "matrix.target != 'aarch64-unknown-linux-musl' && matrix.target != 'armv7-unknown-linux-musleabihf'")
+        self.assertIn("tools/release/check_startup.py", check["run"])
+        self.assertNotIn("continue-on-error", check)
+        package = next(step for step in steps if step.get("name") == "Package binary")
+        self.assertLess(steps.index(check), steps.index(package))
+
     def test_candidate_is_called_by_rc_pipeline_and_remains_read_only(self):
         doc = workflow("fuzz-candidate.yml")
         self.assertEqual(set(doc["on"]), {"workflow_call"})

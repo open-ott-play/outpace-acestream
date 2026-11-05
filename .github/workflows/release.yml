@@ -187,6 +187,17 @@ jobs:
         run: |
           cargo build --locked --release -p ace-engine --bin "$BIN_NAME" --target "${{ matrix.target }}" --message-format=json-render-diagnostics > cargo-build.json
 
+      - name: Check native release startup
+        # The two cross-compiled Linux ARM binaries cannot run on this x86 host.
+        if: matrix.target != 'aarch64-unknown-linux-musl' && matrix.target != 'armv7-unknown-linux-musleabihf'
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/${BIN_NAME}"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            binary="${binary}.exe"
+          fi
+          python3 tools/release/check_startup.py "$binary" "${{ needs.release-metadata.outputs.version }}"
+
       - name: Package binary
         shell: bash
         run: |

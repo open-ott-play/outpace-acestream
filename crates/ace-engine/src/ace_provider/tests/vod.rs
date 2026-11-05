@@ -235,15 +235,69 @@ async fn read_all(mut src: Box<dyn VodByteSource>) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn empty_vod_discovery_can_recover_on_the_next_explicit_request() {
+    let (content, info) = make_vod_content(32_768, 16_384, 32_768);
+    let served = Arc::new(AtomicU64::new(0));
+    let addr = spawn_counting_vod_seeder(content.clone(), info.clone(), served.clone()).await;
+    let registry = SeedRegistry::new();
+    let store = registry.lease_store(info.infohash, || PieceStore::new(32_768, 16_384, 65_536));
+    let vod = AceVodContent {
+        info,
+        bootstrap_peers: Vec::new(),
+        announce_peer_port: tokio::sync::watch::channel(None).1,
+        store,
+        peers: Arc::new(tokio::sync::Mutex::new(None)),
+        range_lock: Arc::new(tokio::sync::Mutex::new(())),
+    };
+    let discoveries = AtomicU64::new(0);
+    let first = vod
+        .peers_with_discovery(async {
+            discoveries.fetch_add(1, Ordering::SeqCst);
+            Vec::new()
+        })
+        .await;
+    assert!(first.is_empty());
+    assert_eq!(discoveries.load(Ordering::SeqCst), 1, "no automatic retry");
+
+    let next = vod
+        .peers_with_discovery(async {
+            discoveries.fetch_add(1, Ordering::SeqCst);
+            vec![addr]
+        })
+        .await;
+    assert_eq!(
+        next,
+        vec![addr],
+        "an empty lookup must not poison the cache"
+    );
+    assert_eq!(discoveries.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        vod.peers_with_discovery(async { panic!("nonempty peers are reused") })
+            .await,
+        vec![addr]
+    );
+    let bytes = tokio::time::timeout(Duration::from_secs(2), async {
+        read_all(vod.open_range(0, 32_767).await.unwrap()).await
+    })
+    .await
+    .expect("the next request plays through the recovered loopback peer");
+    assert_eq!(bytes, content);
+    assert_eq!(served.load(Ordering::SeqCst), 32_768);
+}
+
+#[tokio::test]
 async fn open_range_downloads_each_covering_piece_at_most_once() {
-    // 3 pieces of 16 bytes (one 16-byte block per piece). Two reads that both fall inside
-    // piece 0: the second must be served from the cache the first populated, not re-downloaded.
-    let (content, info) = make_vod_content(16, 16, 48);
+    // The cached piece is larger than the peer-facing 16 KiB request limit. An internal
+    // cache lookup must still reuse the whole verified piece for an overlapping range.
+    let piece_length = 32_768;
+    let (content, info) = make_vod_content(piece_length, 16_384, piece_length * 3);
     assert_eq!(info.piece_count(), 3);
     let served = Arc::new(AtomicU64::new(0));
     let addr = spawn_counting_vod_seeder(content.clone(), info.clone(), served.clone()).await;
     let registry = SeedRegistry::new();
-    let store = registry.lease_store(info.infohash, || PieceStore::new(16, 16, 128));
+    let store = registry.lease_store(info.infohash, || {
+        PieceStore::new(piece_length, 16_384, piece_length * 4)
+    });
     let vod = AceVodContent {
         info,
         bootstrap_peers: vec![addr],
@@ -255,15 +309,89 @@ async fn open_range_downloads_each_covering_piece_at_most_once() {
 
     let first = read_all(vod.open_range(0, 3).await.unwrap()).await;
     assert_eq!(first, content[0..=3]);
-    let second = read_all(vod.open_range(8, 11).await.unwrap()).await;
-    assert_eq!(second, content[8..=11]);
+    let second = read_all(vod.open_range(16_382, 16_387).await.unwrap()).await;
+    assert_eq!(second, content[16_382..=16_387]);
 
-    // Piece 0 is 16 bytes; both reads cover it, but the swarm served it exactly once.
+    // Both reads cover piece 0, but the swarm served it exactly once.
     assert_eq!(
         served.load(Ordering::SeqCst),
-        16,
+        piece_length,
         "the covering piece is downloaded once, then reused from cache"
     );
+}
+
+#[tokio::test]
+async fn large_cached_ranges_and_short_final_piece_need_no_peer_connection() {
+    const PIECE: u64 = 32_768;
+    const CHUNK: u64 = 16_384;
+    let (content, info) = make_vod_content(PIECE, CHUNK, PIECE * 2 - 7_000);
+    for disk in [false, true] {
+        let cache_dir =
+            std::env::temp_dir().join(format!("outpace-vod-cache-{}", rand::random::<u64>()));
+        let registry = SeedRegistry::new();
+        let store = registry.lease_store(info.infohash, || {
+            if disk {
+                PieceStore::new_disk(PIECE, CHUNK, PIECE * 4, cache_dir.clone()).unwrap()
+            } else {
+                PieceStore::new(PIECE, CHUNK, PIECE * 4)
+            }
+        });
+        for (piece, data) in content.chunks(PIECE as usize).enumerate() {
+            for (chunk, data) in data.chunks(CHUNK as usize).enumerate() {
+                PieceStore::shared_put_chunk_with_header(
+                    &store.0,
+                    piece as u64,
+                    chunk as u16,
+                    [0; 8],
+                    data,
+                )
+                .await;
+            }
+        }
+        // A cache miss would connect here and then stall waiting for a handshake.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+            unreachable!();
+        };
+        let vod = AceVodContent {
+            info: info.clone(),
+            bootstrap_peers: vec![addr],
+            announce_peer_port: tokio::sync::watch::channel(None).1,
+            store,
+            peers: Arc::new(tokio::sync::Mutex::new(None)),
+            range_lock: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        for (start, end) in [
+            (0, info.total_length - 1),
+            (CHUNK - 3, CHUNK + 5),
+            (PIECE + 7, info.total_length - 1),
+        ] {
+            let bytes = tokio::time::timeout(Duration::from_secs(2), async {
+                read_all(vod.open_range(start, end).await.unwrap()).await
+            })
+            .await
+            .expect("retained VOD data must be served without contacting a peer");
+            assert_eq!(bytes, content[start as usize..=end as usize]);
+        }
+        assert!(
+            vod.peers.lock().await.is_none(),
+            "cache hits skip discovery"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), listener.accept())
+                .await
+                .is_err()
+        );
+        drop(vod);
+        drop(registry);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while cache_dir.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("disk cache actor cleans up its directory");
+    }
 }
 
 #[tokio::test]

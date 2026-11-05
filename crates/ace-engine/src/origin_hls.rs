@@ -159,18 +159,31 @@ struct ResponseData {
     allocation: usize,
 }
 
-/// A response retains admission and viewer ownership until its body is consumed or dropped.
+/// Every response-body clone or slice retains admission and viewer ownership.
 pub struct OriginResponse {
     pub status: u16,
     pub content_type: String,
     pub content_range: Option<String>,
     pub content_length: u64,
     pub body: Bytes,
-    request: RequestGuard,
+    session: Arc<Session>,
+    history_generation: Option<u64>,
+}
+
+/// A queued slice can retain the full allocation after its HTTP stream reaches EOF.
+/// Keep its permits with the bytes, not just with the response or stream state.
+/// Cache entries and history records retain the original bytes without this owner.
+struct ResponseBodyOwner {
+    bytes: Bytes,
+    _request: RequestGuard,
     _admission: OwnedSemaphorePermit,
     _fetch: Option<OwnedSemaphorePermit>,
     _history: Option<Arc<Retained>>,
-    history_generation: Option<u64>,
+}
+impl AsRef<[u8]> for ResponseBodyOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 impl OriginResponse {
     pub fn into_stream(self) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
@@ -178,7 +191,7 @@ impl OriginResponse {
             if offset >= response.body.len() {
                 return None;
             }
-            if *response.request.session.cancel.borrow() {
+            if *response.session.cancel.borrow() {
                 let end = response.body.len();
                 return Some((
                     Err(std::io::Error::other("origin_cancelled")),
@@ -187,7 +200,6 @@ impl OriginResponse {
             }
             if response.history_generation.is_some_and(|generation| {
                 !response
-                    .request
                     .session
                     .inner
                     .lock()
@@ -539,11 +551,17 @@ impl OriginHls {
             .into(),
             content_range: None,
             content_length: body.len() as u64,
-            body,
-            request: RequestGuard { session, id: 0 },
-            _admission: admission,
-            _fetch: None,
-            _history: owner,
+            body: Bytes::from_owner(ResponseBodyOwner {
+                bytes: body,
+                _request: RequestGuard {
+                    session: session.clone(),
+                    id: 0,
+                },
+                _admission: admission,
+                _fetch: None,
+                _history: owner,
+            }),
+            session,
             history_generation: Some(generation),
         })
     }
@@ -626,11 +644,14 @@ impl OriginHls {
             content_type: result.content_type,
             content_range: result.content_range,
             content_length: result.body.len() as u64,
-            body: result.body,
-            request,
-            _admission: admission,
-            _fetch: fetch_permit,
-            _history: None,
+            body: Bytes::from_owner(ResponseBodyOwner {
+                bytes: result.body,
+                _request: request,
+                _admission: admission,
+                _fetch: fetch_permit,
+                _history: None,
+            }),
+            session,
             history_generation: None,
         })
     }
@@ -780,8 +801,8 @@ impl OriginHls {
                 }
             }
         }
-        // Retain the slot while the response is owned by a slow reader; otherwise
-        // completed 16 MiB resources could accumulate beyond the fetch memory bound.
+        // The returned response attaches this slot to every shared body slice;
+        // completed 16 MiB resources stay accounted for even after stream EOF.
         Ok((data, Some(fetch_permit)))
     }
     fn record(session: &Session, ticket: Option<CaptureTicket>, data: &ResponseData) {

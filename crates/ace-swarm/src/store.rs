@@ -242,8 +242,8 @@ impl PieceStore {
             (guard.chunk_length, guard.piece_length)
         };
         let end = u64::from(begin).checked_add(u64::from(length))?;
-        // Bound hostile request geometry before looping or allocating. BEP 3 blocks are normally
-        // 16 KiB; permit larger compatible requests up to one piece, but never beyond it.
+        // Bound hostile request geometry before looping or allocating. Peer requests are
+        // limited to 16 KiB above and must also stay inside the requested piece.
         if end > piece_length {
             return None;
         }

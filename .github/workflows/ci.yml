@@ -88,6 +88,25 @@ jobs:
       - name: Replay deterministic fuzz seeds
         run: cargo test --manifest-path fuzz/Cargo.toml --locked
 
+  macos-allocator:
+    name: macOS allocator (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
+        with:
+          build-warnings: ""
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Verify effective allocator options and silent startup
+        run: cargo test --locked -p ace-engine --bin outpace --test allocator_startup
+
   abcompare:
     name: A/B harness test
     runs-on: ubuntu-24.04

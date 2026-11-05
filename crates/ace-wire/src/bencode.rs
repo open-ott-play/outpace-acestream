@@ -7,6 +7,11 @@ use std::collections::BTreeMap;
 /// small deeply nested value cannot exhaust the stack.
 const MAX_DEPTH: usize = 32;
 
+/// Bound allocations for shallow messages too: a compact list of empty values can
+/// otherwise expand a valid peer frame into tens of MiB. Dictionary keys count
+/// toward the same budget, including keys that overwrite earlier entries.
+const MAX_VALUES: usize = 65_536;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Bencode {
     Int(i64),
@@ -18,7 +23,7 @@ pub enum Bencode {
 impl Bencode {
     /// Parse exactly one bencode value from the whole buffer; trailing bytes = error.
     pub fn parse(buf: &[u8]) -> Result<Bencode> {
-        let (v, n) = parse_value(buf, 0, 0)?;
+        let (v, n) = Self::parse_prefix(buf)?;
         if n != buf.len() {
             return Err(WireError::Invalid("trailing bytes"));
         }
@@ -27,7 +32,8 @@ impl Bencode {
 
     /// Parse one value from the front; return (value, bytes_consumed).
     pub fn parse_prefix(buf: &[u8]) -> Result<(Bencode, usize)> {
-        parse_value(buf, 0, 0)
+        let mut remaining = MAX_VALUES;
+        parse_value(buf, 0, 0, &mut remaining)
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -91,15 +97,29 @@ impl Bencode {
 
 /// `depth` is the number of container (list/dict) ancestors already open. It bounds
 /// recursion so untrusted, deeply nested bencode cannot exhaust the stack.
-fn parse_value(buf: &[u8], pos: usize, depth: usize) -> Result<(Bencode, usize)> {
+fn parse_value(
+    buf: &[u8],
+    pos: usize,
+    depth: usize,
+    remaining: &mut usize,
+) -> Result<(Bencode, usize)> {
+    consume_value(remaining)?;
     match buf.get(pos).ok_or(WireError::Truncated)? {
         b'i' => parse_int(buf, pos),
         b'l' | b'd' if depth >= MAX_DEPTH => Err(WireError::Invalid("bencode nesting too deep")),
-        b'l' => parse_list(buf, pos, depth),
-        b'd' => parse_dict(buf, pos, depth),
+        b'l' => parse_list(buf, pos, depth, remaining),
+        b'd' => parse_dict(buf, pos, depth, remaining),
         b'0'..=b'9' => parse_bytes(buf, pos),
         _ => Err(WireError::Invalid("unexpected bencode token")),
     }
+}
+
+fn consume_value(remaining: &mut usize) -> Result<()> {
+    if *remaining == 0 {
+        return Err(WireError::Invalid("too many bencode values"));
+    }
+    *remaining -= 1;
+    Ok(())
 }
 
 fn parse_int(buf: &[u8], pos: usize) -> Result<(Bencode, usize)> {
@@ -137,14 +157,19 @@ fn parse_bytes(buf: &[u8], pos: usize) -> Result<(Bencode, usize)> {
     Ok((Bencode::Bytes(buf[start..end].to_vec()), end))
 }
 
-fn parse_list(buf: &[u8], pos: usize, depth: usize) -> Result<(Bencode, usize)> {
+fn parse_list(
+    buf: &[u8],
+    pos: usize,
+    depth: usize,
+    remaining: &mut usize,
+) -> Result<(Bencode, usize)> {
     let mut i = pos + 1;
     let mut items = Vec::new();
     loop {
         match buf.get(i).ok_or(WireError::Truncated)? {
             b'e' => return Ok((Bencode::List(items), i + 1)),
             _ => {
-                let (v, n) = parse_value(buf, i, depth + 1)?;
+                let (v, n) = parse_value(buf, i, depth + 1, remaining)?;
                 items.push(v);
                 i = n;
             }
@@ -152,20 +177,26 @@ fn parse_list(buf: &[u8], pos: usize, depth: usize) -> Result<(Bencode, usize)> 
     }
 }
 
-fn parse_dict(buf: &[u8], pos: usize, depth: usize) -> Result<(Bencode, usize)> {
+fn parse_dict(
+    buf: &[u8],
+    pos: usize,
+    depth: usize,
+    remaining: &mut usize,
+) -> Result<(Bencode, usize)> {
     let mut i = pos + 1;
     let mut map = BTreeMap::new();
     loop {
         match buf.get(i).ok_or(WireError::Truncated)? {
             b'e' => return Ok((Bencode::Dict(map), i + 1)),
             _ => {
+                consume_value(remaining)?;
                 let (k, n) = parse_bytes(buf, i)?;
                 let key = if let Bencode::Bytes(b) = k {
                     b
                 } else {
                     unreachable!()
                 };
-                let (v, n2) = parse_value(buf, n, depth + 1)?;
+                let (v, n2) = parse_value(buf, n, depth + 1, remaining)?;
                 map.insert(key, v);
                 i = n2;
             }
@@ -238,5 +269,78 @@ mod tests {
         // A small input can still describe very deep recursion; this must return a
         // clean error rather than exhausting the stack.
         assert!(Bencode::parse(&nested(b'l', 100_000)).is_err());
+    }
+
+    fn flat_list(items: usize) -> Vec<u8> {
+        let mut bytes = vec![b'l'];
+        for _ in 0..items {
+            bytes.extend_from_slice(b"le");
+        }
+        bytes.push(b'e');
+        bytes
+    }
+
+    #[test]
+    fn bounds_shallow_list_values_including_the_root() {
+        let at_limit = flat_list(MAX_VALUES - 1);
+        let Bencode::List(items) = Bencode::parse(&at_limit).unwrap() else {
+            panic!("expected list");
+        };
+        assert_eq!(items.len(), MAX_VALUES - 1);
+        assert_eq!(
+            Bencode::parse(&flat_list(MAX_VALUES)),
+            Err(WireError::Invalid("too many bencode values")),
+        );
+    }
+
+    fn flat_dictionary(duplicate_keys: bool, extra_value: bool) -> Vec<u8> {
+        let mut bytes = vec![b'd'];
+        // Root + key/value pairs consume MAX_VALUES - 3 values. The final
+        // key, list and empty nested list use the remaining three exactly.
+        for index in 0..(MAX_VALUES - 4) / 2 {
+            let key = if duplicate_keys {
+                "k".to_string()
+            } else {
+                format!("k{index}")
+            };
+            bytes.extend_from_slice(format!("{}:{key}i1e", key.len()).as_bytes());
+        }
+        bytes.extend_from_slice(b"1:zlle");
+        if extra_value {
+            bytes.extend_from_slice(b"le");
+        }
+        bytes.extend_from_slice(b"ee");
+        bytes
+    }
+
+    #[test]
+    fn bounds_dictionary_keys_and_values_even_when_keys_are_overwritten() {
+        for duplicate_keys in [false, true] {
+            assert!(Bencode::parse(&flat_dictionary(duplicate_keys, false)).is_ok());
+            assert_eq!(
+                Bencode::parse(&flat_dictionary(duplicate_keys, true)),
+                Err(WireError::Invalid("too many bencode values")),
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_budget_does_not_count_opaque_trailing_bytes() {
+        let mut bytes = flat_list(MAX_VALUES - 1);
+        let consumed = bytes.len();
+        bytes.extend_from_slice(&flat_list(MAX_VALUES));
+        let (value, actual) = Bencode::parse_prefix(&bytes).unwrap();
+        assert_eq!(actual, consumed);
+        assert!(matches!(value, Bencode::List(_)));
+        assert_eq!(
+            Bencode::parse(&bytes),
+            Err(WireError::Invalid("trailing bytes"))
+        );
+    }
+
+    #[test]
+    fn preserves_permissive_integer_and_duplicate_key_handling() {
+        let value = Bencode::parse(b"d1:ki01e1:ki+2ee").unwrap();
+        assert_eq!(value.get(b"k").and_then(Bencode::as_int), Some(2));
     }
 }

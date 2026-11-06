@@ -82,7 +82,7 @@ class UbuntuMirrorTests(unittest.TestCase):
             guard = guards[0]
             install = next(step for step in steps if step.get("name") == install_name)
             self.assertLess(steps.index(guard), steps.index(install))
-            self.assertEqual(guard["if"], "${{ runner.environment == 'github-hosted' && runner.os == 'Linux' }}")
+            self.assertEqual(guard["if"], "${{ (needs.scope.outputs.run == 'true') && (runner.environment == 'github-hosted' && runner.os == 'Linux') }}")
             self.assertIn("tools/ci/prepare_ubuntu_mirrors.cjs", guard["run"])
             self.assertNotIn("continue-on-error", guard)
             self.assertEqual(install["run"], "sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg")

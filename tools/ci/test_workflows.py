@@ -24,6 +24,24 @@ def steps_text(job):
 
 
 class WorkflowContracts(unittest.TestCase):
+    def test_required_contexts_reject_failed_or_unproven_scope(self):
+        import os
+        import subprocess
+        ci = workflow("ci.yml")
+        self.assertEqual(ci["on"]["workflow_call"]["inputs"]["force-full"]["default"], "true")
+        self.assertIn("--require-path README.md", steps_text(ci["jobs"]["scope"]))
+        for job_id in ("lint", "test", "hls-audio-synthetic"):
+            job = ci["jobs"][job_id]
+            proof = job["steps"][0]
+            self.assertEqual(proof["name"], "Require proven change classification")
+            for result in ("success", "failure", "skipped", "cancelled", ""):
+                for run, reason in (("true", "changed"), ("false", "documentation-only"), ("false", ""), ("", "documentation-only")):
+                    env = {**os.environ, "SCOPE_RESULT": result, "SCOPE_RUN": run, "SCOPE_REASON": reason}
+                    actual = subprocess.run(["sh", "-c", proof["run"]], env=env, capture_output=True).returncode
+                    self.assertEqual(actual == 0, result == "success" and (run == "true" or (run == "false" and reason == "documentation-only")))
+            for step in job["steps"][1:-1]:
+                self.assertIn("needs.scope.outputs.run == 'true'", step["if"])
+
     def test_required_checks_always_run_for_pull_requests(self):
         ci = workflow("ci.yml")
         hygiene = workflow("hygiene.yml")
@@ -40,7 +58,11 @@ class WorkflowContracts(unittest.TestCase):
         for job_id, name in expected.items():
             job = ci["jobs"][job_id]
             self.assertEqual(job["name"], name)
-            self.assertNotIn("if", job)
+            if job_id == "abcompare":
+                self.assertNotIn("if", job)
+            else:
+                self.assertEqual(job["if"], "${{ always() }}")
+                self.assertEqual(job["needs"], "scope")
             self.assertNotIn("continue-on-error", job)
         identifier = hygiene["jobs"]["identifiers"]
         self.assertEqual(identifier["name"], "acestream identifier hygiene")
@@ -64,7 +86,7 @@ class WorkflowContracts(unittest.TestCase):
         self.assertEqual(step["run"],
                          "cargo test -p ace-engine --lib --locked " + target
                          + " -- --ignored --exact --nocapture")
-        self.assertNotIn("if", step)
+        self.assertEqual(step["if"], "${{ needs.scope.outputs.run == 'true' }}")
         self.assertNotIn("continue-on-error", step)
         self.assertTrue(any("apt-get install" in previous.get("run", "")
                             and "ffmpeg" in previous["run"]
@@ -92,7 +114,8 @@ class WorkflowContracts(unittest.TestCase):
     def test_native_allocator_checks_cover_macos_and_release_binaries(self):
         job = workflow("ci.yml")["jobs"]["macos-allocator"]
         self.assertEqual(set(job["strategy"]["matrix"]["os"]), {"macos-15", "macos-15-intel"})
-        self.assertNotIn("if", job)
+        self.assertEqual(job["if"], "${{ needs.scope.outputs.run == 'true' }}")
+        self.assertEqual(job["needs"], "scope")
         self.assertNotIn("continue-on-error", job)
         self.assertIn("cargo test --locked -p ace-engine --bin outpace --test allocator_startup", steps_text(job))
         steps = workflow("release.yml")["jobs"]["build-binaries"]["steps"]

@@ -6,7 +6,7 @@ name: outpace
 
 services:
   outpace:
-    image: ${OUTPACE_IMAGE:-ghcr.io/open-ott-play/outpace-acestream:0.9.3}
+    image: ${OUTPACE_IMAGE:-ghcr.io/open-ott-play/outpace-acestream:0.9.4}
     network_mode: host
     restart: unless-stopped
     environment:

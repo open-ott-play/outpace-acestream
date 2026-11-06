@@ -5,6 +5,11 @@ name: CI
 # checks stay "Pending" forever and block the pull request.
 on:
   workflow_call:
+    inputs:
+      force-full:
+        description: Keep full validation for release callers
+        type: boolean
+        default: true
   pull_request:
   push:
     branches: [main]
@@ -22,15 +27,43 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  scope:
+    name: Change scope
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: scope
+        env:
+          FORCE_FULL: ${{ inputs.force-full || false }}
+        run: |
+          args=(--require-path README.md)
+          if [ "$FORCE_FULL" = true ]; then args+=(--force); fi
+          python3 tools/ci/change_scope.py "${args[@]}"
   # The job names are the check contexts that the main ruleset requires.
   # Renaming a job leaves the ruleset waiting on the old name and blocks every PR,
   # so update the ruleset in the same change.
   lint:
+    needs: scope
+    if: ${{ always() }}
     name: Rust lint
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
+      - name: Require proven change classification
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          SCOPE_RUN: ${{ needs.scope.outputs.run }}
+          SCOPE_REASON: ${{ needs.scope.outputs.reason }}
+        run: test "$SCOPE_RESULT" = success && { test "$SCOPE_RUN" = true || { test "$SCOPE_RUN" = false && test "$SCOPE_REASON" = documentation-only; }; }
       - name: Checkout
+        if: ${{ needs.scope.outputs.run == 'true' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
@@ -39,35 +72,54 @@ jobs:
       # The bundled Swatinem/rust-cache restores on every run but saves only from
       # main, so pull requests reuse main's cache without filling the cache quota.
       - name: Install Rust
+        if: ${{ needs.scope.outputs.run == 'true' }}
         uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
         with:
           build-warnings: ""
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check formatting
+        if: ${{ needs.scope.outputs.run == 'true' }}
         run: cargo fmt --all --check
 
       - name: Check deterministic fuzz target formatting
+        if: ${{ needs.scope.outputs.run == 'true' }}
         run: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
 
       - name: Clippy
+        if: ${{ needs.scope.outputs.run == 'true' }}
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Lint deterministic fuzz targets
+        if: ${{ needs.scope.outputs.run == 'true' }}
         run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
 
+      - name: Report documentation-only result
+        if: ${{ needs.scope.outputs.run == 'false' }}
+        run: echo 'Complete diff is documentation-only; expensive validation was not exercised.'
+
   test:
+    needs: scope
+    if: ${{ always() }}
     name: Rust test
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
+      - name: Require proven change classification
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          SCOPE_RUN: ${{ needs.scope.outputs.run }}
+          SCOPE_REASON: ${{ needs.scope.outputs.reason }}
+        run: test "$SCOPE_RESULT" = success && { test "$SCOPE_RUN" = true || { test "$SCOPE_RUN" = false && test "$SCOPE_REASON" = documentation-only; }; }
       - name: Checkout
+        if: ${{ needs.scope.outputs.run == 'true' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
       # Same toolchain and cache policy as the lint job.
       - name: Install Rust
+        if: ${{ needs.scope.outputs.run == 'true' }}
         uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
         with:
           build-warnings: ""
@@ -75,20 +127,29 @@ jobs:
 
       # The RTMP loopback test self-skips without ffmpeg; the hosted image has none.
       - name: Prefer the provisioned Ubuntu archive fallback
-        if: ${{ runner.environment == 'github-hosted' && runner.os == 'Linux' }}
+        if: ${{ (needs.scope.outputs.run == 'true') && (runner.environment == 'github-hosted' && runner.os == 'Linux') }}
         run: sudo env RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS" "$(command -v node)" tools/ci/prepare_ubuntu_mirrors.cjs
 
       - name: Install ffmpeg
+        if: ${{ needs.scope.outputs.run == 'true' }}
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
 
       # Live-network tests are #[ignore]d, so the default run stays offline.
       - name: Test
+        if: ${{ needs.scope.outputs.run == 'true' }}
         run: cargo test --workspace --locked
 
       - name: Replay deterministic fuzz seeds
+        if: ${{ needs.scope.outputs.run == 'true' }}
         run: cargo test --manifest-path fuzz/Cargo.toml --locked
 
+      - name: Report documentation-only result
+        if: ${{ needs.scope.outputs.run == 'false' }}
+        run: echo 'Complete diff is documentation-only; expensive validation was not exercised.'
+
   macos-allocator:
+    needs: scope
+    if: ${{ needs.scope.outputs.run == 'true' }}
     name: macOS allocator (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
@@ -141,36 +202,54 @@ jobs:
         run: python3 -m unittest discover -s tools/audioscan -v
 
   hls-audio-synthetic:
+    needs: scope
+    if: ${{ always() }}
     name: HLS audio synthetic
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
+      - name: Require proven change classification
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          SCOPE_RUN: ${{ needs.scope.outputs.run }}
+          SCOPE_REASON: ${{ needs.scope.outputs.reason }}
+        run: test "$SCOPE_RESULT" = success && { test "$SCOPE_RUN" = true || { test "$SCOPE_RUN" = false && test "$SCOPE_REASON" = documentation-only; }; }
       - name: Checkout
+        if: ${{ needs.scope.outputs.run == 'true' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Install Rust
+        if: ${{ needs.scope.outputs.run == 'true' }}
         uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
         with:
           build-warnings: ""
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Prefer the provisioned Ubuntu archive fallback
-        if: ${{ runner.environment == 'github-hosted' && runner.os == 'Linux' }}
+        if: ${{ (needs.scope.outputs.run == 'true') && (runner.environment == 'github-hosted' && runner.os == 'Linux') }}
         run: sudo env RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_OS="$RUNNER_OS" "$(command -v node)" tools/ci/prepare_ubuntu_mirrors.cjs
       - name: Install synthetic media tools
+        if: ${{ needs.scope.outputs.run == 'true' }}
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       # The opted-in suite verifies every required encoder/generator and ffprobe;
       # missing tools or capabilities are failures, never successful skips.
       - name: Synthetic codec and lifecycle acceptance
+        if: ${{ needs.scope.outputs.run == 'true' }}
         env:
           OUTPACE_TEST_HLS_AUDIO_FFMPEG: "1"
         run: cargo test -p ace-engine --test hls_audio_ffmpeg --locked -- --nocapture
 
       - name: Retained replay with decoded media and independent viewers
+        if: ${{ needs.scope.outputs.run == 'true' }}
         run: cargo test -p ace-engine --test media_history --locked generated_media_rewinds_decodes_and_returns_live_without_moving_another_viewer -- --ignored --exact --nocapture
 
       - name: Managed origin HLS with decoded TS and fMP4 media
+        if: ${{ needs.scope.outputs.run == 'true' }}
         run: cargo test -p ace-engine --lib --locked origin_hls::tests::generated_origin_hls_ts_and_fmp4_decode -- --ignored --exact --nocapture
 
       - name: Retained origin TS decodes after the origin removes its media
+        if: ${{ needs.scope.outputs.run == 'true' }}
         run: cargo test -p ace-engine --lib --locked origin_hls::tests::generated_origin_ts_archive_decodes_after_origin_removal -- --ignored --exact --nocapture
+      - name: Report documentation-only result
+        if: ${{ needs.scope.outputs.run == 'false' }}
+        run: echo 'Complete diff is documentation-only; expensive validation was not exercised.'

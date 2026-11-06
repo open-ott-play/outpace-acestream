@@ -172,3 +172,14 @@ offer; linking to an unrelated release is insufficient.
 Keep source access reachable through integrations and reverse proxies. Read
 [licensing and source distribution](docs/licensing.md) for the packaging workflow,
 modified builds and the limits of reproducibility claims.
+
+### Documentation-only CI
+
+The CI workflow classifies complete PR and push diffs. Ordinary documentation
+updates skip Rust compilation, synthetic media runs and macOS allocator jobs.
+The existing required Linux check names still report an explicit proof of the
+reduced path; failed or missing classification cannot pass them. A/B/source
+contracts, identifier hygiene and independent security scanning remain active.
+`README.md` stays a required full-validation input because the source bundle
+requires it. Release callers default to full validation. Code, fixtures, hidden
+paths, file-mode changes and uncertain history also keep the full path.

@@ -5,6 +5,11 @@ for production downloads, or [all releases](https://github.com/open-ott-play/out
 to select an explicitly numbered beta. These source notes describe changes;
 the GitHub release page determines whether a version and its assets are published.
 
+## 0.9.6 series
+
+- [0.9.6-beta.1](v0.9.6-beta.1.md): descriptor identity and protection checks,
+  reduced peer-wire copying, bounded peer-control work and optional session admission.
+
 ## 0.9.5 series
 
 - [0.9.5](v0.9.5.md): stable consolidation of metadata, memory ownership and

@@ -6,8 +6,8 @@ player opens the HTTP or HLS output. Optional HLS audio normalization needs an
 operator-installed FFmpeg; ordinary playback does not automatically install or
 invoke it.
 
-This guide targets **v0.9.1**. Check the
-[release page](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.1)
+This guide targets **v0.9.4**. Check the
+[release page](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.4)
 and verify that its assets have been published before installing. Commands below describe a fresh install;
 use [Upgrade and rollback](#upgrade-and-rollback) for an existing service.
 
@@ -36,7 +36,7 @@ filename; it is not a command-line argument.
 | Windows | ARM64 | `aarch64-pc-windows-msvc` | `.zip` |
 
 For example, the Apple Silicon archive is
-`outpace-0.9.1-aarch64-apple-darwin.tar.gz`. Its top-level directory has the same
+`outpace-0.9.4-aarch64-apple-darwin.tar.gz`. Its top-level directory has the same
 name without `.tar.gz`. The Windows executable is `outpace.exe`; the others are
 `outpace`.
 
@@ -61,7 +61,7 @@ refuses to replace an existing executable or package directory.
 ```sh
 (
   set -eu
-  version=0.9.1
+  version=0.9.4
   target=aarch64-apple-darwin # Change this for your machine.
   case "$target" in
     x86_64-unknown-linux-musl|aarch64-unknown-linux-musl|armv7-unknown-linux-musleabihf|x86_64-apple-darwin|aarch64-apple-darwin) ;;
@@ -319,7 +319,7 @@ $ErrorActionPreference = 'Stop'
 if ($PSVersionTable.PSVersion -lt [version]'7.5') {
     throw 'Use PowerShell 7.5 or later for this recipe.'
 }
-$Version = '0.9.1'
+$Version = '0.9.4'
 $Target = 'x86_64-pc-windows-msvc' # Use aarch64-pc-windows-msvc on Windows ARM64.
 if ($Target -notin @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')) {
     throw 'Select a Windows target from the architecture table.'

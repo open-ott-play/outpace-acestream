@@ -5,6 +5,8 @@ engine maintained at [open-ott-play/outpace-acestream](https://github.com/open-o
 The executable is `outpace`. It acquires and serves media; a separate player or
 proxy supplies the viewing interface and channel catalog.
 
+[Latest stable release](https://github.com/open-ott-play/outpace-acestream/releases/latest) · [Release notes](releases/README.md)
+
 ## Install and play
 
 | Goal | Read |
@@ -16,7 +18,7 @@ proxy supplies the viewing interface and channel catalog.
 | Select environment values and buffering limits | [Configuration reference](configuration.md) |
 | Diagnose startup, codecs, network, cache or deployment problems | [Troubleshooting](troubleshooting.md) |
 
-Start with the platform-specific recipe. The examples target v0.9.0; verify
+Start with the platform-specific recipe. The examples pin the published stable v0.9.4; verify
 the published assets and source before installing. Historical version
 differences remain explicit.
 Preserve the data directory across upgrades; use the upgrade and rollback

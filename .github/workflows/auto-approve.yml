@@ -15,7 +15,7 @@ jobs:
   auto-approve:
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
-      contains(fromJSON('["4alvit","californiantiramisu"]'), github.event.pull_request.user.login) &&
+      contains(fromJSON('["4alvit","californiantiramisu","renovate[bot]"]'), github.event.pull_request.user.login) &&
       contains(github.event.pull_request.labels.*.name, 'automerge') &&
       !github.event.pull_request.draft
     permissions:

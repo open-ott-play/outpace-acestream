@@ -140,10 +140,21 @@ impl Drop for Charge {
         *self.budget.used.lock().unwrap() -= self.bytes;
     }
 }
+/// A replay response may retain a clone or slice after history pruning or shutdown.
+/// Keep the global charge with those bytes, without charging independent live owners.
+struct HistoryBytes {
+    bytes: Bytes,
+    _charge: Charge,
+}
+impl AsRef<[u8]> for HistoryBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
 struct Segment {
     seq: u64,
     bytes: Bytes,
-    _charge: Charge,
+    allocation: usize,
     duration: f32,
     start_ms: u64,
     end_ms: u64,
@@ -177,7 +188,7 @@ impl HistoryStore {
     }
     fn pop_front(&mut self) {
         if let Some(segment) = self.segments.pop_front() {
-            self.used -= segment._charge.bytes;
+            self.used -= segment.allocation;
         }
     }
     fn clear(&mut self) {
@@ -256,8 +267,11 @@ impl HistoryStore {
         self.used += allocation;
         self.segments.push_back(Segment {
             seq,
-            bytes,
-            _charge: charge,
+            bytes: Bytes::from_owner(HistoryBytes {
+                bytes,
+                _charge: charge,
+            }),
+            allocation,
             duration,
             start_ms,
             end_ms,
@@ -627,6 +641,82 @@ mod tests {
         drop(a);
         assert_eq!(*budget.used.lock().unwrap(), 100);
         drop(b);
+        assert_eq!(*budget.used.lock().unwrap(), 0);
+    }
+    #[test]
+    fn replay_slice_keeps_global_charge_after_history_is_pruned() {
+        let now = Instant::now();
+        let budget = HistoryBudget::new(1024);
+        let config = HlsHistoryConfig {
+            global_max_bytes: 1024,
+            ..config()
+        };
+        let mut store = HistoryStore::new(config, budget.clone());
+        let mut other = HistoryStore::new(config, budget.clone());
+        let mut allocation = vec![0x47; 800];
+        allocation.truncate(100);
+        let bytes = Bytes::from(allocation);
+        let original_ptr = bytes.as_ptr();
+        store.push(0, bytes.clone(), 800, 5.0, false, true, now);
+        let view = store.prepare(Duration::from_secs(1), now).unwrap();
+        let response = store.segment(&view, 0, now).unwrap();
+        let slice = response.slice(0..1);
+        assert_eq!(response.as_ptr(), original_ptr, "history remains zero-copy");
+        drop(response);
+
+        let later = now + Duration::from_secs(61);
+        store.prune(later);
+        assert_eq!(store.status(later).retained_bytes, 0);
+        assert_eq!(*budget.used.lock().unwrap(), 800);
+        other.push(
+            0,
+            Bytes::from(vec![0x48; 800]),
+            800,
+            5.0,
+            false,
+            true,
+            later,
+        );
+        assert_eq!(other.status(later).retained_bytes, 0);
+        drop(store);
+        assert_eq!(*budget.used.lock().unwrap(), 800);
+        assert_eq!(&slice[..], &[0x47]);
+
+        drop(slice);
+        assert_eq!(*budget.used.lock().unwrap(), 0);
+        // Unwrapped live/cache owners do not retain the history-specific charge.
+        assert_eq!(bytes.as_ptr(), original_ptr);
+        other.push(
+            1,
+            Bytes::from(vec![0x49; 800]),
+            800,
+            5.0,
+            false,
+            true,
+            later,
+        );
+        assert_eq!(other.status(later).retained_bytes, 800);
+    }
+    #[test]
+    fn replay_clone_keeps_global_charge_after_store_is_dropped() {
+        let now = Instant::now();
+        let budget = HistoryBudget::new(1024);
+        let mut store = HistoryStore::new(
+            HlsHistoryConfig {
+                global_max_bytes: 1024,
+                ..config()
+            },
+            budget.clone(),
+        );
+        push(&mut store, 0, true, now);
+        let view = store.prepare(Duration::from_secs(1), now).unwrap();
+        let response = store.segment(&view, 0, now).unwrap();
+        let clone = response.clone();
+        drop(store);
+        assert_eq!(*budget.used.lock().unwrap(), 100);
+        drop(response);
+        assert_eq!(*budget.used.lock().unwrap(), 100);
+        drop(clone);
         assert_eq!(*budget.used.lock().unwrap(), 0);
     }
     #[test]

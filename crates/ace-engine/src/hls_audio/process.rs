@@ -2195,9 +2195,27 @@ fn resolve_executable_with(
 
 async fn preflight_prepared(
     prepared: &PreparedNormalizer,
-    mut cancel: watch::Receiver<bool>,
+    cancel: watch::Receiver<bool>,
     deadline: Instant,
 ) -> Result<(), HlsPreflightError> {
+    preflight_prepared_with(prepared, deadline, |command, input, deadline| {
+        let mut cancel = cancel.clone();
+        async move { probe(command, input, &mut cancel, deadline).await }
+    })
+    .await
+}
+
+// Keep capability sequencing independent of OS process startup so its aggregate
+// deadline can be tested with a controlled clock and the same per-probe cutoff.
+async fn preflight_prepared_with<F, Fut>(
+    prepared: &PreparedNormalizer,
+    deadline: Instant,
+    mut execute: F,
+) -> Result<(), HlsPreflightError>
+where
+    F: FnMut(Command, Vec<u8>, Instant) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, HlsPreflightError>>,
+{
     let probes: &[(&str, &[&str])] = &[
         ("-demuxers", &["mpegts"]),
         ("-muxers", &["mpegts"]),
@@ -2212,7 +2230,7 @@ async fn preflight_prepared(
         if let Some(fake) = test_support::probe_command_for(prepared, &["-hide_banner", argument]) {
             command = fake;
         }
-        let capture = probe(command, Vec::new(), &mut cancel, deadline).await?;
+        let capture = execute(command, Vec::new(), deadline).await?;
         let output =
             std::str::from_utf8(&capture).map_err(|_| HlsPreflightError::Capability("listing"))?;
         for capability in *required {
@@ -2236,7 +2254,7 @@ async fn preflight_prepared(
         .unwrap_or_else(|| build_command(prepared, &layout));
     #[cfg(not(test))]
     let smoke_command = build_command(prepared, &layout);
-    let output = probe(smoke_command, input, &mut cancel, deadline).await?;
+    let output = execute(smoke_command, input, deadline).await?;
     validate_smoke(&output, layout)
 }
 fn validate_smoke(output: &[u8], layout: TransportLayout) -> Result<(), HlsPreflightError> {
@@ -2269,6 +2287,11 @@ fn validate_smoke(output: &[u8], layout: TransportLayout) -> Result<(), HlsPrefl
 }
 
 const PROBE_CAPTURE: usize = 256 * 1024;
+
+fn probe_deadline(aggregate: Instant) -> Instant {
+    aggregate.min(Instant::now() + Duration::from_secs(5))
+}
+
 /// Exactly three owned pumps, fixed reads and bounded capture. Finite preflight
 /// exit is expected; streaming run_child deliberately treats the same exit as fatal.
 async fn probe(
@@ -2280,7 +2303,7 @@ async fn probe(
     if *cancel.borrow() {
         return Err(HlsPreflightError::Cancelled);
     }
-    let deadline = aggregate.min(Instant::now() + Duration::from_secs(5));
+    let deadline = probe_deadline(aggregate);
     if Instant::now() >= deadline {
         return Err(HlsPreflightError::Timeout);
     }
@@ -2426,10 +2449,55 @@ mod task4_preflight_tests {
     use super::*;
     use test_support::{fake_prepared_child, process_test_lock, ChildMode};
 
+    // Restore before releasing process_test_lock, including when an assertion
+    // panics, so later fake children never inherit another test's probe settings.
+    struct RestoreEnv {
+        key: &'static str,
+        value: Option<std::ffi::OsString>,
+    }
+
+    impl RestoreEnv {
+        fn capture(key: &'static str) -> Self {
+            Self {
+                key,
+                value: std::env::var_os(key),
+            }
+        }
+    }
+
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            match &self.value {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_environment_restores_existing_and_absent_values_after_panic() {
+        let _serial = process_test_lock().await;
+        const KEY: &str = "OUTPACE_TEST_HLS_AUDIO_ENV_GUARD";
+        let _restore = RestoreEnv::capture(KEY);
+        for previous in [Some("previous"), None] {
+            match previous {
+                Some(value) => std::env::set_var(KEY, value),
+                None => std::env::remove_var(KEY),
+            }
+            let result = std::panic::catch_unwind(|| {
+                let _restore = RestoreEnv::capture(KEY);
+                std::env::set_var(KEY, "temporary");
+                panic!("synthetic assertion failure");
+            });
+            assert!(result.is_err());
+            assert_eq!(std::env::var_os(KEY), previous.map(Into::into));
+        }
+    }
+
     #[tokio::test]
     async fn preflight_path_resolution_is_canonical_and_survives_path_mutation() {
         let _serial = process_test_lock().await;
-        let old_path = std::env::var_os("PATH");
+        let restore_path = RestoreEnv::capture("PATH");
         let root = test_directory("outpace-hls-path");
         let first = root.join("first");
         let second = root.join("second");
@@ -2460,10 +2528,7 @@ mod task4_preflight_tests {
             "the mutated PATH no longer contains the binary name"
         );
 
-        match old_path {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
-        }
+        drop(restore_path);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2500,7 +2565,7 @@ mod task4_preflight_tests {
     #[tokio::test]
     async fn preflight_requires_each_mpeg_audio_decoder_capability() {
         let _serial = process_test_lock().await;
-        let old = std::env::var_os("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY");
+        let _restore = RestoreEnv::capture("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY");
         for missing in ["mp2", "mp3", "ac3"] {
             std::env::set_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY", missing);
             let (prepared, _) = fake_prepared_child(ChildMode::CapabilityListing);
@@ -2513,16 +2578,12 @@ mod task4_preflight_tests {
                 "missing required decoder {missing} should be reported exactly"
             );
         }
-        match old {
-            Some(value) => std::env::set_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY", value),
-            None => std::env::remove_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY"),
-        }
     }
 
     #[tokio::test]
     async fn preflight_accepts_missing_layer_one_decoder_when_required_codecs_exist() {
         let _serial = process_test_lock().await;
-        let old = std::env::var_os("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY");
+        let _restore = RestoreEnv::capture("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY");
         std::env::set_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY", "mp1");
         let (prepared, _) = fake_prepared_child(ChildMode::CapabilityListing);
         let (_cancel_tx, cancel) = watch::channel(false);
@@ -2533,17 +2594,13 @@ mod task4_preflight_tests {
             Err(HlsPreflightError::Smoke),
             "Layer I absence is not a capability failure; the fake smoke output still fails later"
         );
-        match old {
-            Some(value) => std::env::set_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY", value),
-            None => std::env::remove_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY"),
-        }
     }
 
     #[tokio::test]
     async fn preflight_runs_all_capability_probes_sequentially_before_smoke() {
         let _serial = process_test_lock().await;
         reset_probe_test_counts();
-        let old = std::env::var_os("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY");
+        let _restore = RestoreEnv::capture("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY");
         std::env::remove_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY");
         let (prepared, _) = fake_prepared_child(ChildMode::CapabilityListing);
         let (_cancel_tx, cancel) = watch::channel(false);
@@ -2554,38 +2611,55 @@ mod task4_preflight_tests {
         );
         let (started, reaped, pumps, joined) = probe_test_counts();
         assert_eq!((started, reaped, pumps, joined), (6, 6, 18, 18));
-        match old {
-            Some(value) => std::env::set_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY", value),
-            None => std::env::remove_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY"),
-        }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn preflight_capability_sequence_obeys_one_ten_second_aggregate_deadline() {
-        let _serial = process_test_lock().await;
-        reset_probe_test_counts();
-        let old = std::env::var_os("OUTPACE_TEST_HLS_AUDIO_PROBE_DELAY_MS");
-        std::env::set_var("OUTPACE_TEST_HLS_AUDIO_PROBE_DELAY_MS", "2000");
-        let (prepared, _) = fake_prepared_child(ChildMode::CapabilityListing);
-        let (_cancel_tx, cancel) = watch::channel(false);
+        let prepared = PreparedNormalizer {
+            executable: PathBuf::from("synthetic-preflight-executable"),
+        };
         let start = Instant::now();
-        let result = preflight_prepared(&prepared, cancel, start + Duration::from_secs(10)).await;
+        let deadline = start + Duration::from_secs(10);
+        let listings = [
+            ("-demuxers", " D mpegts\n"),
+            ("-muxers", " E mpegts\n"),
+            ("-encoders", " A aac\n"),
+            ("-decoders", " A mp2\n A mp3\n A ac3\n"),
+            ("-protocols", "pipe\n"),
+        ];
+        let mut started = 0;
+        let result = preflight_prepared_with(&prepared, deadline, |command, input, aggregate| {
+            assert_eq!(
+                aggregate, deadline,
+                "each probe shares the original deadline"
+            );
+            assert!(input.is_empty(), "the smoke probe must not start");
+            let (argument, listing) = listings[started];
+            assert_eq!(
+                command.as_std().get_args().collect::<Vec<_>>(),
+                ["-hide_banner", argument],
+                "capability probes execute in order"
+            );
+            started += 1;
+            async move {
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(probe_deadline(aggregate)) => {
+                        Err(HlsPreflightError::Timeout)
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                        Ok(listing.as_bytes().to_vec())
+                    }
+                }
+            }
+        })
+        .await;
         assert_eq!(result, Err(HlsPreflightError::Timeout));
-        let elapsed = Instant::now().duration_since(start);
-        assert!(
-            elapsed >= Duration::from_secs(9),
-            "aggregate deadline should outlast four sequential probes: {elapsed:?}"
+        assert_eq!(
+            Instant::now().duration_since(start),
+            Duration::from_secs(10)
         );
-        assert!(
-            elapsed < Duration::from_secs(12),
-            "aggregate timeout should bound the full sequence: {elapsed:?}"
-        );
-        let (started, reaped, pumps, joined) = probe_test_counts();
-        assert_eq!((started, reaped, pumps, joined), (5, 5, 15, 15));
-        match old {
-            Some(value) => std::env::set_var("OUTPACE_TEST_HLS_AUDIO_PROBE_DELAY_MS", value),
-            None => std::env::remove_var("OUTPACE_TEST_HLS_AUDIO_PROBE_DELAY_MS"),
-        }
+        assert_eq!(started, 5, "four probes finish before the fifth times out");
     }
 
     #[tokio::test]

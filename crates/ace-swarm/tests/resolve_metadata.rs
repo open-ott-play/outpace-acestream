@@ -5,6 +5,7 @@
 
 use ace_peer::session::PeerSession;
 use ace_swarm::resolve::{resolve_via_peer, ResolveError};
+use ace_wire::extended::ExtendedHandshake;
 use ace_wire::handshake::Handshake;
 use ace_wire::identity::Identity;
 use ace_wire::infohash::{infohash_of_transport, transport_file_hash};
@@ -30,6 +31,17 @@ fn make_transport(plaintext: &[u8]) -> Vec<u8> {
 /// The peer's extended handshake: advertises `ut_metadata` id 5 and the blob size.
 fn peer_extended_handshake(metadata_size: usize) -> Vec<u8> {
     format!("d1:md11:ut_metadatai5ee13:metadata_sizei{metadata_size}ee").into_bytes()
+}
+
+/// BEP-10 replies use the receiver's advertised mapping, not our request id 5.
+fn client_metadata_id(message: PeerMessage) -> u8 {
+    let PeerMessage::Extended { ext_id: 0, payload } = message else {
+        panic!("expected client's extended handshake");
+    };
+    let handshake = ExtendedHandshake::parse(&payload).unwrap();
+    let id = u8::try_from(handshake.ut_metadata_id().unwrap()).unwrap();
+    assert_eq!(id, 2, "resolver must advertise its local metadata id");
+    id
 }
 
 #[tokio::test]
@@ -68,7 +80,7 @@ async fn resolve_via_peer_fetches_and_decodes_transport() {
 
         let mut sess = PeerSession::new(server);
         // 2. Read the client's (signed) extended handshake, then send ours.
-        let _ = sess.read_message().await.unwrap();
+        let client_id = client_metadata_id(sess.read_message().await.unwrap());
         sess.send(&PeerMessage::Extended {
             ext_id: 0,
             payload: peer_extended_handshake(metadata_size),
@@ -89,7 +101,7 @@ async fn resolve_via_peer_fetches_and_decodes_transport() {
                         let resp =
                             data_piece(piece, metadata_size as i64, &transport_peer[off..end]);
                         sess.send(&PeerMessage::Extended {
-                            ext_id: 2,
+                            ext_id: client_id,
                             payload: resp,
                         })
                         .await
@@ -133,7 +145,7 @@ async fn resolve_via_peer_rejects_oversized_metadata_size() {
         server.write_all(&reply.encode()).await.unwrap();
 
         let mut sess = PeerSession::new(server);
-        let _ = sess.read_message().await.unwrap();
+        client_metadata_id(sess.read_message().await.unwrap());
         sess.send(&PeerMessage::Extended {
             ext_id: 0,
             payload: peer_extended_handshake(oversized),
@@ -183,7 +195,7 @@ async fn resolve_via_peer_rejects_metadata_hash_mismatch() {
         server.write_all(&reply.encode()).await.unwrap();
 
         let mut sess = PeerSession::new(server);
-        let _ = sess.read_message().await.unwrap();
+        let client_id = client_metadata_id(sess.read_message().await.unwrap());
         sess.send(&PeerMessage::Extended {
             ext_id: 0,
             payload: peer_extended_handshake(metadata_size),
@@ -203,7 +215,7 @@ async fn resolve_via_peer_rejects_metadata_hash_mismatch() {
                         let resp =
                             data_piece(piece, metadata_size as i64, &transport_peer[off..end]);
                         sess.send(&PeerMessage::Extended {
-                            ext_id: 2,
+                            ext_id: client_id,
                             payload: resp,
                         })
                         .await

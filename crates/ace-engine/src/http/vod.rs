@@ -185,6 +185,10 @@ fn vod_partial_response(
 /// debug wrapper.
 pub(super) fn vod_failure(error: ProviderError) -> Response {
     let status = match &error {
+        ProviderError::CapacityExhausted => return super::streams::capacity_error(),
+        ProviderError::ProtectedContent | ProviderError::InvalidProtection => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
         ProviderError::Invalid(_) => StatusCode::BAD_REQUEST,
         ProviderError::NotFound => StatusCode::NOT_FOUND,
         ProviderError::Unresolvable(_) | ProviderError::DirectHls { .. } => {

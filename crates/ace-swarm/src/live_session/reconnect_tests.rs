@@ -322,6 +322,7 @@ async fn learned_source_recovers_after_outage(disconnect: bool, pex: bool, full_
         }
     });
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: payload.len() as u64,
         chunk_length: payload.len() as u64,
@@ -502,6 +503,7 @@ async fn full_pool_retains_pex_until_rebuild() {
 
 fn cancellation_fixture() -> (StreamInfo, SeedConfig) {
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: 752,
         chunk_length: 752,

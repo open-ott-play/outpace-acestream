@@ -21,6 +21,7 @@ const MAX_FILENAME_BYTES: usize = 4_096;
 /// Validated geometry, piece integrity and discovery data for a single-file VOD.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Metainfo {
+    pub protection: crate::protection::Protection,
     pub infohash: [u8; 20],
     /// Advisory single-file `info.name`, when it is bounded, nonempty UTF-8 text.
     /// This is display metadata, not a local filesystem path or a MIME guarantee.
@@ -50,6 +51,7 @@ pub fn decode_metainfo(bytes: &[u8]) -> Result<Metainfo> {
         .get(b"info")
         .filter(|v| matches!(v, Bencode::Dict(_)))
         .ok_or(WireError::Invalid("metainfo missing info dictionary"))?;
+    let protection = crate::protection::classify(info.get(b"premium"))?;
     if info.get(b"files").is_some() {
         return Err(WireError::Invalid("multi-file metainfo is not supported"));
     }
@@ -77,6 +79,7 @@ pub fn decode_metainfo(bytes: &[u8]) -> Result<Metainfo> {
         .info_span
         .ok_or(WireError::Invalid("metainfo missing info span"))?;
     Ok(Metainfo {
+        protection,
         infohash: Sha1::digest(&bytes[span]).into(),
         filename: advisory_filename(info),
         piece_length,

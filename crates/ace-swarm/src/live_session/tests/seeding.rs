@@ -191,7 +191,7 @@ async fn disabled_pool_reciprocal_seed_does_not_unchoke_or_serve_id6() {
 }
 
 #[tokio::test]
-async fn failed_pool_reply_enqueue_does_not_increment_counters() {
+async fn closed_pool_peer_abandons_pending_reply_without_incrementing_counters() {
     let mut caller = start_pool(true).await;
     let store = caller.store.clone();
     let guard = store.lock().await;
@@ -205,21 +205,38 @@ async fn failed_pool_reply_enqueue_does_not_increment_counters() {
         .expect("the local worker should close its socket after receiving EOF")
         .unwrap();
     assert_eq!(n, 0, "the remote read half should observe worker EOF");
-    assert!(
-        !caller.task.is_finished(),
-        "reply preparation should wait on the held store lock"
-    );
-    drop(guard);
-
+    // The peer-loss event must now retire the pool while its read is still blocked.
     let result = tokio::time::timeout(Duration::from_secs(2), &mut caller.task)
         .await
-        .expect("the failed enqueue should retire the closed peer")
+        .expect("peer loss must not wait for reciprocal read completion")
         .unwrap();
     assert!(matches!(result, FollowEnd::PeerLost(1)));
+    drop(guard);
     assert_eq!(caller.downloaded.load(Ordering::Relaxed), 0);
     assert_eq!(caller.uploaded.load(Ordering::Relaxed), 0);
     assert_eq!(caller.peers_served.load(Ordering::Relaxed), 0);
     drop(caller.peer);
     drop(caller.control);
     drop(caller.rx);
+}
+
+#[tokio::test]
+async fn reciprocal_store_wait_does_not_block_peer_control_or_consumer_close() {
+    let mut caller = start_pool(true).await;
+    let store = caller.store.clone();
+    let held = store.lock().await;
+    caller.peer.send(&chunk_request(7, 0)).await.unwrap();
+    caller.peer.send(&PeerMessage::Interested).await.unwrap();
+    assert_eq!(
+        caller.peer.read_message().await.unwrap(),
+        PeerMessage::Unchoke
+    );
+    drop(caller.rx);
+    let end = tokio::time::timeout(Duration::from_secs(2), caller.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(end, FollowEnd::ConsumerGone));
+    assert_eq!(caller.uploaded.load(Ordering::Relaxed), 0);
+    drop(held);
 }

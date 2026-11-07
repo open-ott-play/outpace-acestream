@@ -195,6 +195,7 @@ fn content_and_info_with_length(total_len: usize) -> (Vec<u8>, VodInfo) {
     (
         content,
         VodInfo {
+            protection: None,
             infohash: [0x4d; 20],
             filename: None,
             peer_protocol: Default::default(),

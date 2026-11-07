@@ -13,6 +13,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
+// The permit follows the disk command and its retained result, including cancellation.
+pub(crate) struct ReciprocalChunk {
+    pub(crate) data: Vec<u8>,
+    pub(crate) header: [u8; 8],
+    pub(crate) permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
 /// Maximum request block accepted from a standard BitTorrent peer (BEP 3 convention).
 pub const MAX_BT_REQUEST_LEN: u32 = 16 * 1024;
 
@@ -224,6 +231,27 @@ impl PieceStore {
             }
         };
         handle.get(piece, chunk).await
+    }
+
+    pub(crate) async fn shared_reciprocal_chunk(
+        store: &Arc<Mutex<Self>>,
+        piece: u64,
+        chunk: u16,
+    ) -> Option<ReciprocalChunk> {
+        let handle = {
+            let guard = store.lock().await;
+            match &guard.backend {
+                Backend::Memory(_) => {
+                    return Some(ReciprocalChunk {
+                        data: guard.chunk(piece, chunk)?.into_owned(),
+                        header: guard.piece_header(piece).unwrap_or([0; 8]),
+                        permit: None,
+                    })
+                }
+                Backend::Disk(disk) => disk.handle(),
+            }
+        };
+        handle.reciprocal_get(piece, chunk).await
     }
 
     /// Read a standard BitTorrent byte block from a piece stored as request-sized chunks.

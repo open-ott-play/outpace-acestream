@@ -32,6 +32,10 @@ and offline rebuild instructions. THIRD_PARTY_NOTICES.txt accompanies the binary
 and the published runtime image. Local modified builds require their own matching
 complete source bundle; they do not advertise an unrelated release asset.
 
+Selected November 2026 upstream changes are adapted with their original license
+and notices retained. Upstream pull requests and downstream adaptation boundaries
+are recorded in docs/protocol/notes/75-selected-upstream-adoption.md.
+
 Third-party dependencies retain their respective licenses. Cargo.lock records
 exact Rust dependency versions and registry checksums. An optional separately
 installed FFmpeg has its own build-dependent licensing terms.

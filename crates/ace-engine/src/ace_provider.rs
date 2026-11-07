@@ -464,10 +464,29 @@ impl StreamProvider for AceProvider {
         self.resolve_vod_inner(id).await
     }
 
-    fn check_openable(&self, _id: &str) -> Result<(), ProviderError> {
+    fn check_openable(&self, id: &str) -> Result<(), ProviderError> {
+        if let Some(info) = self.peer_resolve_cache.get(id) {
+            info.ensure_playable()?;
+        }
+        if let Some(info) = id
+            .strip_prefix("cid:")
+            .and_then(|cid| self.resolve_cache.get(cid))
+        {
+            info.ensure_playable()?;
+        }
+        if let Some(info) = hex20(id)
+            .ok()
+            .and_then(|hash| self.infohash_index.get(&hash))
+        {
+            info.ensure_playable()?;
+        }
         // Cold infohash lookup is asynchronous. Actual resolution still requires an
         // authenticated descriptor bound to the requested infohash before discovery.
         Ok(())
+    }
+
+    fn remember_transport_url(&self, id: &str, info: &StreamInfo) {
+        self.peer_resolve_cache.put(id, info.clone());
     }
 
     fn remember_live_descriptor(&self, info: &StreamInfo) {
@@ -475,7 +494,7 @@ impl StreamProvider for AceProvider {
     }
 
     fn verified_live_descriptor(&self, infohash: &[u8; 20]) -> Option<StreamInfo> {
-        self.verified_info_for_infohash(&infohash_hex(infohash))
+        self.inspected_info_for_infohash(&infohash_hex(infohash))
             .ok()
     }
 
@@ -492,6 +511,7 @@ impl StreamProvider for AceProvider {
         let opening = Instant::now();
         crate::alog!("[ace] discovery stage=open-request");
         let info = self.resolve_live_info(id).await?;
+        info.ensure_playable()?;
         crate::alog!(
             "[ace] discovery stage=resolved resolve_ms={}",
             opening.elapsed().as_millis()

@@ -5,6 +5,7 @@ use ace_swarm::discover::MAX_DISCOVERY_PEERS;
 
 fn info() -> StreamInfo {
     StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: 752,
         chunk_length: 752,

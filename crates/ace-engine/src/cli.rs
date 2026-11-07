@@ -336,6 +336,7 @@ fn direct_hls_url(
 ) -> Result<String, crate::provider::ProviderError> {
     use crate::provider::ProviderError;
     use ace_swarm::resolve::ResolvedTransport;
+    source.ensure_playable()?;
     match source {
         ResolvedTransport::Hls { manifest_url, .. } => Ok(manifest_url),
         ResolvedTransport::Swarm(_) => Err(ProviderError::Unresolvable(
@@ -896,6 +897,7 @@ mod direct_origin_tests {
         let url = "https://cdn.example.test/a%2Fb/master.m3u8?token=a%2Fb&x=1&x=2";
         assert_eq!(
             direct_hls_url(ResolvedTransport::Hls {
+                protection: ace_wire::protection::Protection::Public,
                 manifest_url: url.into(),
                 metadata: Default::default(),
             })

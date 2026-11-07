@@ -15,6 +15,7 @@ fn source() -> &'static LiveSourceAuth {
 
 fn info() -> StreamInfo {
     StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: 1024,
         chunk_length: 256,

@@ -57,6 +57,15 @@ Environment variables parsed by the daemon include:
 - `OUTPACE_PREFETCH_PIECES` - optional exact number of pieces behind the live edge to start at.
   When unset, outpace derives the depth from the startup target and advertised bitrate, falling
   back to `32` pieces when the bitrate is unavailable.
+- `OUTPACE_MAX_SESSIONS` - maximum pending provider opens and retained live/VOD source
+  owners, default `0` (unlimited). Multiple viewers and native/compatibility HLS wrapping
+  the same live source share one slot. Retained VOD ranges continue to hold their slot
+  after the descriptor leaves the cache. Saturated new starts return HTTP `503` with
+  `Retry-After: 1`; compatibility JSON keeps its error envelope. Native stream-list and
+  engine status responses expose `occupied_sessions` and `max_sessions` (null when unlimited).
+  Only nonnegative decimal integers are accepted. This is not a process-memory, socket,
+  viewer or exact asynchronous-cleanup ceiling. Managed origin-HLS sessions retain their
+  separate relay limit and do not consume a provider slot. No limit is enabled automatically.
 - `OUTPACE_SESSION_BUFFER` - per-client fan-out channel depth, default `256`;
   must be at least `1`.
 - `OUTPACE_PREBUFFER_MS` - target server-resident live startup queue duration, default `30000`.

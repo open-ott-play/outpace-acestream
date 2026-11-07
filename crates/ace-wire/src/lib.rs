@@ -14,6 +14,7 @@ pub mod live_codec;
 pub mod message;
 pub mod metainfo;
 pub mod peer_exchange;
+pub mod protection;
 pub mod reassembly;
 pub mod signing_chunker;
 pub mod transport;
@@ -22,6 +23,8 @@ pub mod ut_metadata;
 /// Errors produced while decoding untrusted wire bytes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WireError {
+    /// A recognized descriptor carries malformed content-protection metadata.
+    InvalidProtection,
     /// A recognized HLS descriptor cannot be used as a piece-based swarm.
     Hls(&'static str),
     /// Buffer ended before a complete structure was parsed.

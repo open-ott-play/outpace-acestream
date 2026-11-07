@@ -816,8 +816,9 @@ pub(super) async fn follow_peer_pool_with_discovery(
                     {
                         continue;
                     }
+                    let arrived_at = Instant::now();
                     let accepted = match continuity
-                        .receive_live_chunk(&lc, info.chunk_length, store, Instant::now())
+                        .receive_live_chunk(&lc, info.chunk_length, store, arrived_at)
                         .await
                     {
                         Ok(accepted) => accepted,
@@ -837,17 +838,9 @@ pub(super) async fn follow_peer_pool_with_discovery(
                             continue;
                         }
                     };
-                    if accepted.contributed {
-                        continuity
-                            .piece_producers
-                            .entry(piece)
-                            .and_modify(|producer| {
-                                if *producer != Some(addr) {
-                                    *producer = None;
-                                }
-                            })
-                            .or_insert(Some(addr));
-                    }
+                    record_accepted_contribution(
+                        continuity, peer_id, addr, piece, accepted, arrived_at,
+                    );
                     // Only verified completion releases request slots; only new bytes
                     // count as progress toward the pool activity deadline.
                     continuity.note_chunk(piece, lc.chunk, chunks_per_piece);
@@ -1016,3 +1009,37 @@ pub(super) async fn follow_peer_pool_with_discovery(
         }
     }
 }
+
+/// Runs only after reassembly accepts the chunk, including source signature validation
+/// on completion when configured. Retain producer evidence before releasing ownership.
+fn record_accepted_contribution(
+    continuity: &mut Continuity,
+    peer_id: u64,
+    addr: SocketAddrV4,
+    piece: u64,
+    accepted: ace_wire::reassembly::BlockAcceptance,
+    arrived_at: Instant,
+) {
+    if !accepted.contributed {
+        return;
+    }
+    continuity
+        .piece_producers
+        .entry(piece)
+        .and_modify(|producer| {
+            if *producer != Some(addr) {
+                *producer = None;
+            }
+        })
+        .or_insert(Some(addr));
+    if continuity.reasm.has_complete_piece(piece) {
+        let exclusive = continuity.piece_producers.get(&piece) == Some(&Some(addr));
+        continuity
+            .active_peers
+            .note_completed_piece(peer_id, piece, exclusive, arrived_at);
+    }
+}
+
+#[cfg(test)]
+#[path = "pool_eta_tests.rs"]
+mod eta_tests;

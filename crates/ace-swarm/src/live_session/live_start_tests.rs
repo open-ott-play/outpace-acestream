@@ -779,7 +779,13 @@ async fn failed_candidate_writes_preserve_the_only_provisional_peer() {
     shutdown_peer_runtimes(&mut peers);
 }
 
-async fn queued_chunk_requests_stop_after_floor_change(eviction: bool) {
+enum CursorAdvance {
+    LiveHead,
+    Eviction,
+    ContiguousDrain,
+}
+
+async fn queued_chunk_requests_stop_after_floor_change(advance: CursorAdvance) {
     // One frame of capacity leaves a request write in progress, unlike a timer-only race.
     let (client, server) = tokio::io::duplex(15);
     let (commands, rx) = mpsc::channel(4);
@@ -814,16 +820,27 @@ async fn queued_chunk_requests_stop_after_floor_change(eviction: bool) {
         server.read_message().await.unwrap(),
         PeerMessage::Unknown { id: 6, .. }
     ));
-    if eviction {
-        c.register_active_peer(1, addr, window(9, 10));
-        c.set_peer_unchoked(1, true);
-        assert_eq!(
-            c.skip_evicted_gap(c.next_needed_since + c.live_recovery.request_timeout()),
-            Some(9)
-        );
-    } else {
-        c.head = 10;
-        advance_pool_requests(&mut BTreeMap::new(), &mut c, 1).await;
+    match advance {
+        CursorAdvance::Eviction => {
+            c.register_active_peer(1, addr, window(9, 10));
+            c.set_peer_unchoked(1, true);
+            assert_eq!(
+                c.skip_evicted_gap(c.next_needed_since + c.live_recovery.request_timeout()),
+                Some(9)
+            );
+        }
+        CursorAdvance::LiveHead => {
+            c.head = 10;
+            advance_pool_requests(&mut BTreeMap::new(), &mut c, 1).await;
+        }
+        CursorAdvance::ContiguousDrain => {
+            // Another upstream has completed the same pieces while this worker still
+            // has a retry queued. Publication may now wait on downstream backpressure.
+            c.reasm.add_block(7, 0, &packet_piece(0x55)).unwrap();
+            c.reasm.add_block(8, 0, &packet_piece(0x66)).unwrap();
+            assert_eq!(take_ready_with_stats(&mut c, None, &info).len(), 1504);
+            assert_eq!(c.reasm.next_needed(), 9);
+        }
     }
     let mut stale_after_observation = 0;
     loop {
@@ -849,12 +866,17 @@ async fn queued_chunk_requests_stop_after_floor_change(eviction: bool) {
 
 #[tokio::test]
 async fn queued_chunk_requests_stop_when_known_floor_advances() {
-    queued_chunk_requests_stop_after_floor_change(false).await;
+    queued_chunk_requests_stop_after_floor_change(CursorAdvance::LiveHead).await;
 }
 
 #[tokio::test]
 async fn queued_chunk_requests_stop_when_eviction_moves_cursor_without_a_new_head() {
-    queued_chunk_requests_stop_after_floor_change(true).await;
+    queued_chunk_requests_stop_after_floor_change(CursorAdvance::Eviction).await;
+}
+
+#[tokio::test]
+async fn queued_chunk_requests_stop_when_contiguous_drain_moves_cursor_without_a_new_head() {
+    queued_chunk_requests_stop_after_floor_change(CursorAdvance::ContiguousDrain).await;
 }
 
 #[tokio::test]

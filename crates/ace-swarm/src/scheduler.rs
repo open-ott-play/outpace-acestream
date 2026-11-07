@@ -8,8 +8,47 @@
 //! [`ace_wire::live::LivePicker`] / [`ace_wire::reassembly::PieceReassembler`].
 
 use ace_wire::extended::LivePosition;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddrV4;
+use std::time::{Duration, Instant};
+
+/// Bounded arithmetic mean of accepted whole-piece service intervals. The native
+/// engine averages 100 chunk intervals; our scheduler requests whole pieces.
+#[derive(Debug, Default, Clone)]
+struct PieceServiceTime {
+    samples: VecDeque<Duration>,
+    total_nanos: u128,
+    last_sample_at: Option<Instant>,
+}
+
+impl PieceServiceTime {
+    fn complete(&mut self, admitted: Instant, now: Instant) {
+        let start = self
+            .last_sample_at
+            .map_or(admitted, |last| last.max(admitted));
+        let Some(elapsed) = now.checked_duration_since(start).filter(|d| !d.is_zero()) else {
+            return;
+        };
+        self.last_sample_at = Some(now);
+        if self.samples.len() == 100 {
+            self.total_nanos -= self.samples.pop_front().unwrap().as_nanos();
+        }
+        // At most 100 Duration values: their sum fits u128 without saturation.
+        self.total_nanos += elapsed.as_nanos();
+        self.samples.push_back(elapsed);
+    }
+
+    fn mean(&self, now: Instant, max_age: Duration) -> Option<Duration> {
+        if self.samples.is_empty() || now.checked_duration_since(self.last_sample_at?)? >= max_age {
+            return None;
+        }
+        let nanos = self.total_nanos / self.samples.len() as u128;
+        Some(Duration::new(
+            u64::try_from(nanos / 1_000_000_000).ok()?,
+            (nanos % 1_000_000_000) as u32,
+        ))
+    }
+}
 
 /// A peer as the scheduler sees it this tick.
 #[derive(Debug, Clone, Copy)]
@@ -52,6 +91,20 @@ struct ActivePeer {
     max_piece: u64,
     unchoked: bool,
     in_flight: BTreeSet<u64>,
+    admitted_at: BTreeMap<u64, Instant>,
+    service_time: PieceServiceTime,
+}
+
+impl ActivePeer {
+    fn admit(&mut self, piece: u64, now: Instant) {
+        if self.in_flight.insert(piece) {
+            self.admitted_at.insert(piece, now);
+        } else {
+            // A retry has ambiguous arrival ownership; it cannot teach a service time.
+            self.admitted_at.remove(&piece);
+            self.service_time = PieceServiceTime::default();
+        }
+    }
 }
 
 /// Pure active-peer state paired with [`Scheduler`]. It tracks each peer's current
@@ -79,12 +132,18 @@ impl ActivePeers {
                 max_piece: window.max_piece.max(0) as u64,
                 unchoked: false,
                 in_flight: BTreeSet::new(),
+                admitted_at: BTreeMap::new(),
+                service_time: PieceServiceTime::default(),
             },
         );
     }
 
     pub fn set_unchoked(&mut self, id: u64, unchoked: bool) {
         if let Some(peer) = self.peers.get_mut(&id) {
+            if !unchoked {
+                peer.service_time = PieceServiceTime::default();
+                peer.admitted_at.clear();
+            }
             peer.unchoked = unchoked;
         }
     }
@@ -114,8 +173,37 @@ impl ActivePeers {
         scheduler: &mut Scheduler,
         next_needed: u64,
         head: u64,
+        admit: impl FnMut(PeerAssignment) -> bool,
+    ) -> Vec<PeerAssignment> {
+        self.assign_if_at(
+            scheduler,
+            next_needed,
+            head,
+            Instant::now(),
+            Duration::ZERO,
+            admit,
+        )
+    }
+
+    /// Timing refines only otherwise equal candidates, and only if all have fresh
+    /// measurements. `max_age` should be the existing progress timeout, not a new deadline.
+    pub fn assign_if_at(
+        &mut self,
+        scheduler: &mut Scheduler,
+        next_needed: u64,
+        head: u64,
+        now: Instant,
+        max_age: Duration,
         mut admit: impl FnMut(PeerAssignment) -> bool,
     ) -> Vec<PeerAssignment> {
+        for peer in self.peers.values_mut() {
+            if peer.service_time.last_sample_at.is_some_and(|last| {
+                now.checked_duration_since(last)
+                    .is_none_or(|age| age >= max_age)
+            }) {
+                peer.service_time = PieceServiceTime::default();
+            }
+        }
         let views: Vec<PeerView> = self
             .peers
             .iter()
@@ -128,8 +216,13 @@ impl ActivePeers {
             })
             .collect();
         let mut rejected = BTreeSet::new();
+        let means: BTreeMap<_, _> = self
+            .peers
+            .iter()
+            .filter_map(|(&id, peer)| Some((id, peer.service_time.mean(now, max_age)?)))
+            .collect();
         let assigned =
-            scheduler.assign_with_admission(next_needed, head, &views, |peer_id, piece| {
+            scheduler.assign_with_admission(next_needed, head, &views, &means, |peer_id, piece| {
                 if admit(PeerAssignment { peer_id, piece }) {
                     true
                 } else {
@@ -140,11 +233,7 @@ impl ActivePeers {
         let mut out = Vec::with_capacity(assigned.len());
         for (peer_id, piece) in assigned {
             // Views came from this unchanged map; successful admission owns the slot.
-            self.peers
-                .get_mut(&peer_id)
-                .unwrap()
-                .in_flight
-                .insert(piece);
+            self.peers.get_mut(&peer_id).unwrap().admit(piece, now);
             out.push(PeerAssignment { peer_id, piece });
         }
         // Normal scheduling prefers peers with spare capacity, giving slow requests a
@@ -152,7 +241,7 @@ impl ActivePeers {
         // an existing owner needs no NEW slot. Scan only bounded ownership sets, not the
         // untrusted live head, and never dispatch the same piece twice in one pass.
         if next_needed <= head {
-            for (&peer_id, peer) in &self.peers {
+            for (&peer_id, peer) in &mut self.peers {
                 if !peer.unchoked || rejected.contains(&peer_id) {
                     continue;
                 }
@@ -166,6 +255,8 @@ impl ActivePeers {
                     }
                     let assignment = PeerAssignment { peer_id, piece };
                     if admit(assignment) {
+                        peer.admitted_at.remove(&piece);
+                        peer.service_time = PieceServiceTime::default();
                         scheduler.requested.insert(piece);
                         out.push(assignment);
                     } else {
@@ -178,6 +269,33 @@ impl ActivePeers {
             }
         }
         out
+    }
+
+    /// Sample only a complete accepted piece from its sole contributing request owner.
+    /// Call before releasing ownership. Reassembly verifies signatures when configured.
+    pub fn note_completed_piece(&mut self, id: u64, piece: u64, exclusive: bool, now: Instant) {
+        for (&owner, peer) in &mut self.peers {
+            if !peer.in_flight.contains(&piece) {
+                continue;
+            }
+            if exclusive && owner == id {
+                if let Some(&admitted) = peer.admitted_at.get(&piece) {
+                    peer.service_time.complete(admitted, now);
+                }
+            } else {
+                // Mixed contributors or losing a raced request gives no reliable interval.
+                peer.service_time = PieceServiceTime::default();
+                peer.admitted_at.clear();
+            }
+        }
+    }
+
+    /// Retained partial bytes may belong to an earlier connection at the same address.
+    /// Finishing them does not measure this generation's whole-piece service time.
+    pub fn exclude_timing_sample(&mut self, id: u64, piece: u64) {
+        if let Some(peer) = self.peers.get_mut(&id) {
+            peer.admitted_at.remove(&piece);
+        }
     }
 
     pub fn remove(&mut self, id: u64) -> Vec<u64> {
@@ -209,6 +327,7 @@ impl ActivePeers {
     pub fn complete_everywhere(&mut self, piece: u64) {
         for peer in self.peers.values_mut() {
             peer.in_flight.remove(&piece);
+            peer.admitted_at.remove(&piece);
         }
     }
 
@@ -218,6 +337,7 @@ impl ActivePeers {
     pub fn prune_below(&mut self, floor: u64) {
         for peer in self.peers.values_mut() {
             peer.in_flight.retain(|&p| p >= floor);
+            peer.admitted_at.retain(|&p, _| p >= floor);
         }
     }
 
@@ -272,7 +392,7 @@ impl Scheduler {
     /// has spare in-flight capacity. Returns `(peer_id, piece)` pairs and records them as
     /// in-flight.
     pub fn assign(&mut self, next_needed: u64, head: u64, peers: &[PeerView]) -> Vec<(u64, u64)> {
-        self.assign_with_admission(next_needed, head, peers, |_, _| true)
+        self.assign_with_admission(next_needed, head, peers, &BTreeMap::new(), |_, _| true)
     }
 
     /// Reserve slots only after the bounded driver queue accepts a request. Rejecting a
@@ -283,6 +403,7 @@ impl Scheduler {
         next_needed: u64,
         head: u64,
         peers: &[PeerView],
+        means: &BTreeMap<u64, Duration>,
         mut admit: impl FnMut(u64, u64) -> bool,
     ) -> Vec<(u64, u64)> {
         // Drop bookkeeping for pieces we've moved past.
@@ -320,11 +441,9 @@ impl Scheduler {
                 // end within this pass: use a less-flexible peer now instead of stranding
                 // its slot, leaving broader peers for the later pieces. Differences beyond
                 // the bounded ceiling cannot help this pass and retain the existing tie.
-                while let Some(slot) = cap
-                    .iter_mut()
-                    .filter(|(p, c)| *c > 0 && p.covers(piece))
-                    .max_by_key(|(p, c)| (*c, std::cmp::Reverse(p.max_piece.min(ceiling))))
+                while let Some(index) = select_peer(&cap, piece, ceiling, self.max_in_flight, means)
                 {
+                    let slot = &mut cap[index];
                     if admit(slot.0.id, piece) {
                         out.push((slot.0.id, piece));
                         slot.1 -= 1;
@@ -372,6 +491,42 @@ impl Scheduler {
     pub fn in_flight_count(&self) -> usize {
         self.requested.len()
     }
+}
+
+fn select_peer(
+    cap: &[(PeerView, usize)],
+    piece: u64,
+    ceiling: u64,
+    max_in_flight: usize,
+    means: &BTreeMap<u64, Duration>,
+) -> Option<usize> {
+    let priority = |(peer, spare): &(PeerView, usize)| {
+        (*spare, std::cmp::Reverse(peer.max_piece.min(ceiling)))
+    };
+    let (legacy, best) = cap
+        .iter()
+        .enumerate()
+        .filter(|(_, (peer, spare))| *spare > 0 && peer.covers(piece))
+        .max_by_key(|(_, slot)| priority(slot))?;
+    let best_priority = priority(best);
+    let mut fastest: Option<(usize, u128)> = None;
+    for (index, slot) in cap.iter().enumerate() {
+        if !slot.0.covers(piece) || priority(slot) != best_priority {
+            continue;
+        }
+        // Do not compare an unknown estimate as zero/infinity or use a pairwise
+        // comparator mixing known and unknown values: keep the exact legacy tie.
+        let Some(eta) = means.get(&slot.0.id).and_then(|mean| {
+            mean.as_nanos()
+                .checked_mul((max_in_flight - slot.1) as u128 + 1)
+        }) else {
+            return Some(legacy);
+        };
+        if fastest.is_none_or(|(_, best_eta)| eta <= best_eta) {
+            fastest = Some((index, eta));
+        }
+    }
+    Some(fastest.map_or(legacy, |(index, _)| index))
 }
 
 #[cfg(test)]
@@ -514,6 +669,7 @@ mod tests {
             0,
             1,
             &[peer(1, 0, 0, true, 0), peer(2, 0, 1, true, 0)],
+            &BTreeMap::new(),
             |peer_id, piece| {
                 attempts.push((peer_id, piece));
                 peer_id == 2
@@ -559,6 +715,257 @@ mod tests {
     fn addr() -> SocketAddrV4 {
         use std::net::Ipv4Addr;
         SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)
+    }
+
+    #[test]
+    fn eta_only_breaks_fully_measured_capacity_and_window_ties() {
+        let cap = vec![(peer(1, 0, 10, true, 0), 2), (peer(2, 0, 10, true, 0), 2)];
+        let known = BTreeMap::from([
+            (1, Duration::from_millis(10)),
+            (2, Duration::from_millis(20)),
+        ]);
+        assert_eq!(select_peer(&cap, 0, 4, 2, &known), Some(0));
+        assert_eq!(
+            select_peer(
+                &cap,
+                0,
+                4,
+                2,
+                &BTreeMap::from([(1, Duration::from_millis(10))])
+            ),
+            Some(1)
+        );
+        let equal = BTreeMap::from([
+            (1, Duration::from_millis(10)),
+            (2, Duration::from_millis(10)),
+        ]);
+        assert_eq!(select_peer(&cap, 0, 4, 2, &equal), Some(1));
+        let mut less_capacity = cap.clone();
+        less_capacity[0].1 = 1;
+        assert_eq!(select_peer(&less_capacity, 0, 4, 2, &known), Some(1));
+        let mut narrow = cap;
+        narrow[1].0.max_piece = 0;
+        assert_eq!(select_peer(&narrow, 0, 4, 2, &known), Some(1));
+    }
+
+    #[test]
+    fn eta_overflow_and_unknown_peers_keep_the_exact_legacy_order() {
+        let cap = vec![
+            (peer(1, 0, u64::MAX, true, 0), 1),
+            (peer(2, 0, u64::MAX, true, 0), 1),
+        ];
+        let means = BTreeMap::from([(1, Duration::MAX), (2, Duration::from_nanos(1))]);
+        assert_eq!(
+            select_peer(&cap, u64::MAX, u64::MAX, usize::MAX, &means),
+            Some(1)
+        );
+        let reversed = vec![cap[1], cap[0]];
+        assert_eq!(
+            select_peer(&reversed, u64::MAX, u64::MAX, usize::MAX, &means),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn piece_service_mean_is_bounded_and_excludes_idle_time() {
+        let start = Instant::now();
+        let mut service = PieceServiceTime::default();
+        assert_eq!(service.mean(start, Duration::from_secs(5)), None);
+        service.complete(start, start);
+        assert!(service.samples.is_empty());
+        service.complete(start, start + Duration::from_millis(100));
+        // New request after 1h idle takes 20ms, not 1h.
+        let later = start + Duration::from_secs(3600);
+        service.complete(later, later + Duration::from_millis(20));
+        assert_eq!(
+            service.mean(later + Duration::from_millis(20), Duration::from_secs(5)),
+            Some(Duration::from_millis(60))
+        );
+        for i in 1..=100 {
+            service.complete(later, later + Duration::from_millis(20 + 10 * i));
+        }
+        assert_eq!(service.samples.len(), 100);
+        assert_eq!(service.total_nanos, Duration::from_secs(1).as_nanos());
+        assert_eq!(
+            service.mean(later + Duration::from_millis(1020), Duration::from_secs(5)),
+            Some(Duration::from_millis(10))
+        );
+    }
+
+    #[test]
+    fn zero_samples_cannot_refresh_an_old_estimate() {
+        let start = Instant::now();
+        let mut service = PieceServiceTime::default();
+        service.complete(start, start + Duration::from_secs(1));
+        let later = start + Duration::from_secs(10);
+        service.complete(later, later);
+        assert_eq!(service.mean(later, Duration::from_secs(5)), None);
+        assert_eq!(service.samples.len(), 1);
+    }
+
+    fn sampled_peers(now: Instant) -> ActivePeers {
+        let mut active = ActivePeers::new();
+        for (id, delay) in [(1, 10), (2, 20)] {
+            active.insert(id, addr(), win(0, 100));
+            active.set_unchoked(id, true);
+            active.peers.get_mut(&id).unwrap().admit(id, now);
+            active.note_completed_piece(id, id, true, now + Duration::from_millis(delay));
+            active.complete_everywhere(id);
+        }
+        active
+    }
+
+    #[test]
+    fn admission_and_owned_completion_teach_the_next_scheduling_pass() {
+        let now = Instant::now();
+        let mut active = ActivePeers::new();
+        let ttl = Duration::from_secs(5);
+        let mut scheduler = Scheduler::new(1);
+        active.insert(1, addr(), win(0, 100));
+        active.set_unchoked(1, true);
+        let first = active.assign_if_at(&mut scheduler, 0, 0, now, ttl, |_| true);
+        assert_eq!(
+            first,
+            vec![PeerAssignment {
+                peer_id: 1,
+                piece: 0
+            }]
+        );
+        active.note_completed_piece(1, 0, true, now + Duration::from_millis(10));
+        active.complete_everywhere(0);
+        scheduler.on_complete(0);
+        active.insert(2, addr(), win(0, 100));
+        active.set_unchoked(2, true);
+        // Unknown peer 2 keeps its legacy tie, so it still gets a chance to learn.
+        let second = active.assign_if_at(
+            &mut scheduler,
+            1,
+            1,
+            now + Duration::from_millis(10),
+            ttl,
+            |_| true,
+        );
+        assert_eq!(second[0].peer_id, 2);
+        active.note_completed_piece(2, 1, true, now + Duration::from_millis(30));
+        active.complete_everywhere(1);
+        scheduler.on_complete(1);
+        let third = active.assign_if_at(
+            &mut scheduler,
+            2,
+            2,
+            now + Duration::from_millis(30),
+            ttl,
+            |_| true,
+        );
+        assert_eq!(third[0].peer_id, 1);
+        // A rejected queue still falls back to the other owner without reserving a slot.
+        active.complete_everywhere(2);
+        scheduler.on_drop(2);
+        let fallback = active.assign_if_at(
+            &mut scheduler,
+            2,
+            2,
+            now + Duration::from_millis(31),
+            ttl,
+            |a| a.peer_id == 2,
+        );
+        assert_eq!(fallback[0].peer_id, 2);
+    }
+
+    #[test]
+    fn stale_idle_samples_and_chokes_restore_unknown_fallback() {
+        let now = Instant::now();
+        let ttl = Duration::from_secs(5);
+        let mut active = sampled_peers(now);
+        let mut scheduler = Scheduler::new(1);
+        let got = active.assign_if_at(
+            &mut scheduler,
+            5,
+            5,
+            now + Duration::from_secs(10),
+            ttl,
+            |_| true,
+        );
+        assert_eq!(got[0].peer_id, 2);
+        assert!(active
+            .peers
+            .values()
+            .all(|p| p.service_time.samples.is_empty()));
+        let mut active = sampled_peers(now);
+        active.set_unchoked(1, false);
+        active.set_unchoked(1, true);
+        let got = active.assign_if_at(
+            &mut Scheduler::new(1),
+            5,
+            5,
+            now + Duration::from_millis(30),
+            ttl,
+            |_| true,
+        );
+        assert_eq!(got[0].peer_id, 2);
+    }
+
+    #[test]
+    fn mixed_unowned_and_retried_completions_cannot_create_timing_samples() {
+        let now = Instant::now();
+        let mut active = ActivePeers::new();
+        active.insert(1, addr(), win(0, 100));
+        active.set_unchoked(1, true);
+        active.note_completed_piece(1, 1, true, now);
+        assert!(active.peers[&1].service_time.samples.is_empty());
+        active.peers.get_mut(&1).unwrap().admit(1, now);
+        active.note_completed_piece(1, 1, false, now + Duration::from_millis(10));
+        assert!(active.peers[&1].service_time.samples.is_empty());
+        active.complete_everywhere(1);
+        active.peers.get_mut(&1).unwrap().admit(2, now);
+        active
+            .peers
+            .get_mut(&1)
+            .unwrap()
+            .admit(2, now + Duration::from_millis(10));
+        active.note_completed_piece(1, 2, true, now + Duration::from_millis(20));
+        assert!(active.peers[&1].service_time.samples.is_empty());
+    }
+
+    #[test]
+    fn rejected_admission_never_starts_a_timing_sample() {
+        let now = Instant::now();
+        let mut active = ActivePeers::new();
+        active.insert(1, addr(), win(0, 100));
+        active.set_unchoked(1, true);
+        assert!(active
+            .assign_if_at(
+                &mut Scheduler::new(1),
+                0,
+                0,
+                now,
+                Duration::from_secs(5),
+                |_| false
+            )
+            .is_empty());
+        active.note_completed_piece(1, 0, true, now + Duration::from_millis(10));
+        assert!(active.peers[&1].service_time.samples.is_empty());
+    }
+
+    #[test]
+    fn retained_partial_data_cannot_teach_a_whole_piece_interval() {
+        let now = Instant::now();
+        let mut active = ActivePeers::new();
+        active.insert(1, addr(), win(0, 100));
+        active.set_unchoked(1, true);
+        let got = active.assign_if_at(
+            &mut Scheduler::new(1),
+            0,
+            0,
+            now,
+            Duration::from_secs(5),
+            |_| true,
+        );
+        assert_eq!(got.len(), 1);
+        active.exclude_timing_sample(1, 0);
+        active.note_completed_piece(1, 0, true, now + Duration::from_millis(1));
+        assert!(active.peers[&1].service_time.samples.is_empty());
+        assert_eq!(active.in_flight_count(1), 1);
     }
 
     fn win(min: i64, max: i64) -> LivePosition {

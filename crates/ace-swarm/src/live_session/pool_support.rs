@@ -257,10 +257,13 @@ pub(super) async fn advance_pool_requests(
     }
     let mut failed = Vec::new();
     let request_head = continuity.request_head();
-    let assignments = continuity.active_peers.assign_if(
+    let now = Instant::now();
+    let assignments = continuity.active_peers.assign_if_at(
         &mut continuity.scheduler,
         continuity.reasm.next_needed(),
         request_head,
+        now,
+        continuity.live_recovery.request_timeout(),
         |assignment| {
             let Some(peer) = peers.get(&assignment.peer_id) else {
                 return false;
@@ -279,8 +282,14 @@ pub(super) async fn advance_pool_requests(
             }
         },
     );
-    let now = Instant::now();
     for assignment in assignments {
+        if continuity.reasm.has_partial_piece(assignment.piece)
+            || continuity.reasm.has_complete_piece(assignment.piece)
+        {
+            continuity
+                .active_peers
+                .exclude_timing_sample(assignment.peer_id, assignment.piece);
+        }
         continuity
             .requested_at
             .entry(assignment.piece)
@@ -366,6 +375,10 @@ pub(super) fn take_ready_with_stats(
 ) -> Vec<u8> {
     publish_live_stats(c, metrics, info);
     let ready = c.reasm.take_ready();
+    // A different upstream may complete a piece while its retry is still queued.
+    // Stop obsolete chunk requests before output publication can block on a viewer.
+    c.request_floor
+        .fetch_max(c.reasm.next_needed(), Ordering::Relaxed);
     if let Some(metrics) = metrics {
         metrics.received_bytes(ready.len() as u64);
     }

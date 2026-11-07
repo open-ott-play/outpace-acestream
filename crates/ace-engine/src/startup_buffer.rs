@@ -337,11 +337,22 @@ impl StartupBufferedSource {
 
     async fn collect_next(&mut self) {
         let next = if let Some(deadline) = self.reservoir.deadline() {
-            tokio::select! { chunk = self.inner.next() => chunk, _ = tokio::time::sleep_until(deadline) => { self.reservoir.release(ReleaseReason::Deadline); self.publish_stats(); return; } }
+            // Once the absolute deadline expires, drain the retained media before
+            // consuming another ready chunk, which may belong to a new source epoch.
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => {
+                    self.reservoir.release(ReleaseReason::Deadline);
+                    self.publish_stats();
+                    return;
+                }
+                chunk = self.inner.next() => chunk,
+            }
         } else {
             self.inner.next().await
         };
 
+        let empty = next.as_ref().is_some_and(Bytes::is_empty);
         match next {
             Some(chunk) => {
                 if self.inner.take_discontinuity() {
@@ -353,6 +364,11 @@ impl StartupBufferedSource {
             None => self.reservoir.release(ReleaseReason::EndOfStream),
         }
         self.publish_stats();
+        if empty {
+            // A source may return ready empty chunks without ever yielding to cancellation
+            // or the startup deadline. Preserve its gap and stats before cooperating.
+            tokio::task::yield_now().await;
+        }
     }
 }
 
@@ -378,6 +394,8 @@ impl TsSource for StartupBufferedSource {
                     self.publish_stats();
                     if next.as_ref().is_some_and(Bytes::is_empty) {
                         self.pending_discontinuity |= self.inner.take_discontinuity();
+                        // Pass-through must remain cooperative for immediately-ready sources too.
+                        tokio::task::yield_now().await;
                         continue;
                     }
                     return next;
@@ -628,6 +646,111 @@ mod tests {
 
     fn boxed(chunks: Vec<(Bytes, bool)>) -> Box<dyn TsSource> {
         Box::new(FixtureSource::new(chunks))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_empty_bursts_yield_during_collection_and_pass_through() {
+        for target_ms in [1_000, 0] {
+            let first = packet(PID, Some(0), false, b'a');
+            let second = packet(PID, Some(90_000), false, b'b');
+            let mut chunks = vec![(Bytes::new(), false); 64];
+            chunks.extend([(first.clone(), false), (second.clone(), false)]);
+            let mut inner = FixtureSource::new(chunks);
+            inner.count_reads = true;
+            let mut source =
+                StartupBufferedSource::new(Box::new(inner), config(target_ms, 4096, 500), None);
+            let stats = source.stats_handle().unwrap();
+
+            let mut pending = Box::pin(source.next());
+            assert!(futures::poll!(pending.as_mut()).is_pending());
+            assert_eq!(stats.snapshot().downloaded, 1);
+            assert_eq!(stats.snapshot().buffer_ms, 0);
+            // Empty input cannot start the first-media deadline. An independently ready
+            // source must remain serviceable while this source has no media to publish.
+            let mut other = StartupBufferedSource::new(
+                boxed(vec![(Bytes::from_static(b"other"), false)]),
+                config(0, 4096, 500),
+                None,
+            );
+            assert_eq!(other.next().await.unwrap(), Bytes::from_static(b"other"));
+            tokio::time::advance(Duration::from_secs(5)).await;
+            assert_eq!(pending.await.unwrap(), first);
+            assert_eq!(source.next().await.unwrap(), second);
+            assert!(source.next().await.is_none());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_empty_burst_does_not_starve_the_existing_media_deadline() {
+        let first = packet(PID, None, false, b'a');
+        let mut chunks = vec![(first.clone(), false)];
+        chunks.extend(vec![(Bytes::new(), false); 64]);
+        chunks.push((packet(PID, None, false, b'b'), false));
+        let mut inner = FixtureSource::new(chunks);
+        inner.count_reads = true;
+        let mut source =
+            StartupBufferedSource::new(Box::new(inner), config(1_000, 4096, 500), None);
+        let stats = source.stats_handle().unwrap();
+        let mut pending = Box::pin(source.next());
+
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        assert_eq!(stats.snapshot().downloaded, 2);
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert_eq!(pending.await.unwrap(), first);
+        assert_eq!(stats.snapshot().downloaded, 2);
+        assert_eq!(source.next().await.unwrap()[20], b'b');
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_deadline_drains_retained_media_before_ready_source_gap() {
+        let first = packet(PID, None, false, b'a');
+        let after_gap = packet(PID, None, false, b'b');
+        let mut inner = FixtureSource::new(vec![
+            (first.clone(), false),
+            (Bytes::new(), false),
+            (after_gap.clone(), true),
+        ]);
+        inner.count_reads = true;
+        let mut source =
+            StartupBufferedSource::new(Box::new(inner), config(1_000, 4096, 500), None);
+        let stats = source.stats_handle().unwrap();
+        let mut pending = Box::pin(source.next());
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        assert_eq!(stats.snapshot().downloaded, 2);
+
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert_eq!(pending.await.unwrap(), first);
+        assert_eq!(stats.snapshot().downloaded, 2);
+        assert!(!source.take_discontinuity());
+        assert_eq!(source.next().await.unwrap(), after_gap);
+        assert_eq!(stats.snapshot().downloaded, 3);
+        assert!(source.take_discontinuity());
+        assert!(!source.take_discontinuity());
+        assert!(source.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_ready_empty_read_preserves_the_next_payload_gap() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let first = packet(PID, None, false, b'a');
+        let mut inner = FixtureSource::new(vec![
+            (Bytes::new(), true),
+            (Bytes::new(), false),
+            (first.clone(), false),
+        ]);
+        inner.dropped = Some(dropped.clone());
+        let mut source = StartupBufferedSource::new(Box::new(inner), config(0, 4096, 500), None);
+        let mut pending = Box::pin(source.next());
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        drop(pending);
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        assert_eq!(source.next().await.unwrap(), first);
+        assert!(source.take_discontinuity());
+        assert!(!source.take_discontinuity());
+        assert!(source.next().await.is_none());
+        drop(source);
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -907,6 +1030,8 @@ mod tests {
             tokio::pin!(next);
             for _ in 0..16 {
                 tx.send((Bytes::new(), false, true)).unwrap();
+                // Empty chunks yield cooperatively; consume each before timing media arrival.
+                assert!(futures::poll!(next.as_mut()).is_pending());
             }
             assert!(futures::poll!(next.as_mut()).is_pending());
             tokio::time::advance(Duration::from_secs(20)).await;

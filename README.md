@@ -14,11 +14,9 @@ preserving its history, attribution and **AGPL-3.0-or-later** license. It does n
 require an original closed-source engine at runtime and is not an official Ace
 Stream product. The executable remains `outpace`; configuration uses `OUTPACE_*`.
 
-[v0.9.1 release](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.1)
-· [0.9.1 changes](docs/releases/v0.9.1.md)
-· [0.9.1-beta.14 changes](docs/releases/v0.9.1-beta.14.md)
-· [Previous stable v0.9.0](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.0)
-· [Beta.8 history](docs/releases/v0.9.0-beta.8.md)
+[Latest stable release](https://github.com/open-ott-play/outpace-acestream/releases/latest)
+· [All releases and betas](https://github.com/open-ott-play/outpace-acestream/releases)
+· [Release notes](docs/releases/README.md)
 · [Retained replay](docs/timeshift.md)
 · [Documentation](docs/README.md)
 · [HTTP API](docs/native-api.md)
@@ -49,13 +47,25 @@ product archive or runtime acceptance.
 | Tuning and operations | [Configuration](docs/configuration.md) · [Troubleshooting](docs/troubleshooting.md) · [Audio inventory](tools/audioscan/README.md) |
 | Development and source distribution | [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Licensing](docs/licensing.md) |
 
-The installation examples target **v0.9.1**; verify its published assets before
-installing, and pin a verified image digest for production containers.
+The installation examples pin **v0.9.4**, the current published stable release.
+Verify its published assets before installing, and pin a verified image digest
+for production containers.
 Historical version differences remain explicit. In particular, set
 **both `OUTPACE_DATA_DIR` and `OUTPACE_CACHE_DIR`** when moving
 v0.8.1 state to a service directory or volume. Its default-cache derivation was
 fixed after that release. Windows currently supports in-memory peer hints, not
 the Unix durable peer-hint backend; follow the Windows-specific recipe.
+
+## Recent improvements
+
+The 0.9.5 series strengthens replay-memory ownership and peer metadata validation.
+It also refines equal-priority peer selection using bounded timing measurements,
+stops obsolete queued requests after the playback cursor advances, and keeps
+empty-input buffering cooperative with cancellation and startup deadlines.
+See the [0.9.5-beta.2 notes](docs/releases/v0.9.5-beta.2.md) for changes and limits,
+and the [native recovery analysis](docs/protocol/notes/74-native-live-recovery.md)
+for the evidence behind the scheduling adaptation. A source change or healthy
+HTTP endpoint does not establish faster decoded playback on a particular channel.
 
 ## What it does
 

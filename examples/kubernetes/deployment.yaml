@@ -34,7 +34,7 @@ spec:
       containers:
         - name: outpace
           # Verify publication; pin its reviewed index digest for production.
-          image: ghcr.io/open-ott-play/outpace-acestream:0.9.0
+          image: ghcr.io/open-ott-play/outpace-acestream:0.9.4
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

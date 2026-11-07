@@ -48,15 +48,6 @@
   ],
   "packageRules": [
     {
-      "matchUpdateTypes": [
-        "minor",
-        "patch",
-        "pin",
-        "digest"
-      ],
-      "automerge": true
-    },
-    {
       "matchManagers": [
         "cargo"
       ],
@@ -146,5 +137,9 @@
   "platformAutomerge": true,
   "prConcurrentLimit": 3,
   "prHourlyLimit": 2,
-  "rebaseWhen": "behind-base-branch"
+  "rebaseWhen": "behind-base-branch",
+  "automerge": false,
+  "addLabels": [
+    "automerge"
+  ]
 }

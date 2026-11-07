@@ -316,12 +316,14 @@ impl Scheduler {
         let mut piece = next_needed;
         while piece <= ceiling {
             if !self.requested.contains(&piece) && !self.completed.contains(&piece) {
-                // Prefer the peer with the most spare capacity that covers this piece —
-                // spreads load and keeps the rarest-window peers in reserve.
+                // Prefer spare capacity to spread load. Break ties by the earliest window
+                // end within this pass: use a less-flexible peer now instead of stranding
+                // its slot, leaving broader peers for the later pieces. Differences beyond
+                // the bounded ceiling cannot help this pass and retain the existing tie.
                 while let Some(slot) = cap
                     .iter_mut()
                     .filter(|(p, c)| *c > 0 && p.covers(piece))
-                    .max_by_key(|(_, c)| *c)
+                    .max_by_key(|(p, c)| (*c, std::cmp::Reverse(p.max_piece.min(ceiling))))
                 {
                     if admit(slot.0.id, piece) {
                         out.push((slot.0.id, piece));
@@ -452,6 +454,74 @@ mod tests {
         assert_eq!(pieces, vec![0, 1, 2]);
         // p2 (more spare) takes the first piece.
         assert_eq!(got[0].0, 2);
+    }
+
+    #[test]
+    fn equal_capacity_uses_the_narrow_window_before_stranding_its_slot() {
+        for max_in_flight in [1, 2] {
+            for next_needed in [0, u64::MAX - 2] {
+                let head = next_needed + max_in_flight;
+                let narrow = peer(1, next_needed, next_needed, true, 0);
+                let broad = peer(2, next_needed, head, true, 0);
+                for views in [[narrow, broad], [broad, narrow]] {
+                    let mut scheduler = Scheduler::new(max_in_flight as usize);
+                    let got = scheduler.assign(next_needed, head, &views);
+                    // Only the broad peer can serve the later pieces. Serving the cursor
+                    // from it would strand a usable slot on the narrow peer this pass.
+                    let expected: Vec<_> = std::iter::once((1, next_needed))
+                        .chain((next_needed + 1..=head).map(|piece| (2, piece)))
+                        .collect();
+                    assert_eq!(got, expected);
+                    assert_eq!(scheduler.in_flight_count(), expected.len());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn narrower_window_does_not_override_spare_capacity_or_equal_window_ties() {
+        let mut scheduler = Scheduler::new(2);
+        assert_eq!(
+            scheduler.assign(0, 0, &[peer(1, 0, 0, true, 1), peer(2, 0, 9, true, 0)]),
+            vec![(2, 0)]
+        );
+
+        // Exact ties retain the existing last-view preference, used by retry admission.
+        for views in [
+            [peer(1, 0, 9, true, 0), peer(2, 0, 9, true, 0)],
+            [peer(2, 0, 9, true, 0), peer(1, 0, 9, true, 0)],
+        ] {
+            let mut scheduler = Scheduler::new(1);
+            assert_eq!(scheduler.assign(0, 0, &views), vec![(views[1].id, 0)]);
+        }
+
+        // Window differences beyond the bounded horizon are irrelevant to this pass.
+        for views in [
+            [peer(1, 0, 2, true, 0), peer(2, 0, u64::MAX, true, 0)],
+            [peer(2, 0, u64::MAX, true, 0), peer(1, 0, 2, true, 0)],
+        ] {
+            let mut scheduler = Scheduler::new(1);
+            let assigned = scheduler.assign(0, u64::MAX, &views);
+            assert_eq!(assigned, vec![(views[1].id, 0), (views[0].id, 1)]);
+        }
+    }
+
+    #[test]
+    fn rejected_narrow_window_keeps_the_cursor_available_to_a_broader_peer() {
+        let mut scheduler = Scheduler::new(1);
+        let mut attempts = Vec::new();
+        let assigned = scheduler.assign_with_admission(
+            0,
+            1,
+            &[peer(1, 0, 0, true, 0), peer(2, 0, 1, true, 0)],
+            |peer_id, piece| {
+                attempts.push((peer_id, piece));
+                peer_id == 2
+            },
+        );
+        assert_eq!(attempts, vec![(1, 0), (2, 0)]);
+        assert_eq!(assigned, vec![(2, 0)]);
+        assert_eq!(scheduler.requested, BTreeSet::from([0]));
     }
 
     #[test]

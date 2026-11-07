@@ -51,8 +51,9 @@ The installation examples pin **v0.9.5**. The [Latest stable release](https://gi
 provides the currently published downloads.
 Verify its published assets before installing, and pin a verified image digest
 for production containers.
-Unreleased compatibility and resource-control changes are documented in the
-[selected upstream adoption note](docs/protocol/notes/75-selected-upstream-adoption.md).
+The **0.9.6-beta.1** source adds descriptor compatibility, bounded peer-control
+work and optional session admission. See its [release notes](docs/releases/v0.9.6-beta.1.md)
+and verify publication on the linked release page before selecting this beta.
 
 Historical version differences remain explicit. In particular, set
 **both `OUTPACE_DATA_DIR` and `OUTPACE_CACHE_DIR`** when moving

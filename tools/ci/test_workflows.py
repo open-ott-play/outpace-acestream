@@ -24,6 +24,37 @@ def steps_text(job):
 
 
 class WorkflowContracts(unittest.TestCase):
+    def test_dependency_merges_require_current_review_and_completion_wakeups(self):
+        merge = workflow("auto-merge.yml")
+        self.assertEqual(merge["concurrency"]["cancel-in-progress"], "false")
+        self.assertIn("github.run_id", merge["concurrency"]["group"])
+        listeners = set(merge["on"]["workflow_run"]["workflows"])
+        self.assertNotIn(merge["name"], listeners)
+        for path in WORKFLOWS.glob("*.yml"):
+            doc = workflow(path.name)
+            if "pull_request" in doc["on"]:
+                self.assertIn(doc["name"], listeners, path.name)
+        self.assertEqual(merge["on"]["workflow_run"]["types"], ["completed"])
+        self.assertEqual(merge["on"]["pull_request_review"]["types"], ["submitted", "edited", "dismissed"])
+        job = merge["jobs"]["auto-merge"]
+        self.assertEqual(job["uses"].split("@")[0], "victron-venus/venus-os-ci-toolkit/.github/workflows/auto-merge.yml")
+        self.assertNotIn("steps", job)
+        self.assertEqual(job["with"], {
+            "reviewed-merge": "true", "reviewed-single-pass": "true",
+            "allow-owned-bot-actions-review": "true",
+            "required-status-checks": "HLS audio synthetic,acestream identifier hygiene,Rust test,A/B harness test,Rust lint",
+        })
+        self.assertEqual(job["secrets"], {"BOT_PAT": "${{ secrets.BOT_PAT }}"})
+        withdrawal = merge["jobs"]["withdraw-auto-merge"]
+        self.assertEqual(withdrawal["uses"], job["uses"])
+        self.assertEqual(withdrawal["with"], {"withdrawal-only": "true"})
+        for guard in ("pull_request_target", "unlabeled", "converted_to_draft", "github.event.changes.base"):
+            self.assertIn(guard, withdrawal["if"])
+        config = json.loads((ROOT / "renovate.json").read_text())
+        self.assertEqual(config["addLabels"], ["automerge"])
+        self.assertFalse(config["automerge"])
+        self.assertTrue(all(rule.get("automerge") is not True for rule in config["packageRules"]))
+
     def test_required_contexts_reject_failed_or_unproven_scope(self):
         import os
         import subprocess
@@ -183,7 +214,8 @@ class WorkflowContracts(unittest.TestCase):
         pattern = manager["matchStrings"][0].replace("(?<currentDigest>", "(?P<currentDigest>")
         inventory = (ROOT / "tools/hygiene/allowed-identifiers.txt").read_text()
         matches = list(re.finditer(pattern, inventory))
-        self.assertEqual([match.group("currentDigest") for match in matches], [expected])
+        merge_ref = workflow("auto-merge.yml")["jobs"]["auto-merge"]["uses"].rsplit("@", 1)[1]
+        self.assertEqual({match.group("currentDigest") for match in matches}, {expected, merge_ref})
         for custom_manager in ("custom.jsonata", "custom.regex"):
             rules = [rule for rule in config["packageRules"]
                      if custom_manager in rule.get("matchManagers", [])

@@ -1,0 +1,64 @@
+name: Auto Merge PRs
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled, edited, converted_to_draft]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  workflow_run:
+    workflows: [CI, hygiene, Security analysis, Compose smoke, ARMv7 portability, Auto Approve PRs]
+    types: [completed]
+  status:
+  check_run:
+    types: [completed]
+  schedule:
+    - cron: '41 * * * *'
+  workflow_dispatch:
+
+# A completion event reevaluates current metadata once, including long CI runs.
+# Withdrawal events retain their own slot so newer wakeups cannot discard them.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request_target' && ((github.event.action == 'unlabeled' && github.event.label.name == 'automerge') || github.event.action == 'converted_to_draft' || (github.event.action == 'edited' && github.event.changes.base && github.event.pull_request.base.ref != github.event.repository.default_branch)) && github.run_id || 'state' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  auto-merge:
+    if: >-
+      (contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name) &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       contains(fromJSON('["4alvit","californiantiramisu","dependabot[bot]","renovate[bot]"]'), github.event.pull_request.user.login)) ||
+      (contains(fromJSON('["workflow_run","status","check_run","schedule","workflow_dispatch"]'), github.event_name) &&
+       github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    # Metadata only: the shared workflow validates same-repo trusted authors,
+    # current-head independent approval, every observed check and the current base.
+    uses: victron-venus/venus-os-ci-toolkit/.github/workflows/auto-merge.yml@ffa568e48a9510bf66dcfe01d6646f6840382431
+    with:
+      reviewed-merge: true
+      reviewed-single-pass: true
+      allow-owned-bot-actions-review: true
+      required-status-checks: HLS audio synthetic,acestream identifier hygiene,Rust test,A/B harness test,Rust lint
+    secrets:
+      BOT_PAT: ${{ secrets.BOT_PAT }}
+
+  withdraw-auto-merge:
+    permissions:
+      contents: read
+      pull-requests: write
+    # Also revoke requests created by the former native Renovate merge policy.
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      ((github.event.action == 'unlabeled' && github.event.label.name == 'automerge') || github.event.action == 'converted_to_draft' || (github.event.action == 'edited' && github.event.changes.base && github.event.pull_request.base.ref != github.event.repository.default_branch)) &&
+      contains(fromJSON('["4alvit","californiantiramisu","dependabot[bot]","renovate[bot]"]'), github.event.pull_request.user.login)
+    uses: victron-venus/venus-os-ci-toolkit/.github/workflows/auto-merge.yml@ffa568e48a9510bf66dcfe01d6646f6840382431
+    with:
+      withdrawal-only: true
+    secrets:
+      BOT_PAT: ${{ secrets.BOT_PAT }}

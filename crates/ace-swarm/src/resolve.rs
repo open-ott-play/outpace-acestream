@@ -307,7 +307,7 @@ pub async fn transport_bytes_via_peer<S: AsyncRead + AsyncWrite + Unpin>(
 
     let (peer_ut_id, metadata_size) = read_metadata_params(session).await?;
     let blob = session
-        .fetch_metadata(peer_ut_id, metadata_size)
+        .fetch_metadata(peer_ut_id, OUR_UT_METADATA_ID as u8, metadata_size)
         .await
         .map_err(|_| ResolveError::Peer("ut_metadata fetch failed"))?;
     if !checked_transport_file_hash(&blob, handshake_infohash) {

@@ -228,17 +228,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     /// request every 16 KiB piece from the peer and assemble the data blocks into a single
     /// buffer of `metadata_size` bytes.
     ///
-    /// `peer_ut_metadata_id` is the ext id the peer assigned to `ut_metadata` in its extended
-    /// handshake `m` dict; the BEP-10 handshake must already have been exchanged. Unrelated
-    /// messages are ignored; a `Reject` or an early close is an error.
+    /// `peer_ut_metadata_id` is the id the peer assigned to incoming `ut_metadata` requests;
+    /// `our_ut_metadata_id` is the id we advertised for its replies. BEP-10 ids are directional,
+    /// so these need not match. The extended handshake must already have been exchanged.
+    /// Unrelated extensions are ignored. Every data block must match the advertised metadata
+    /// size and its exact 16 KiB piece geometry; conflicting duplicates are rejected.
     pub async fn fetch_metadata(
         &mut self,
         peer_ut_metadata_id: u8,
+        our_ut_metadata_id: u8,
         metadata_size: usize,
     ) -> Result<Vec<u8>> {
         use ace_wire::ut_metadata::{
             piece_count, request_piece, MetadataMessage, METADATA_BLOCK_LEN,
         };
+        if peer_ut_metadata_id == 0 || our_ut_metadata_id == 0 {
+            return Err(PeerError::Protocol("metadata extension is disabled"));
+        }
+        let total_size = i64::try_from(metadata_size)
+            .map_err(|_| PeerError::Protocol("invalid metadata size"))?;
         let pieces = piece_count(metadata_size);
         if pieces == 0 {
             return Ok(Vec::new());
@@ -256,22 +264,34 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
         let mut remaining = pieces;
         while remaining > 0 {
             match self.read_message().await? {
-                PeerMessage::Extended { ext_id, payload } if ext_id != 0 => {
+                PeerMessage::Extended { ext_id, payload } if ext_id == our_ut_metadata_id => {
                     match MetadataMessage::parse(&payload) {
-                        Some(MetadataMessage::Data { piece, data, .. }) => {
-                            let idx = piece as usize;
-                            if piece < 0 || idx >= pieces {
+                        Some(MetadataMessage::Data {
+                            piece,
+                            total_size: advertised_size,
+                            data,
+                        }) => {
+                            let Ok(idx) = usize::try_from(piece) else {
+                                continue;
+                            };
+                            if idx >= pieces {
                                 continue;
                             }
                             let off = idx * METADATA_BLOCK_LEN;
-                            let end = (off + data.len()).min(metadata_size);
-                            if off < end {
-                                blob[off..end].copy_from_slice(&data[..end - off]);
+                            let length = (metadata_size - off).min(METADATA_BLOCK_LEN);
+                            if advertised_size != Some(total_size) || data.len() != length {
+                                return Err(PeerError::Protocol("invalid metadata block geometry"));
                             }
-                            if !have[idx] {
-                                have[idx] = true;
-                                remaining -= 1;
+                            let end = off + length;
+                            if have[idx] {
+                                if blob[off..end] != data {
+                                    return Err(PeerError::Protocol("conflicting metadata block"));
+                                }
+                                continue;
                             }
+                            blob[off..end].copy_from_slice(&data);
+                            have[idx] = true;
+                            remaining -= 1;
                         }
                         Some(MetadataMessage::Reject { .. }) => {
                             return Err(PeerError::Protocol("metadata request rejected"));
@@ -307,6 +327,9 @@ fn looks_like_acestream_peer_id_prefix(bytes: &[u8]) -> bool {
     bytes.len() <= PREFIX.len() && PREFIX.starts_with(bytes)
         || bytes.len() > PREFIX.len() && bytes.starts_with(PREFIX)
 }
+
+#[cfg(test)]
+mod metadata_tests;
 
 /// Apply `dur` as a ceiling to `fut`, mapping elapsed time to `PeerError::Timeout`.
 async fn with_timeout<F, T>(dur: Duration, fut: F) -> Result<T>
@@ -680,7 +703,8 @@ mod tests {
             .collect();
         let total = metadata.len();
         let meta_peer = metadata.clone();
-        let peer_ut_id = 2u8;
+        let peer_ut_id = 7u8;
+        let our_ut_id = 2u8;
 
         let (client, server) = tokio::io::duplex(64 * 1024);
         // Mock peer: answer every ut_metadata request with the matching data block.
@@ -698,7 +722,7 @@ mod tests {
                             let end = (off + METADATA_BLOCK_LEN).min(total);
                             let resp = data_piece(piece, total as i64, &meta_peer[off..end]);
                             sess.send(&PeerMessage::Extended {
-                                ext_id: peer_ut_id,
+                                ext_id: our_ut_id,
                                 payload: resp,
                             })
                             .await
@@ -712,7 +736,10 @@ mod tests {
         });
 
         let mut session = PeerSession::new(client);
-        let got = session.fetch_metadata(peer_ut_id, total).await.unwrap();
+        let got = session
+            .fetch_metadata(peer_ut_id, our_ut_id, total)
+            .await
+            .unwrap();
         assert_eq!(got, metadata);
         srv.await.unwrap();
     }
@@ -735,7 +762,7 @@ mod tests {
             }
         });
         let mut session = PeerSession::new(client);
-        let res = session.fetch_metadata(peer_ut_id, 100).await;
+        let res = session.fetch_metadata(peer_ut_id, peer_ut_id, 100).await;
         assert!(matches!(res, Err(PeerError::Protocol(_))));
         srv.await.unwrap();
     }

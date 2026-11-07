@@ -1,4 +1,6 @@
 //! Serving peers: a pure unchoke policy (`Choker`) and the `SeederSession` serve loop.
+#[cfg(test)]
+mod metadata_tests;
 pub(crate) mod protocol;
 #[cfg(test)]
 mod protocol_tests;
@@ -106,6 +108,9 @@ impl SeederSession {
         });
         let mut unchoked = false;
         let mut advertised_bitfields = false;
+        // BEP-10 mappings are directional: requests use our advertised id 2, but replies
+        // use the id supplied by this peer. Missing mappings in later handshakes retain it.
+        let mut peer_ut_metadata_id: Option<u8> = None;
         // Highest piece already advertised to this peer (via the initial `mi`/live bitfield or a
         // subsequent id=4 HAVE). Set from the same snapshot the bitfield is built from, then
         // advanced one HAVE per newly completed piece (issue #94).
@@ -157,33 +162,53 @@ impl SeederSession {
                 crate::alog!("[seed-session] <- {}", seed_message_summary(&msg));
             }
             match msg {
-                PeerMessage::Extended { ext_id: 0, .. } if !advertised_bitfields => {
-                    if let Some(store) = &store {
-                        // Seed the live edge from the very snapshot the bitfield advertises, so a
-                        // piece that completes between here and the first poll still gets a HAVE.
-                        advertised_max = advertise_live_bitfields(session, store, debug).await?;
+                PeerMessage::Extended { ext_id: 0, payload } => {
+                    if let Ok(handshake) = ExtendedHandshake::parse(&payload) {
+                        if let Some(id) = handshake
+                            .ut_metadata_id()
+                            .and_then(|id| u8::try_from(id).ok())
+                        {
+                            peer_ut_metadata_id = (id != 0).then_some(id);
+                        }
                     }
-                    advertised_bitfields = true;
+                    if !advertised_bitfields {
+                        if let Some(store) = &store {
+                            // Seed the live edge from the very snapshot the bitfield advertises, so a
+                            // piece that completes between here and the first poll still gets a HAVE.
+                            advertised_max =
+                                advertise_live_bitfields(session, store, debug).await?;
+                        }
+                        advertised_bitfields = true;
+                    }
                 }
                 PeerMessage::Extended { ext_id: 2, payload } => {
-                    if let Some(metadata) = &metadata {
+                    if let (Some(metadata), Some(response_id)) = (&metadata, peer_ut_metadata_id) {
                         if let Some(ace_wire::ut_metadata::MetadataMessage::Request { piece }) =
                             ace_wire::ut_metadata::MetadataMessage::parse(&payload)
                         {
-                            let piece = piece.max(0) as usize;
-                            let start = piece * ace_wire::ut_metadata::METADATA_BLOCK_LEN;
-                            if start < metadata.len() {
-                                let end = (start + ace_wire::ut_metadata::METADATA_BLOCK_LEN)
-                                    .min(metadata.len());
-                                let payload = ace_wire::ut_metadata::data_piece(
-                                    piece as i64,
-                                    metadata.len() as i64,
-                                    &metadata[start..end],
-                                );
-                                session
-                                    .send(&PeerMessage::Extended { ext_id: 2, payload })
-                                    .await?;
-                            }
+                            let Some(start) = usize::try_from(piece)
+                                .ok()
+                                .and_then(|index| {
+                                    index.checked_mul(ace_wire::ut_metadata::METADATA_BLOCK_LEN)
+                                })
+                                .filter(|&offset| offset < metadata.len())
+                            else {
+                                continue;
+                            };
+                            let end = start
+                                + (metadata.len() - start)
+                                    .min(ace_wire::ut_metadata::METADATA_BLOCK_LEN);
+                            let payload = ace_wire::ut_metadata::data_piece(
+                                piece,
+                                metadata.len() as i64,
+                                &metadata[start..end],
+                            );
+                            session
+                                .send(&PeerMessage::Extended {
+                                    ext_id: response_id,
+                                    payload,
+                                })
+                                .await?;
                         }
                     }
                 }
@@ -718,18 +743,30 @@ mod tests {
 
         client_session
             .send(&PeerMessage::Extended {
+                ext_id: 0,
+                payload: b"d1:md11:ut_metadatai7eee".to_vec(),
+            })
+            .await
+            .unwrap();
+        client_session
+            .send(&PeerMessage::Extended {
                 ext_id: 2,
                 payload: request_piece(0),
             })
             .await
             .unwrap();
         let msg = client_session.read_message().await.unwrap();
-        let PeerMessage::Extended { ext_id: 2, payload } = msg else {
+        let PeerMessage::Extended { ext_id: 7, payload } = msg else {
             panic!("expected ut_metadata data");
         };
         match MetadataMessage::parse(&payload).unwrap() {
-            MetadataMessage::Data { piece, data, .. } => {
+            MetadataMessage::Data {
+                piece,
+                total_size,
+                data,
+            } => {
                 assert_eq!(piece, 0);
+                assert_eq!(total_size, Some(27));
                 assert_eq!(data, b"AceStreamTransport-metadata");
             }
             other => panic!("expected data, got {other:?}"),

@@ -47,7 +47,8 @@ product archive or runtime acceptance.
 | Tuning and operations | [Configuration](docs/configuration.md) · [Troubleshooting](docs/troubleshooting.md) · [Audio inventory](tools/audioscan/README.md) |
 | Development and source distribution | [Architecture](docs/architecture.md) · [Development](docs/development.md) · [Licensing](docs/licensing.md) |
 
-The installation examples pin **v0.9.4**, the current published stable release.
+The installation examples pin **v0.9.5**. The [Latest stable release](https://github.com/open-ott-play/outpace-acestream/releases/latest)
+provides the currently published downloads.
 Verify its published assets before installing, and pin a verified image digest
 for production containers.
 Historical version differences remain explicit. In particular, set
@@ -62,7 +63,7 @@ The 0.9.5 series strengthens replay-memory ownership and peer metadata validatio
 It also refines equal-priority peer selection using bounded timing measurements,
 stops obsolete queued requests after the playback cursor advances, and keeps
 empty-input buffering cooperative with cancellation and startup deadlines.
-See the [0.9.5-beta.2 notes](docs/releases/v0.9.5-beta.2.md) for changes and limits,
+See the [0.9.5 release notes](docs/releases/v0.9.5.md) for changes and limits,
 and the [native recovery analysis](docs/protocol/notes/74-native-live-recovery.md)
 for the evidence behind the scheduling adaptation. A source change or healthy
 HTTP endpoint does not establish faster decoded playback on a particular channel.

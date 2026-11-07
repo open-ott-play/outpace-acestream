@@ -18,7 +18,7 @@ proxy supplies the viewing interface and channel catalog.
 | Select environment values and buffering limits | [Configuration reference](configuration.md) |
 | Diagnose startup, codecs, network, cache or deployment problems | [Troubleshooting](troubleshooting.md) |
 
-Start with the platform-specific recipe. The examples pin the published stable v0.9.4; verify
+Start with the platform-specific recipe. The examples pin v0.9.5; verify
 the published assets and source before installing. Historical version
 differences remain explicit.
 Preserve the data directory across upgrades; use the upgrade and rollback

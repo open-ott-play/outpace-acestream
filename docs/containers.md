@@ -5,12 +5,12 @@ player or proxy. It supports Linux `amd64`, `arm64`, and `arm/v7`. Docker Deskto
 can run it on macOS or Windows through its Linux VM; a native binary is also
 available in the [installation guide](installation.md).
 
-These examples target **v0.9.4**. Confirm publication on the
-[release page](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.4)
+These examples target **v0.9.5**. Confirm publication on the
+[release page](https://github.com/open-ott-play/outpace-acestream/releases/tag/v0.9.5)
 and inspect the multi-platform image before starting it:
 
 ```bash
-export OUTPACE_IMAGE='ghcr.io/open-ott-play/outpace-acestream:0.9.4'
+export OUTPACE_IMAGE='ghcr.io/open-ott-play/outpace-acestream:0.9.5'
 docker buildx imagetools inspect "$OUTPACE_IMAGE"
 docker pull "$OUTPACE_IMAGE"
 ```
@@ -80,7 +80,7 @@ have one, then edit it. Preserve an existing operator configuration.
 Set these values in `.env`:
 
 ```dotenv
-OUTPACE_IMAGE=ghcr.io/open-ott-play/outpace-acestream:0.9.4
+OUTPACE_IMAGE=ghcr.io/open-ott-play/outpace-acestream:0.9.5
 OUTPACE_ACE_COMPAT=1
 OUTPACE_CACHE_TYPE=memory
 OUTPACE_CACHE_DIR=/var/lib/outpace/cache

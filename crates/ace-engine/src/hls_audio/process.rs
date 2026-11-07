@@ -2583,6 +2583,7 @@ mod task4_preflight_tests {
     #[tokio::test]
     async fn preflight_accepts_missing_layer_one_decoder_when_required_codecs_exist() {
         let _serial = process_test_lock().await;
+        reset_probe_test_counts();
         let _restore = RestoreEnv::capture("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY");
         std::env::set_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY", "mp1");
         let (prepared, _) = fake_prepared_child(ChildMode::CapabilityListing);
@@ -2594,23 +2595,88 @@ mod task4_preflight_tests {
             Err(HlsPreflightError::Smoke),
             "Layer I absence is not a capability failure; the fake smoke output still fails later"
         );
+        let (started, reaped, pumps, joined) = probe_test_counts();
+        assert_eq!((started, reaped, pumps, joined), (6, 6, 18, 18));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn preflight_runs_all_capability_probes_sequentially_before_smoke() {
-        let _serial = process_test_lock().await;
-        reset_probe_test_counts();
-        let _restore = RestoreEnv::capture("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY");
-        std::env::remove_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY");
-        let (prepared, _) = fake_prepared_child(ChildMode::CapabilityListing);
-        let (_cancel_tx, cancel) = watch::channel(false);
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Test orchestration with a controlled executor. Six real child launches can
+        // consume the aggregate deadline on a busy host before this assertion reaches
+        // the smoke validator; process ownership is covered by the probe tests below.
+        let prepared = PreparedNormalizer {
+            executable: PathBuf::from("synthetic-preflight-executable"),
+        };
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(10);
+        let listings = [
+            ("-demuxers", " D mpegts\n"),
+            ("-muxers", " E mpegts\n"),
+            ("-encoders", " A aac\n"),
+            ("-decoders", " A mp2\n A mp3\n A ac3\n"),
+            ("-protocols", "pipe\n"),
+        ];
+        let (smoke, layout) = smoke_input();
+        let smoke_command = build_command(&prepared, &layout);
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut started = 0;
+        let result = preflight_prepared_with(&prepared, deadline, |command, input, aggregate| {
+            assert_eq!(
+                aggregate, deadline,
+                "all probes share the original deadline"
+            );
+            assert_eq!(
+                completed.load(Ordering::SeqCst),
+                started,
+                "the previous probe must finish before the next is dispatched"
+            );
+            assert_eq!(
+                command.as_std().get_program(),
+                prepared.executable.as_os_str()
+            );
+            let output = if started < listings.len() {
+                let (argument, listing) = listings[started];
+                assert!(input.is_empty(), "listing probes have no media input");
+                assert_eq!(
+                    command.as_std().get_args().collect::<Vec<_>>(),
+                    ["-hide_banner", argument]
+                );
+                listing.as_bytes().to_vec()
+            } else {
+                assert_eq!(started, listings.len(), "exactly one smoke probe follows");
+                assert_eq!(input, smoke, "only smoke receives the TS fixture");
+                assert!(!input.is_empty());
+                assert_eq!(
+                    command.as_std().get_args().collect::<Vec<_>>(),
+                    smoke_command.as_std().get_args().collect::<Vec<_>>()
+                );
+                Vec::new()
+            };
+            started += 1;
+            let completed = completed.clone();
+            async move {
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(probe_deadline(aggregate)) => {
+                        Err(HlsPreflightError::Timeout)
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        completed.fetch_add(1, Ordering::SeqCst);
+                        Ok(output)
+                    }
+                }
+            }
+        })
+        .await;
         assert_eq!(
-            preflight_prepared(&prepared, cancel, Instant::now() + Duration::from_secs(10)).await,
+            result,
             Err(HlsPreflightError::Smoke),
             "all five capability listings pass before the fake empty smoke output is rejected",
         );
-        let (started, reaped, pumps, joined) = probe_test_counts();
-        assert_eq!((started, reaped, pumps, joined), (6, 6, 18, 18));
+        assert_eq!((started, completed.load(Ordering::SeqCst)), (6, 6));
+        assert_eq!(Instant::now().duration_since(start), Duration::from_secs(6));
     }
 
     #[tokio::test(start_paused = true)]

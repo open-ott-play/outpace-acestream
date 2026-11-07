@@ -7,6 +7,8 @@ the GitHub release page determines whether a version and its assets are publishe
 
 ## 0.9.5 series
 
+- [0.9.5](v0.9.5.md): stable consolidation of metadata, memory ownership and
+  live scheduling/recovery improvements.
 - [0.9.5-beta.2](v0.9.5-beta.2.md): measured peer selection, stale-request
   suppression, cooperative buffering and native recovery research.
 - [0.9.5-beta.1](v0.9.5-beta.1.md): retained-history memory ownership and strict

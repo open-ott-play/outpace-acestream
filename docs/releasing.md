@@ -8,6 +8,12 @@ prerelease names and build metadata, and requires an exact match with the
 reviewed PR before creating a tag. Published tags are immutable; never replace
 an existing tag or its assets.
 
+For each stable version, update the README release summary, release-notes index,
+native installation examples, Docker/Compose defaults and Kubernetes image pins
+together. Keep historical release notes and version-specific migration caveats
+unchanged. Examples must ask operators to verify publication before installation;
+source notes alone do not establish that downloadable assets exist.
+
 A beta is an installable product prerelease, with the same platform and source
 requirements as stable. GitHub marks it as a prerelease and explicitly excludes
 it from Latest. For example, `v0.9.0-beta.1` requires Cargo version

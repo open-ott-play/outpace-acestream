@@ -48,7 +48,7 @@ Copy [`compose.yml`](../tools/deploy/lxc/compose.yml) to `/opt/outpace/compose.y
 `/opt/outpace/.env`:
 
 ```dotenv
-OUTPACE_IMAGE=ghcr.io/open-ott-play/outpace-acestream:0.9.4
+OUTPACE_IMAGE=ghcr.io/open-ott-play/outpace-acestream:0.9.5
 ```
 
 Verify that the selected release is published and use its accepted immutable

@@ -38,6 +38,17 @@ enum Command {
         chunk: u16,
         reply: tokio::sync::oneshot::Sender<Option<(Vec<u8>, [u8; 8])>>,
     },
+    ReciprocalGet {
+        piece: u64,
+        chunk: u16,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        reply: tokio::sync::oneshot::Sender<Option<super::ReciprocalChunk>>,
+    },
+    #[cfg(test)]
+    Pause {
+        reached: Arc<tokio::sync::Notify>,
+        gate: mpsc::Receiver<()>,
+    },
     SyncPut {
         piece: u64,
         chunk: u16,
@@ -62,17 +73,20 @@ enum Command {
 pub(super) struct DiskBackend {
     tx: mpsc::Sender<Command>,
     state: Arc<Mutex<State>>,
+    reciprocal: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Clone)]
 pub(super) struct DiskHandle {
     tx: mpsc::Sender<Command>,
+    reciprocal: Arc<tokio::sync::Semaphore>,
 }
 
 impl DiskBackend {
     pub(super) fn handle(&self) -> DiskHandle {
         DiskHandle {
             tx: self.tx.clone(),
+            reciprocal: self.reciprocal.clone(),
         }
     }
     pub(super) fn new(dir: PathBuf, chunk_length: u64) -> std::io::Result<Self> {
@@ -86,7 +100,11 @@ impl DiskBackend {
         std::thread::Builder::new()
             .name("outpace-disk-cache".into())
             .spawn(move || Actor::new(dir, chunk_length, actor_state).run(rx))?;
-        Ok(Self { tx, state })
+        Ok(Self {
+            tx,
+            state,
+            reciprocal: Arc::new(tokio::sync::Semaphore::new(1)),
+        })
     }
 
     pub(super) fn put(&mut self, piece: u64, chunk: u16, header: [u8; 8], data: &[u8]) -> Stored {
@@ -172,6 +190,23 @@ impl DiskBackend {
 }
 
 impl DiskHandle {
+    pub(super) async fn reciprocal_get(
+        &self,
+        piece: u64,
+        chunk: u16,
+    ) -> Option<super::ReciprocalChunk> {
+        let permit = self.reciprocal.clone().acquire_owned().await.ok()?;
+        let (reply, done) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(Command::ReciprocalGet {
+                piece,
+                chunk,
+                permit,
+                reply,
+            })
+            .ok()?;
+        done.await.ok().flatten()
+    }
     pub(super) async fn put(
         &self,
         piece: u64,
@@ -248,6 +283,28 @@ impl Actor {
                     reply,
                 } => {
                     let _ = reply.send(self.get(piece, chunk));
+                }
+                Command::ReciprocalGet {
+                    piece,
+                    chunk,
+                    permit,
+                    reply,
+                } => {
+                    if !reply.is_closed() {
+                        let result =
+                            self.get(piece, chunk)
+                                .map(|(data, header)| super::ReciprocalChunk {
+                                    data,
+                                    header,
+                                    permit: Some(permit),
+                                });
+                        let _ = reply.send(result);
+                    }
+                }
+                #[cfg(test)]
+                Command::Pause { reached, gate } => {
+                    reached.notify_one();
+                    let _ = gate.recv();
                 }
                 Command::SyncPut {
                     piece,
@@ -502,5 +559,62 @@ mod tests {
         assert_eq!(backend.open_handles(), MAX_OPEN_PIECES);
         while backend.evict_lowest().is_some() {}
         assert_eq!(backend.open_handles(), 0);
+    }
+}
+
+#[cfg(test)]
+mod reciprocal_lifetime_tests {
+    use super::*;
+    use std::future::Future;
+    #[tokio::test]
+    async fn cancelled_disk_reply_keeps_admission_until_queued_operation_retires() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut backend = DiskBackend::new(dir.path().join("store"), 2).unwrap();
+        backend.put(7, 0, [1; 8], b"ab");
+        let handle = backend.handle();
+        let (gate, paused) = mpsc::channel();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        handle
+            .tx
+            .send(Command::Pause {
+                reached: reached.clone(),
+                gate: paused,
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), reached.notified())
+            .await
+            .unwrap();
+        let mut first = Box::pin(handle.reciprocal_get(7, 0));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(first.as_mut().poll(cx).is_pending()))
+                .await
+        );
+        assert_eq!(handle.reciprocal.available_permits(), 0);
+        drop(first);
+        assert_eq!(
+            handle.reciprocal.available_permits(),
+            0,
+            "queued cancelled operation still owns admission"
+        );
+        let mut next_generation = Box::pin(handle.reciprocal_get(7, 0));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                next_generation.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        drop(gate);
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), next_generation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(chunk.data, b"ab");
+        assert_eq!(
+            handle.reciprocal.available_permits(),
+            0,
+            "retained result keeps admission"
+        );
+        drop(chunk);
+        assert_eq!(handle.reciprocal.available_permits(), 1);
     }
 }

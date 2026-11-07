@@ -10,6 +10,7 @@ enum SourceCase {
 
 async fn next_owner_after_measured_completions(case: SourceCase) -> u64 {
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: 752,
         chunk_length: 376,

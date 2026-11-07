@@ -74,6 +74,21 @@ has a separate opt-in resolution policy. Read
 [content-ID resolution](playback.md#content-id-resolution) before using
 `OUTPACE_BEP9_CONTENT_ID_FALLBACK=1`; it is not a general fix for all catalog IDs.
 
+### Protected descriptors and provider capacity
+
+A decoded `premium=1` descriptor returns `encrypted content is not supported` before
+starting discovery or issuing a playback URL. Malformed authoritative protection metadata
+returns `invalid content protection metadata`. Both are native HTTP `422` failures;
+compatibility JSON retains its normal error envelope. Missing or integer-zero protection
+metadata remains eligible. Transport wrapping/encryption and source signatures do not
+by themselves imply protected media. This check does not add premium playback support.
+
+`session capacity reached` with HTTP `503` and `Retry-After: 1` means the optional
+`OUTPACE_MAX_SESSIONS` provider cap is occupied. Reusing an existing source is allowed;
+pending starts and retained VOD readers also occupy slots. Inspect `occupied_sessions`
+and `max_sessions` before increasing the cap. This differs from HLS readiness `503`;
+changing the cap does not accelerate peers or make an unsupported source playable.
+
 ### Discovery and media progress
 
 No productive peers can result from an unavailable or stale source, failed
@@ -107,6 +122,10 @@ player buffers together; do not independently increase all three. Change one
 setting at a time and compare actual startup and sustained decode results.
 
 ### Continuity and recovery diagnostics
+
+Native status includes `livepos.buffer_complete`. When false, zero buffer figures
+mean the bounded scan has no complete current measurement; do not interpret them
+as proof of an empty source. Compatibility response keys remain unchanged.
 
 A `[hls] continuity reset` event identifies the first reset after published media:
 `source_event`, `receiver_lag`, `transport_marker`, `audio_layout`, `clock_reset`,

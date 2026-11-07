@@ -7,6 +7,7 @@ const VIDEO: u16 = 0x101;
 
 fn continuity() -> Continuity {
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: 4,
         chunk_length: 2,
@@ -310,6 +311,7 @@ async fn buffered_output_fixture() -> BufferedOutputFixture {
     let mut signed = payload.clone();
     signed.extend(auth.sign(&payload));
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: signed.len() as u64,
         chunk_length: signed.len() as u64,

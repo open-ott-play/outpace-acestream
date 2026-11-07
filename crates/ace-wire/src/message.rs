@@ -49,63 +49,75 @@ pub enum PeerMessage {
 
 impl PeerMessage {
     pub fn encode(&self) -> Vec<u8> {
-        let mut body = Vec::new();
+        let body_len = match self {
+            PeerMessage::KeepAlive => 0,
+            PeerMessage::Choke
+            | PeerMessage::Unchoke
+            | PeerMessage::Interested
+            | PeerMessage::NotInterested => 1,
+            PeerMessage::Have(_) => 5,
+            PeerMessage::Bitfield(bytes) => 1 + bytes.len(),
+            PeerMessage::Request { .. } | PeerMessage::Cancel { .. } => 13,
+            PeerMessage::Piece { block, .. } => 9 + block.len(),
+            PeerMessage::Extended { payload, .. } => 2 + payload.len(),
+            PeerMessage::Unknown { payload, .. } => 1 + payload.len(),
+        };
+        let mut out = Vec::with_capacity(4 + body_len);
+        out.extend_from_slice(&(body_len as u32).to_be_bytes());
         match self {
             PeerMessage::KeepAlive => {}
-            PeerMessage::Choke => body.push(0),
-            PeerMessage::Unchoke => body.push(1),
-            PeerMessage::Interested => body.push(2),
-            PeerMessage::NotInterested => body.push(3),
+            PeerMessage::Choke => out.push(0),
+            PeerMessage::Unchoke => out.push(1),
+            PeerMessage::Interested => out.push(2),
+            PeerMessage::NotInterested => out.push(3),
             PeerMessage::Have(i) => {
-                body.push(4);
-                body.extend_from_slice(&i.to_be_bytes());
+                out.push(4);
+                out.extend_from_slice(&i.to_be_bytes());
             }
             PeerMessage::Bitfield(b) => {
-                body.push(5);
-                body.extend_from_slice(b);
+                out.push(5);
+                out.extend_from_slice(b);
             }
             PeerMessage::Request {
                 index,
                 begin,
                 length,
             } => {
-                body.push(6);
-                body.extend_from_slice(&index.to_be_bytes());
-                body.extend_from_slice(&begin.to_be_bytes());
-                body.extend_from_slice(&length.to_be_bytes());
+                out.push(6);
+                out.extend_from_slice(&index.to_be_bytes());
+                out.extend_from_slice(&begin.to_be_bytes());
+                out.extend_from_slice(&length.to_be_bytes());
             }
             PeerMessage::Piece {
                 index,
                 begin,
                 block,
             } => {
-                body.push(7);
-                body.extend_from_slice(&index.to_be_bytes());
-                body.extend_from_slice(&begin.to_be_bytes());
-                body.extend_from_slice(block);
+                out.push(7);
+                out.extend_from_slice(&index.to_be_bytes());
+                out.extend_from_slice(&begin.to_be_bytes());
+                out.extend_from_slice(block);
             }
             PeerMessage::Cancel {
                 index,
                 begin,
                 length,
             } => {
-                body.push(8);
-                body.extend_from_slice(&index.to_be_bytes());
-                body.extend_from_slice(&begin.to_be_bytes());
-                body.extend_from_slice(&length.to_be_bytes());
+                out.push(8);
+                out.extend_from_slice(&index.to_be_bytes());
+                out.extend_from_slice(&begin.to_be_bytes());
+                out.extend_from_slice(&length.to_be_bytes());
             }
             PeerMessage::Extended { ext_id, payload } => {
-                body.push(20);
-                body.push(*ext_id);
-                body.extend_from_slice(payload);
+                out.push(20);
+                out.push(*ext_id);
+                out.extend_from_slice(payload);
             }
             PeerMessage::Unknown { id, payload } => {
-                body.push(*id);
-                body.extend_from_slice(payload);
+                out.push(*id);
+                out.extend_from_slice(payload);
             }
         }
-        let mut out = (body.len() as u32).to_be_bytes().to_vec();
-        out.extend_from_slice(&body);
         out
     }
 
@@ -177,6 +189,118 @@ fn be32(p: &[u8], off: usize) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoding_preserves_all_peer_wire_variants() {
+        // Independent literal wire expectations include the four-byte length prefix.
+        // Exercise every encoder arm without deriving its expected length from the encoder.
+        let cases = [
+            (PeerMessage::KeepAlive, vec![0, 0, 0, 0]),
+            (PeerMessage::Choke, vec![0, 0, 0, 1, 0]),
+            (PeerMessage::Unchoke, vec![0, 0, 0, 1, 1]),
+            (PeerMessage::Interested, vec![0, 0, 0, 1, 2]),
+            (PeerMessage::NotInterested, vec![0, 0, 0, 1, 3]),
+            (
+                PeerMessage::Have(0x01020304),
+                vec![0, 0, 0, 5, 4, 1, 2, 3, 4],
+            ),
+            (
+                PeerMessage::Bitfield(vec![0x81, 0x40]),
+                vec![0, 0, 0, 3, 5, 0x81, 0x40],
+            ),
+            (
+                PeerMessage::Request {
+                    index: 1,
+                    begin: 0x01020304,
+                    length: 16384,
+                },
+                vec![0, 0, 0, 13, 6, 0, 0, 0, 1, 1, 2, 3, 4, 0, 0, 0x40, 0],
+            ),
+            (
+                PeerMessage::Cancel {
+                    index: 1,
+                    begin: 0x01020304,
+                    length: 16384,
+                },
+                vec![0, 0, 0, 13, 8, 0, 0, 0, 1, 1, 2, 3, 4, 0, 0, 0x40, 0],
+            ),
+            (
+                PeerMessage::Piece {
+                    index: 1,
+                    begin: 2,
+                    block: vec![0xaa, 0xbb],
+                },
+                vec![0, 0, 0, 11, 7, 0, 0, 0, 1, 0, 0, 0, 2, 0xaa, 0xbb],
+            ),
+            (
+                PeerMessage::Extended {
+                    ext_id: 3,
+                    payload: vec![0xaa, 0xbb],
+                },
+                vec![0, 0, 0, 4, 20, 3, 0xaa, 0xbb],
+            ),
+            (
+                PeerMessage::Unknown {
+                    id: 250,
+                    payload: vec![0xaa, 0xbb],
+                },
+                vec![0, 0, 0, 3, 250, 0xaa, 0xbb],
+            ),
+            // A standard id with vendor framing must retain its custom payload exactly.
+            (
+                PeerMessage::Unknown {
+                    id: 6,
+                    payload: vec![0; 10],
+                },
+                vec![0, 0, 0, 11, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            ),
+        ];
+        for (message, expected) in cases {
+            let encoded = message.encode();
+            assert_eq!(encoded, expected, "wire bytes for {message:?}");
+            assert_eq!(
+                PeerMessage::decode(&encoded).unwrap(),
+                Some((message, encoded.len()))
+            );
+        }
+    }
+
+    #[test]
+    fn encoding_preserves_empty_variable_payloads() {
+        let cases = [
+            (PeerMessage::Bitfield(Vec::new()), vec![0, 0, 0, 1, 5]),
+            (
+                PeerMessage::Piece {
+                    index: 0,
+                    begin: 0,
+                    block: Vec::new(),
+                },
+                vec![0, 0, 0, 9, 7, 0, 0, 0, 0, 0, 0, 0, 0],
+            ),
+            (
+                PeerMessage::Extended {
+                    ext_id: 0,
+                    payload: Vec::new(),
+                },
+                vec![0, 0, 0, 2, 20, 0],
+            ),
+            (
+                PeerMessage::Unknown {
+                    id: 250,
+                    payload: Vec::new(),
+                },
+                vec![0, 0, 0, 1, 250],
+            ),
+        ];
+        for (message, expected) in cases {
+            let encoded = message.encode();
+            assert_eq!(encoded, expected, "empty payload for {message:?}");
+            assert_eq!(
+                PeerMessage::decode(&encoded).unwrap(),
+                Some((message, encoded.len()))
+            );
+        }
+    }
 
     #[test]
     fn keepalive_roundtrip() {

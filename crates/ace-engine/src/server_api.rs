@@ -105,6 +105,7 @@ pub enum ResolvedContent {
     /// A supplied identity with no descriptor yet. Neither live state nor file layout is known.
     Unresolved { infohash: String },
     Swarm {
+        protection: Option<ace_wire::protection::Protection>,
         infohash: String,
         content_id: Option<String>,
         is_live: bool,
@@ -114,6 +115,7 @@ pub enum ResolvedContent {
         filename: Option<String>,
     },
     Hls {
+        protection: ace_wire::protection::Protection,
         content_id: Option<String>,
         manifest_url: String,
         metadata: StreamMetadata,
@@ -124,6 +126,7 @@ impl ResolvedContent {
     pub fn from_transport(source: ResolvedTransport, content_id: Option<String>) -> Self {
         match source {
             ResolvedTransport::Swarm(info) => Self::Swarm {
+                protection: info.protection,
                 infohash: infohash_hex(&info.infohash),
                 content_id,
                 is_live: true,
@@ -131,6 +134,7 @@ impl ResolvedContent {
                 filename: None,
             },
             ResolvedTransport::Vod(info) => Self::Swarm {
+                protection: info.protection,
                 infohash: infohash_hex(&info.infohash),
                 content_id,
                 is_live: false,
@@ -138,9 +142,11 @@ impl ResolvedContent {
                 filename: info.filename,
             },
             ResolvedTransport::Hls {
+                protection,
                 manifest_url,
                 metadata,
             } => Self::Hls {
+                protection,
                 content_id,
                 manifest_url,
                 metadata,
@@ -220,6 +226,7 @@ pub fn analyze_result(c: &ResolvedContent) -> Value {
             "is_live": -1, "is_encrypted": -1, "status": "complete",
         }),
         ResolvedContent::Swarm {
+            protection,
             infohash,
             content_id,
             is_live,
@@ -228,15 +235,16 @@ pub fn analyze_result(c: &ResolvedContent) -> Value {
             "infohash": infohash,
             "content_id": content_id,
             "is_live": bool_flag(*is_live),
-            "is_encrypted": 0,
+            "is_encrypted": protection.map(|p| bool_flag(p == ace_wire::protection::Protection::Protected) as i32).unwrap_or(-1),
             "status": "complete",
         }),
         ResolvedContent::Hls {
+            protection,
             content_id,
             manifest_url,
             metadata,
         } => {
-            let mut result = origin_hls_result(content_id, manifest_url, metadata);
+            let mut result = origin_hls_result(content_id, manifest_url, metadata, *protection);
             result["status"] = json!("complete");
             result
         }
@@ -247,16 +255,18 @@ fn origin_hls_result(
     content_id: &Option<String>,
     manifest_url: &str,
     metadata: &StreamMetadata,
+    protection: ace_wire::protection::Protection,
 ) -> Value {
+    let protected = protection == ace_wire::protection::Protection::Protected;
     // Resolution reads only the descriptor, not the manifest. It establishes neither
     // live/VOD state nor encryption, files, variants, tracks or retention duration.
     json!({
         "content_id": content_id,
         "transport": "hls",
-        "playback_url": manifest_url,
+        "playback_url": if protected { None } else { Some(manifest_url) },
         "is_direct": true,
         "is_live": -1,
-        "is_encrypted": -1,
+        "is_encrypted": if protected { 1 } else { -1 },
         "metadata": {
             "title": metadata.title,
             "bitrate": metadata.bitrate.map(|rate| rate.saturating_mul(8)),
@@ -312,11 +322,12 @@ pub fn media_files_result(c: &ResolvedContent) -> Value {
             json!({ "infohash": infohash, "files": [file] })
         }
         ResolvedContent::Hls {
+            protection,
             content_id,
             manifest_url,
             metadata,
         } => {
-            let mut result = origin_hls_result(content_id, manifest_url, metadata);
+            let mut result = origin_hls_result(content_id, manifest_url, metadata, *protection);
             result["files"] = json!([]);
             result
         }
@@ -450,6 +461,7 @@ mod tests {
     #[test]
     fn analyze_result_exposes_infohash_and_flags() {
         let c = ResolvedContent::Swarm {
+            protection: Some(ace_wire::protection::Protection::Public),
             infohash: "aa".repeat(20),
             content_id: Some("cid".to_string()),
             is_live: true,
@@ -466,6 +478,7 @@ mod tests {
     #[test]
     fn media_files_result_lists_the_single_file_by_infohash() {
         let c = ResolvedContent::Swarm {
+            protection: Some(ace_wire::protection::Protection::Public),
             infohash: "bb".repeat(20),
             content_id: None,
             is_live: false,
@@ -528,6 +541,7 @@ mod transport_contract_tests {
         const URL: &str = "https://cdn.example.test/a%2Fb/master.m3u8?token=a%2Fb&x=1&x=2";
         let content = ResolvedContent::from_transport(
             ResolvedTransport::Hls {
+                protection: ace_wire::protection::Protection::Public,
                 manifest_url: URL.into(),
                 metadata: StreamMetadata {
                     title: Some("Synthetic HLS".into()),

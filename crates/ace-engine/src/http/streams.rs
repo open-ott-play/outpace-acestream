@@ -20,7 +20,10 @@ pub(super) async fn list_streams(State(s): State<AppState>) -> Json<serde_json::
             })
         })
         .collect();
-    Json(json!({ "streams": streams }))
+    let (occupied_sessions, max_sessions) = s.manager.admission_status();
+    Json(
+        json!({ "streams": streams, "occupied_sessions": occupied_sessions, "max_sessions": max_sessions }),
+    )
 }
 
 /// Normalize native Ace selectors once, before any session lookup. Provider-facing bare
@@ -96,7 +99,7 @@ pub(super) async fn stream_status(
                 "clients": session.subscriber_count(),
                 "peers": stats.peers,
                 "bitrate": stats.bitrate,
-                "livepos": live_position_json(stats.livepos.as_ref()),
+                "livepos": native_live_position_json(stats.livepos.as_ref()),
                 "recovery": stats.recovery,
                 "buffer_ms": stats.buffer_ms,
                 "uploaded": stats.uploaded,
@@ -121,6 +124,11 @@ pub(super) async fn stream_segment(
         Ok(id) => id,
         Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
     };
+    if let Err(error @ (ProviderError::ProtectedContent | ProviderError::InvalidProtection)) =
+        s.manager.check_openable(&network, &id)
+    {
+        return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response();
+    }
     // Segment probes must NOT start a stream: only serve from an already-running packager
     // (started when the playlist was fetched). Unknown streams 404 without any provider work.
     let Some(pkg) = s.manager.get_hls(&network, &id).await else {
@@ -132,12 +140,26 @@ pub(super) async fn stream_segment(
     }
 }
 
+/// Provider-source capacity is distinct from the separately bounded origin HLS relay.
+pub(super) fn capacity_error() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "1")],
+        "session capacity reached",
+    )
+        .into_response()
+}
+
 /// Response for a failed stream start on the native routes. `Unresolvable` carries a user-facing
 /// reason (a bare infohash without a verified descriptor, #164) and is returned as `422` with
 /// that text; malformed selectors return `400`. Other failures keep the historical
 /// bodiless `404`.
 async fn stream_start_error(state: &AppState, e: ProviderError) -> Response {
     match e {
+        ProviderError::CapacityExhausted => capacity_error(),
+        error @ (ProviderError::ProtectedContent | ProviderError::InvalidProtection) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response()
+        }
         ProviderError::Invalid(reason) => (StatusCode::BAD_REQUEST, reason).into_response(),
         ProviderError::DirectHls { manifest_url } => {
             resolved_origin_redirect(state, &manifest_url).await
@@ -305,4 +327,39 @@ pub(super) fn ace_stream_session_response(
 
 pub(super) fn reset_stream_keyframe_gate(gate: &mut ace_media::mpegts::KeyframeGate) {
     gate.reset_for_discontinuity();
+}
+
+// Compatibility retains its existing numeric keys; native clients can distinguish an
+// unfinished bounded measurement from a completed empty buffer.
+fn native_live_position_json(
+    position: Option<&crate::provider::LivePositionStats>,
+) -> serde_json::Value {
+    let mut value = live_position_json(position);
+    if let (Some(position), Some(object)) = (position, value.as_object_mut()) {
+        object.insert("buffer_complete".into(), json!(position.buffer_complete));
+    }
+    value
+}
+
+#[cfg(test)]
+mod buffer_contract_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_measurement_freshness_is_native_only() {
+        for complete in [false, true] {
+            let position = crate::provider::LivePositionStats {
+                buffer_complete: complete,
+                ..Default::default()
+            };
+            assert_eq!(
+                native_live_position_json(Some(&position))["buffer_complete"],
+                complete
+            );
+            assert!(live_position_json(Some(&position))
+                .get("buffer_complete")
+                .is_none());
+        }
+        assert!(native_live_position_json(None).is_null());
+    }
 }

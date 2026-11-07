@@ -132,6 +132,7 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
             allow_non_global: config.allow_non_global_broadcast_source,
         },
     )?;
+    apply_max_sessions_env(&mut config, std::env::var("OUTPACE_MAX_SESSIONS"))?;
     if let Ok(bind) = std::env::var("OUTPACE_BIND") {
         config.bind = bind.parse()?;
     }
@@ -297,6 +298,20 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     config.hls_audio.validate()?;
     validate_cache_budget(&config)?;
     Ok(config)
+}
+
+fn apply_max_sessions_env(
+    config: &mut Config,
+    raw: Result<String, std::env::VarError>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match raw {
+        Ok(value) if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => {
+            config.max_sessions = value.parse().map_err(|_| "invalid OUTPACE_MAX_SESSIONS")?;
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        _ => return Err("invalid OUTPACE_MAX_SESSIONS".into()),
+    }
+    Ok(())
 }
 
 fn apply_broadcast_options_env(
@@ -761,7 +776,7 @@ pub async fn build_runtime(
     }
     let networks: Vec<String> = registry.networks().iter().map(|s| s.to_string()).collect();
 
-    let manager = StreamManager::with_audio_languages(
+    let manager = StreamManager::with_admission_config(
         registry,
         config.session_buffer,
         config.hls,
@@ -771,6 +786,7 @@ pub async fn build_runtime(
             .hls_audio
             .preferred_language_tags()
             .expect("configuration was validated"),
+        config.max_sessions,
     );
     manager.spawn_reaper();
     let broadcasts = BroadcastState {
@@ -2547,3 +2563,32 @@ mod tests_shutdown;
 
 #[cfg(test)]
 mod inbound_policy_tests;
+
+#[cfg(test)]
+mod session_limit_config_tests {
+    use super::*;
+
+    #[test]
+    fn optional_provider_limit_is_strict_and_preserves_defaults() {
+        let mut config = Config::default();
+        assert_eq!(config.max_sessions, 0);
+        apply_max_sessions_env(&mut config, Err(std::env::VarError::NotPresent)).unwrap();
+        for (value, expected) in [("0", 0), ("4", 4), ("0008", 8)] {
+            apply_max_sessions_env(&mut config, Ok(value.into())).unwrap();
+            assert_eq!(config.max_sessions, expected);
+        }
+        for value in ["", "-1", "+1", " 2", "2 ", "1.0", "184467440737095516160"] {
+            assert!(apply_max_sessions_env(&mut config, Ok(value.into())).is_err());
+            assert_eq!(config.max_sessions, 8);
+        }
+        assert!(apply_max_sessions_env(
+            &mut config,
+            Err(std::env::VarError::NotUnicode(std::ffi::OsString::new()))
+        )
+        .is_err());
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert_eq!(encoded["max_sessions"], 8);
+        let decoded: Config = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.max_sessions, 8);
+    }
+}

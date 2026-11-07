@@ -19,6 +19,8 @@ mod compat_hls;
 mod native;
 mod origin_gateway;
 mod origin_history;
+mod protection;
+mod provider_admission;
 mod server_api;
 mod source;
 mod startup;

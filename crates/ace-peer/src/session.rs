@@ -4,6 +4,7 @@ use ace_wire::handshake::{
     Handshake, HandshakeProtocol, BITTORRENT_HANDSHAKE_LEN, HANDSHAKE_LEN, HANDSHAKE_PREFIX_LEN,
 };
 use ace_wire::message::PeerMessage;
+use bytes::{Buf, BufMut, BytesMut};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -18,7 +19,7 @@ const INBOUND_PEER_ID_GRACE: Duration = Duration::from_millis(20);
 pub struct PeerSession<S> {
     stream: S,
     /// Bytes read from the stream but not yet consumed into a message.
-    buf: Vec<u8>,
+    buf: BytesMut,
     /// Ceiling applied to each individual I/O await (handshake, send, read).
     timeout: Duration,
     protocol: HandshakeProtocol,
@@ -28,7 +29,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     pub fn new(stream: S) -> Self {
         PeerSession {
             stream,
-            buf: Vec::with_capacity(32 * 1024),
+            buf: BytesMut::with_capacity(32 * 1024),
             timeout: DEFAULT_PEER_TIMEOUT,
             protocol: HandshakeProtocol::default(),
         }
@@ -309,15 +310,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerSession<S> {
     pub async fn read_message(&mut self) -> Result<PeerMessage> {
         loop {
             if let Some((msg, consumed)) = PeerMessage::decode(&self.buf)? {
-                self.buf.drain(..consumed);
+                self.buf.advance(consumed);
                 return Ok(msg);
             }
-            let mut chunk = [0u8; 16 * 1024];
-            let n = with_timeout(self.timeout, self.stream.read(&mut chunk)).await??;
+            // reserve() counts additional bytes beyond len, not the spare-capacity deficit.
+            // Bound every read even when the buffer already has a larger allocation.
+            if self.buf.capacity() - self.buf.len() < 16 * 1024 {
+                self.buf.reserve(16 * 1024);
+            }
+            let mut writable = (&mut self.buf).limit(16 * 1024);
+            let n = with_timeout(self.timeout, self.stream.read_buf(&mut writable)).await??;
             if n == 0 {
                 return Err(PeerError::Closed);
             }
-            self.buf.extend_from_slice(&chunk[..n]);
         }
     }
 }

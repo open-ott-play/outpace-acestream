@@ -67,6 +67,7 @@ pub enum TransportSource {
 /// An HTTP HLS source described inside an encrypted Acestream transport file.
 #[derive(Debug, PartialEq, Eq)]
 pub struct HlsTransportDescriptor {
+    pub protection: crate::protection::Protection,
     /// Original URL, including any signed query. Never rewrite or log credentials.
     pub manifest_url: String,
     pub title: Option<String>,
@@ -74,6 +75,11 @@ pub struct HlsTransportDescriptor {
 }
 
 impl TransportDescriptor {
+    /// Root protection field is authoritative for the wrapped descriptor format.
+    pub fn protection(&self) -> Result<crate::protection::Protection> {
+        crate::protection::classify(self.raw.get(b"premium"))
+    }
+
     /// Total content byte length for a single-file VOD (`length` key), if present.
     ///
     /// Historical synthetic compatibility schema for the legacy ASCII-wrapped descriptor,
@@ -205,6 +211,8 @@ pub fn decode_transport_source_with_key(
         return Err(WireError::Invalid("descriptor not a dict"));
     }
 
+    let protection = crate::protection::classify(raw.get(b"premium"))?;
+
     if raw.get(b"type").and_then(Bencode::as_bytes) == Some(b"hls") {
         let manifest_url = raw
             .get(b"manifest_url")
@@ -214,6 +222,7 @@ pub fn decode_transport_source_with_key(
             .ok_or(WireError::Hls("missing or invalid HLS manifest_url"))?
             .to_string();
         return Ok(TransportSource::Hls(HlsTransportDescriptor {
+            protection,
             manifest_url,
             title: raw
                 .get(b"title")

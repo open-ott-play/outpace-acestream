@@ -45,6 +45,8 @@ pub struct LivePositionStats {
     pub live_first: Option<u64>,
     pub live_last: Option<u64>,
     pub buffer_pieces: u64,
+    /// False means bounded buffer measurement is pending, not a known empty buffer.
+    pub buffer_complete: bool,
 }
 
 /// Independently readable; implementations must never lock the source across an await.
@@ -138,6 +140,9 @@ pub trait StreamProvider: Send + Sync {
     /// (never BEP-9 or a transport url): the index trusts them as-is. Defaults to ignoring it.
     fn remember_live_descriptor(&self, _info: &StreamInfo) {}
 
+    /// Cache a decoded transport only under its exact URL, without catalog identity trust.
+    fn remember_transport_url(&self, _id: &str, _info: &StreamInfo) {}
+
     /// Return an already verified live descriptor without resolving, fetching or opening it.
     /// Only locally originated or signed-catalog descriptors qualify, with an exact infohash
     /// match. Peer metadata and caller-supplied transport URLs must not enter this lookup.
@@ -155,6 +160,10 @@ pub trait StreamProvider: Send + Sync {
 }
 
 pub enum ProviderError {
+    /// The optional provider-owner limit is occupied. Existing shared sources remain usable.
+    CapacityExhausted,
+    ProtectedContent,
+    InvalidProtection,
     NotFound,
     /// The caller's selector is malformed. The message is safe to return to clients.
     Invalid(String),
@@ -174,6 +183,9 @@ pub enum ProviderError {
 impl std::fmt::Debug for ProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::CapacityExhausted => f.write_str("CapacityExhausted"),
+            Self::ProtectedContent => f.write_str("ProtectedContent"),
+            Self::InvalidProtection => f.write_str("InvalidProtection"),
             Self::NotFound => f.write_str("NotFound"),
             Self::Invalid(message) => f.debug_tuple("Invalid").field(message).finish(),
             Self::Backend(message) => f.debug_tuple("Backend").field(message).finish(),
@@ -187,6 +199,9 @@ impl std::fmt::Debug for ProviderError {
 impl std::fmt::Display for ProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ProviderError::CapacityExhausted => f.write_str("session capacity reached"),
+            ProviderError::ProtectedContent => f.write_str("encrypted content is not supported"),
+            ProviderError::InvalidProtection => f.write_str("invalid content protection metadata"),
             ProviderError::NotFound => f.write_str("not found"),
             ProviderError::Invalid(msg)
             | ProviderError::Backend(msg)
@@ -194,6 +209,16 @@ impl std::fmt::Display for ProviderError {
             ProviderError::DirectHls { .. } => f.write_str(
                 "source is origin HLS; use the native HTTP playback URL or outpace play --resolve",
             ),
+        }
+    }
+}
+
+impl From<ace_swarm::resolve::ResolveError> for ProviderError {
+    fn from(error: ace_swarm::resolve::ResolveError) -> Self {
+        match error {
+            ace_swarm::resolve::ResolveError::ProtectedContent => Self::ProtectedContent,
+            ace_swarm::resolve::ResolveError::InvalidProtection => Self::InvalidProtection,
+            other => Self::Backend(format!("descriptor resolution: {other:?}")),
         }
     }
 }

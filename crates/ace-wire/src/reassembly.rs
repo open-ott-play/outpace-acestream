@@ -270,6 +270,23 @@ impl PieceReassembler {
         out
     }
 
+    /// Read accepted media for one piece without its signature trailer.
+    pub fn ready_piece(&self, index: u64) -> Option<&[u8]> {
+        self.complete
+            .get(&index)
+            .map(|bytes| &bytes[..bytes.len().saturating_sub(self.piece_trailer as usize)])
+    }
+
+    /// Pull at most one contiguous accepted piece without copying its payload.
+    /// The signature trailer stays private to the verified seed store.
+    pub fn take_ready_piece(&mut self) -> Option<Vec<u8>> {
+        let next = self.next_emit.checked_add(1)?;
+        let mut bytes = self.complete.remove(&self.next_emit)?;
+        bytes.truncate(bytes.len().saturating_sub(self.piece_trailer as usize));
+        self.next_emit = next;
+        Some(bytes)
+    }
+
     /// Next piece index still needed to make progress (for the picker to target).
     pub fn next_needed(&self) -> u64 {
         self.next_emit
@@ -739,5 +756,23 @@ mod tests {
         // Default (no window set): behavior is unchanged for legacy/trusted callers.
         let mut r = PieceReassembler::new(2, 0);
         assert!(r.add_block(1_000_000, 0, &[9, 9]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod bounded_take_tests {
+    use super::*;
+    #[test]
+    fn one_piece_take_preserves_contiguity_trailer_and_later_ownership() {
+        let mut r = PieceReassembler::new(4, 7).with_piece_trailer(1);
+        r.add_block(8, 0, b"defY").unwrap();
+        assert!(r.take_ready_piece().is_none());
+        assert_eq!(r.next_needed(), 7);
+        r.add_block(7, 0, b"abcX").unwrap();
+        assert_eq!(r.take_ready_piece().unwrap(), b"abc");
+        assert_eq!(r.next_needed(), 8);
+        assert!(r.has_complete_piece(8));
+        assert_eq!(r.take_ready(), b"def");
+        assert!(r.take_ready_piece().is_none());
     }
 }

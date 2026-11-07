@@ -323,6 +323,7 @@ pub(super) fn observe_live_window(c: &mut Continuity, peer: u64, payload: &[u8])
         .observe_window(peer, value(b"min_piece").zip(value(b"max_piece")));
 }
 
+#[cfg(test)]
 pub(super) fn ready_buffer_snapshot(continuity: &Continuity, bitrate: Option<u64>) -> (u64, u64) {
     let mut clock = ace_media::mpegts::SelectedPcrClock::new();
     let mut bytes = 0_u64;
@@ -354,7 +355,12 @@ pub(super) fn publish_live_stats(
     let Some(metrics) = metrics else {
         return;
     };
-    let (buffer_ms, buffer_pieces) = ready_buffer_snapshot(c, info.metadata.bitrate);
+    let _ = info;
+    let result = c
+        .stats_scan
+        .result(c.reasm.next_needed())
+        .filter(|_| c.pending_output.is_none());
+    let (buffer_ms, buffer_pieces) = result.unwrap_or_default();
     let bounds = c.active_peers.coverage_bounds();
     metrics.publish_position(
         Some(LivePosition {
@@ -363,11 +369,13 @@ pub(super) fn publish_live_stats(
             live_first: bounds.map(|(first, _)| first),
             live_last: bounds.map(|(_, last)| last),
             buffer_pieces,
+            buffer_complete: result.is_some(),
         }),
         buffer_ms,
     );
 }
 
+#[cfg(test)]
 pub(super) fn take_ready_with_stats(
     c: &mut Continuity,
     metrics: Option<&Arc<dyn LiveObserver>>,
@@ -471,5 +479,159 @@ pub(super) fn shutdown_peer_runtimes(peers: &mut BTreeMap<u64, PeerRuntime>) {
     for (_, peer) in std::mem::take(peers) {
         let _ = peer.commands.try_send(PeerCommand::Stop);
         peer.worker.abort();
+    }
+}
+
+/// Scalar continuation: no media ownership or packet event list.
+pub(super) struct BufferScan {
+    anchor: Option<u64>,
+    index: u64,
+    offset: usize,
+    bytes: u64,
+    pieces: u64,
+    clock: ace_media::mpegts::SelectedPcrClock,
+    complete: Option<(u64, u64)>,
+}
+impl BufferScan {
+    pub(super) fn new() -> Self {
+        Self {
+            anchor: None,
+            index: 0,
+            offset: 0,
+            bytes: 0,
+            pieces: 0,
+            clock: ace_media::mpegts::SelectedPcrClock::new(),
+            complete: None,
+        }
+    }
+    pub(super) fn result(&self, cursor: u64) -> Option<(u64, u64)> {
+        (self.anchor == Some(cursor))
+            .then_some(self.complete)
+            .flatten()
+    }
+    /// Completed pieces are immutable. A new piece can only extend the first
+    /// unscanned gap; do not rescan the already measured prefix for every arrival.
+    pub(super) fn note_completed(&mut self, piece: u64, cursor: u64) {
+        if self.anchor == Some(cursor) && self.index == piece {
+            self.complete = None;
+        }
+    }
+
+    pub(super) fn pending(&self) -> bool {
+        self.complete.is_none()
+    }
+    /// Called exactly once per actor loop, never by publication/extraction callbacks.
+    pub(super) fn advance(
+        &mut self,
+        reasm: &PieceReassembler,
+        bitrate: Option<u64>,
+    ) -> (usize, usize) {
+        let cursor = reasm.next_needed();
+        if self.anchor != Some(cursor) {
+            *self = Self::new();
+            self.anchor = Some(cursor);
+            self.index = cursor;
+        }
+        let (mut packets, mut transitions) = (0, 0);
+        while self.complete.is_none() && packets < 2048 && transitions < 64 {
+            // Match ready_chunks: an unadvanceable endpoint is not ready.
+            let Some(bytes) = self
+                .index
+                .checked_add(1)
+                .and_then(|_| reasm.ready_piece(self.index))
+            else {
+                let duration = self
+                    .clock
+                    .elapsed()
+                    .filter(|d| !d.is_zero())
+                    .or_else(|| {
+                        bitrate
+                            .filter(|r| *r > 0)
+                            .map(|r| Duration::from_secs_f64(self.bytes as f64 / r as f64))
+                    })
+                    .unwrap_or_default();
+                self.complete = Some((
+                    duration.as_millis().min(u64::MAX as u128) as u64,
+                    self.pieces,
+                ));
+                break;
+            };
+            if self.offset == 0 {
+                self.bytes = self.bytes.saturating_add(bytes.len() as u64);
+                self.pieces += 1;
+            }
+            while self.offset + 188 <= bytes.len() && packets < 2048 {
+                let packet = (&bytes[self.offset..self.offset + 188]).try_into().unwrap();
+                self.clock.observe(ace_media::mpegts::ts_timing(packet));
+                self.offset += 188;
+                packets += 1;
+            }
+            if self.offset + 188 > bytes.len() {
+                transitions += 1;
+                self.offset = 0;
+                self.index = self.index.checked_add(1).expect("checked before lookup");
+            }
+        }
+        (packets, transitions)
+    }
+}
+
+#[cfg(test)]
+mod bounded_stats_tests {
+    use super::*;
+    #[test]
+    fn fixed_cursor_arrivals_scan_each_packet_once_and_ignore_beyond_gap() {
+        let mut reasm = PieceReassembler::new(188, 0);
+        let mut scan = BufferScan::new();
+        let mut packets = 0;
+        for i in 0..130 {
+            reasm.add_block(i, 0, &[0; 188]).unwrap();
+            scan.note_completed(i, reasm.next_needed());
+            packets += scan.advance(&reasm, Some(188)).0;
+            assert_eq!(scan.result(0), Some(((i + 1) * 1000, i + 1)));
+        }
+        assert_eq!(
+            packets, 130,
+            "accepted immutable prefix must not be rescanned on each completion"
+        );
+        reasm.add_block(131, 0, &[0; 188]).unwrap();
+        scan.note_completed(131, 0);
+        assert_eq!(scan.advance(&reasm, Some(188)), (0, 0));
+        assert_eq!(scan.result(0), Some((130000, 130)));
+        reasm.add_block(130, 0, &[0; 188]).unwrap();
+        scan.note_completed(130, 0);
+        assert_eq!(scan.advance(&reasm, Some(188)), (2, 2));
+        assert_eq!(scan.result(0), Some((132000, 132)));
+    }
+
+    #[test]
+    fn bounded_stats_packets_resume_without_recount_and_cursor_reset() {
+        let mut reasm = PieceReassembler::new(188 * 5000 + 7, 0);
+        reasm.add_block(0, 0, &vec![0; 188 * 5000 + 7]).unwrap();
+        let mut scan = BufferScan::new();
+        assert_eq!(scan.advance(&reasm, Some(1000)), (2048, 0));
+        assert_eq!(scan.advance(&reasm, Some(1000)), (2048, 0));
+        assert_eq!(scan.advance(&reasm, Some(1000)), (904, 1));
+        assert_eq!(scan.result(0), Some((940007, 1)));
+        assert_eq!(scan.advance(&reasm, Some(1000)), (0, 0));
+        reasm.skip_to(1);
+        assert_eq!(scan.result(1), None);
+        assert_eq!(scan.advance(&reasm, None), (0, 0));
+        assert_eq!(scan.result(1), Some((0, 0)));
+    }
+    #[test]
+    fn bounded_stats_empty_and_tiny_pieces_spend_transitions() {
+        for trailer in [0, 1] {
+            let mut reasm = PieceReassembler::new(1, 0).with_piece_trailer(trailer);
+            for i in 0..130 {
+                reasm.add_block(i, 0, &[0]).unwrap();
+            }
+            let mut scan = BufferScan::new();
+            assert_eq!(scan.advance(&reasm, Some(1)), (0, 64));
+            assert!(scan.pending());
+            assert_eq!(scan.advance(&reasm, Some(1)), (0, 64));
+            assert_eq!(scan.advance(&reasm, Some(1)), (0, 2));
+            assert_eq!(scan.result(0), Some(((1 - trailer) * 130000, 130)));
+        }
     }
 }

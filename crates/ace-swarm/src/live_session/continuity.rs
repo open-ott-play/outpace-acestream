@@ -48,6 +48,8 @@ impl Continuity {
                 output_gate: ace_media::mpegts::KeyframeGate::new_passthrough(),
                 transport_recovery: None,
                 discontinuity_pending: false,
+                pending_output: None,
+                stats_scan: pool_support::BufferScan::new(),
                 scheduler: Scheduler::new(live_recovery.max_piece_advance as usize),
                 active_peers: ActivePeers::new(),
                 received_chunks: BTreeMap::new(),
@@ -161,9 +163,31 @@ impl Continuity {
 
     /// Publish only a fully assembled and source-verified wire piece to the seed cache.
     /// Duplicate writes count for producer provenance, but cannot postpone a missing-byte retry.
+    #[cfg(test)]
     pub(super) async fn receive_live_chunk(
         &mut self,
         chunk: &LiveChunk,
+        chunk_length: u64,
+        store: &Arc<tokio::sync::Mutex<PieceStore>>,
+        now: Instant,
+    ) -> ace_wire::Result<ace_wire::reassembly::BlockAcceptance> {
+        self.receive_live_chunk_ref(
+            &ace_wire::live_codec::LiveChunkRef {
+                piece: chunk.piece,
+                piece_header: chunk.piece_header,
+                chunk: chunk.chunk,
+                data: &chunk.data,
+            },
+            chunk_length,
+            store,
+            now,
+        )
+        .await
+    }
+
+    pub(super) async fn receive_live_chunk_ref(
+        &mut self,
+        chunk: &ace_wire::live_codec::LiveChunkRef<'_>,
         chunk_length: u64,
         store: &Arc<tokio::sync::Mutex<PieceStore>>,
         now: Instant,
@@ -182,7 +206,7 @@ impl Continuity {
             .ok_or(ace_wire::WireError::Invalid("live chunk offset overflow"))?;
         let accepted = match self
             .reasm
-            .add_block_with_acceptance(piece, begin, &chunk.data)
+            .add_block_with_acceptance(piece, begin, chunk.data)
         {
             Ok(accepted) => accepted,
             Err(error) => {
@@ -192,6 +216,10 @@ impl Continuity {
                 return Err(error);
             }
         };
+        if accepted.contributed && self.reasm.has_complete_piece(piece) {
+            self.stats_scan
+                .note_completed(piece, self.reasm.next_needed());
+        }
         if accepted.progressed {
             if let Some(requested_at) = self.requested_at.get_mut(&piece) {
                 *requested_at = now;
@@ -276,10 +304,10 @@ impl Continuity {
         }
         let target = self.head.saturating_sub(self.prefetch);
         self.reasm.skip_to(target);
-        if self.emitted > 0 {
+        if self.emitted > 0 || self.pending_output.is_some() {
             self.arm_output_gate();
         } else {
-            // No published stream exists to mark discontinuous at provisional startup.
+            // No published or retained output exists to interrupt at provisional startup.
             self.resync = ace_media::mpegts::TsResync::new();
         }
         self.active_peers.prune_below(target);

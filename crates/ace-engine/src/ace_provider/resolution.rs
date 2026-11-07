@@ -1,5 +1,13 @@
 use super::*;
 
+/// Preserve actionable source diagnostics without flattening content-policy failures.
+fn contextual_resolution_error(context: &str, error: ResolveError) -> ProviderError {
+    match error {
+        ResolveError::ProtectedContent | ResolveError::InvalidProtection => error.into(),
+        _ => ProviderError::Backend(format!("{context}: {error:?}")),
+    }
+}
+
 impl AceProvider {
     /// Resolve the source transport without opening a peer or creating a playback session.
     /// HLS URLs are intentionally not cached: their signed query may expire or rotate.
@@ -34,29 +42,38 @@ impl AceProvider {
         catalog: impl std::future::Future<Output = Result<ResolvedTransport, ResolveError>>,
     ) -> Result<ResolvedTransport, ProviderError> {
         if let Some(info) = self.resolve_cache.get(content_id) {
+            info.ensure_playable()?;
             // Re-record: the bounded infohash index may have evicted it since (#164).
             self.infohash_index.put(info.clone());
             return Ok(ResolvedTransport::Swarm(info));
         }
         let key = hex20(content_id).map_err(|_| ProviderError::Backend("bad content-id".into()))?;
         if let Some(bytes) = self.seed_registry.broadcast_transport_for_content_id(&key) {
-            return playback_from_transport(&bytes)
-                .map_err(|e| ProviderError::Backend(format!("local broadcast descriptor: {e:?}")));
+            let source = playback_from_transport(&bytes).map_err(|error| {
+                contextual_resolution_error("local broadcast descriptor", error)
+            })?;
+            source.ensure_playable()?;
+            return Ok(source);
         }
         if self.bep9_content_id_fallback {
             if let Some(info) = self.peer_resolve_cache.get(content_id) {
+                info.ensure_playable()?;
                 return Ok(ResolvedTransport::Swarm(info));
             }
         }
 
         let catalog_error = match catalog.await {
             Ok(source) => {
+                source.ensure_playable()?;
                 if let ResolvedTransport::Swarm(info) = &source {
                     self.resolve_cache.put(content_id, info.clone());
                     self.infohash_index.put(info.clone());
                 }
                 crate::alog!("[ace] resolved content id via catalog");
                 return Ok(source);
+            }
+            Err(error @ (ResolveError::ProtectedContent | ResolveError::InvalidProtection)) => {
+                return Err(error.into());
             }
             Err(error @ (ResolveError::Hls(_) | ResolveError::Transport(_))) => {
                 // A returned descriptor was classified but is unusable/unsupported. This is
@@ -98,11 +115,15 @@ impl AceProvider {
             let mut session = session.with_timeout(RESOLVE_PEER_TIMEOUT);
             match resolve_via_peer(&mut session, key, &self.identity).await {
                 Ok(info) => {
+                    info.ensure_playable()?;
                     crate::alog!("[ace] resolved raw-hash content id via metadata peer");
                     // A raw transport hash is not catalog authentication: keep the descriptor
                     // out of the infohash index (#164).
                     self.peer_resolve_cache.put(content_id, info.clone());
                     return Ok(ResolvedTransport::Swarm(info));
+                }
+                Err(error @ (ResolveError::ProtectedContent | ResolveError::InvalidProtection)) => {
+                    return Err(error.into());
                 }
                 Err(ResolveError::Peer(why)) => crate::alog!("[ace] resolve {addr}: {why}"),
                 Err(e) => crate::alog!("[ace] resolve {addr}: {e:?}"),
@@ -131,6 +152,7 @@ impl AceProvider {
     }
 
     pub(super) fn require_live(source: ResolvedTransport) -> Result<StreamInfo, ProviderError> {
+        source.ensure_playable()?;
         match source {
             ResolvedTransport::Swarm(info) => Ok(info),
             ResolvedTransport::Hls { manifest_url, .. } => {
@@ -153,9 +175,11 @@ impl AceProvider {
             return self.resolve_content_playback(content_id).await;
         }
         if let Some(url) = crate::transport_url::decode_transport_url(id) {
-            return resolve_playback_from_url(&url)
+            let source = resolve_playback_from_url(&url)
                 .await
-                .map_err(|e| ProviderError::Backend(format!("transport url: {e:?}")));
+                .map_err(|error| contextual_resolution_error("transport url", error))?;
+            source.ensure_playable()?;
+            return Ok(source);
         }
         if is_bare_hex40(id) {
             return self
@@ -176,7 +200,10 @@ impl AceProvider {
     /// shared index serves a descriptor resolved through the signed catalog. BEP-9 and
     /// transport-url descriptors are never in the index: neither binds the descriptor's
     /// trackers to the infohash (#164).
-    pub(super) fn verified_info_for_infohash(&self, id: &str) -> Result<StreamInfo, ProviderError> {
+    pub(super) fn inspected_info_for_infohash(
+        &self,
+        id: &str,
+    ) -> Result<StreamInfo, ProviderError> {
         let infohash = hex20(id).map_err(|_| ProviderError::Backend("bad infohash".into()))?;
         // Decoding recomputes the infohash from the minted bytes.
         if let Some(transport) = self
@@ -195,14 +222,25 @@ impl AceProvider {
         Err(ProviderError::Unresolvable(unresolved_infohash_message(id)))
     }
 
+    /// Playback retains the content-policy check; inspection retains known protected metadata.
+    pub(super) fn verified_info_for_infohash(&self, id: &str) -> Result<StreamInfo, ProviderError> {
+        let info = self.inspected_info_for_infohash(id)?;
+        info.ensure_playable()?;
+        Ok(info)
+    }
+
     pub(super) async fn resolve_infohash_with_catalog(
         &self,
         id: &str,
         catalog: impl std::future::Future<Output = Result<StreamInfo, ResolveError>>,
     ) -> Result<StreamInfo, ProviderError> {
         let requested = hex20(id).map_err(|_| ProviderError::Backend("bad infohash".into()))?;
-        if let Ok(info) = self.verified_info_for_infohash(id) {
-            return Ok(info);
+        match self.verified_info_for_infohash(id) {
+            Ok(info) => return Ok(info),
+            Err(error @ (ProviderError::ProtectedContent | ProviderError::InvalidProtection)) => {
+                return Err(error)
+            }
+            Err(_) => {}
         }
         if self
             .infohash_failures
@@ -218,6 +256,9 @@ impl AceProvider {
         }
         let info = match catalog.await {
             Ok(info) => info,
+            Err(error @ (ResolveError::ProtectedContent | ResolveError::InvalidProtection)) => {
+                return Err(error.into())
+            }
             Err(error) => {
                 self.remember_infohash_failure(requested);
                 return Err(ProviderError::Unresolvable(format!(
@@ -232,6 +273,7 @@ impl AceProvider {
                 "catalog descriptor does not match the requested infohash".into(),
             ));
         }
+        info.ensure_playable()?;
         self.infohash_index.put(info.clone());
         crate::alog!("[ace] resolved infohash via authenticated catalog");
         Ok(info)
@@ -260,6 +302,7 @@ impl AceProvider {
         id: &str,
     ) -> Result<Box<dyn VodContent>, ProviderError> {
         let info = self.resolve_vod_info(id).await?;
+        info.ensure_playable()?;
         let infohash = info.infohash;
         let piece_length = info.piece_length;
         let chunk_length = info.chunk_length;
@@ -323,9 +366,10 @@ impl AceProvider {
                 "id must be cid:<40hex> or a transport-url id for VOD".into(),
             ));
         };
-        match playback_from_transport(&bytes)
-            .map_err(|e| ProviderError::Backend(format!("vod descriptor: {e:?}")))?
-        {
+        let source = playback_from_transport(&bytes)
+            .map_err(|error| contextual_resolution_error("vod descriptor", error))?;
+        source.ensure_playable()?;
+        match source {
             ResolvedTransport::Vod(info) => Ok(info),
             ResolvedTransport::Swarm(_) => Err(ProviderError::Unresolvable(
                 "source is live; use /streams/ace/{id}".into(),

@@ -246,6 +246,7 @@ mod seeder_tests {
             piece_hashes.push(h);
         }
         let info = VodInfo {
+            protection: None,
             infohash: [0x42; 20],
             filename: None,
             peer_protocol: Default::default(),

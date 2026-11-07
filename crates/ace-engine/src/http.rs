@@ -28,6 +28,32 @@ tokio::task_local! {
 }
 use tokio::sync::broadcast::error::RecvError;
 
+#[cfg(test)]
+tokio::task_local! {
+    static URL_DESCRIPTOR_BYTES: Vec<u8>;
+    static CATALOG_DESCRIPTOR_BYTES: Vec<u8>;
+}
+
+async fn catalog_descriptor_source(
+    content_id: &str,
+) -> Result<ace_swarm::resolve::ResolvedTransport, ace_swarm::resolve::ResolveError> {
+    #[cfg(test)]
+    if let Ok(bytes) = CATALOG_DESCRIPTOR_BYTES.try_with(Clone::clone) {
+        return ace_swarm::resolve::playback_from_transport(&bytes);
+    }
+    ace_swarm::resolve::resolve_playback_via_catalog(content_id).await
+}
+
+async fn url_descriptor_source(
+    url: &str,
+) -> Result<ace_swarm::resolve::ResolvedTransport, ace_swarm::resolve::ResolveError> {
+    #[cfg(test)]
+    if let Ok(bytes) = URL_DESCRIPTOR_BYTES.try_with(Clone::clone) {
+        return ace_swarm::resolve::playback_from_transport(&bytes);
+    }
+    ace_swarm::resolve::resolve_playback_from_url(url).await
+}
+
 mod broadcast;
 mod broadcast_source;
 mod compat;

@@ -249,6 +249,7 @@ async fn origin_hls_classification_is_fresh_and_never_indexes_swarm_geometry() {
             .resolve_content_playback_with_catalog(
                 CID,
                 ready(Ok(ResolvedTransport::Hls {
+                    protection: ace_wire::protection::Protection::Public,
                     manifest_url: url.clone(),
                     metadata: StreamMetadata::default(),
                 })),
@@ -328,4 +329,131 @@ async fn authenticated_cid_seed_preserves_native_session_identity_without_second
         expected
     );
     assert!(p.peer_resolve_cache.get(CID).is_none());
+}
+
+fn protected_transport(
+    mut root: ace_wire::bencode::Bencode,
+    value: ace_wire::bencode::Bencode,
+) -> Vec<u8> {
+    let ace_wire::bencode::Bencode::Dict(fields) = &mut root else {
+        panic!("fixture dictionary");
+    };
+    fields.insert(b"premium".to_vec(), value);
+    ace_wire::transport::encode_transport(&root)
+}
+
+#[tokio::test]
+async fn protected_catalog_sources_are_terminal_before_fallback_and_caching() {
+    use ace_wire::{bencode::Bencode, protection::Protection};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let std::net::SocketAddr::V4(addr) = listener.local_addr().unwrap() else {
+        unreachable!()
+    };
+    let p = provider()
+        .with_bep9_content_id_fallback(true)
+        .with_bootstrap_peers(vec![addr]);
+    let (bytes, _) = test_support::synthetic_live_transport(65536);
+    let root = ace_wire::transport::decode_transport(&bytes).unwrap().raw;
+    for value in [
+        Bencode::Int(1),
+        Bencode::Int(2),
+        Bencode::Bytes(b"1".to_vec()),
+    ] {
+        let protected = protected_transport(root.clone(), value.clone());
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            p.resolve_content_playback_with_catalog(CID, async {
+                playback_from_transport(&protected)
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, Err(ProviderError::ProtectedContent)) == (value == Bencode::Int(1))
+        );
+        assert!(matches!(
+            result,
+            Err(ProviderError::ProtectedContent | ProviderError::InvalidProtection)
+        ));
+        assert!(p.resolve_cache.get(CID).is_none());
+    }
+    let protected = protected_transport(root, Bencode::Int(1));
+    let info = stream_info_from_transport(&protected).unwrap();
+    assert_eq!(info.protection, Some(Protection::Protected));
+    p.remember_catalog_descriptor(CID, &info);
+    assert!(matches!(
+        p.check_openable(&format!("cid:{CID}")),
+        Err(ProviderError::ProtectedContent)
+    ));
+    assert!(matches!(
+        p.check_openable(&infohash_hex(&info.infohash)),
+        Err(ProviderError::ProtectedContent)
+    ));
+    let never = async {
+        panic!("cached protection must not poll catalog");
+    };
+    assert!(matches!(
+        p.resolve_content_playback_with_catalog(CID, never).await,
+        Err(ProviderError::ProtectedContent)
+    ));
+    let never = async {
+        panic!("indexed protection must not poll catalog");
+    };
+    assert!(matches!(
+        p.resolve_infohash_with_catalog(&infohash_hex(&info.infohash), never)
+            .await,
+        Err(ProviderError::ProtectedContent)
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), listener.accept())
+            .await
+            .is_err(),
+        "protection refusal must not open fallback peers"
+    );
+}
+
+#[tokio::test]
+async fn protected_origin_hls_is_refused_before_manifest_handoff() {
+    use ace_wire::bencode::Bencode;
+    let root = Bencode::parse(
+        include_bytes!("../../../../tests/vectors/hls-descriptor.bencode")
+            .strip_suffix(b"\n")
+            .unwrap(),
+    )
+    .unwrap();
+    for value in [0, 1] {
+        let bytes = protected_transport(root.clone(), Bencode::Int(value));
+        let source = playback_from_transport(&bytes).unwrap();
+        let p = provider().with_bep9_content_id_fallback(true);
+        let result = p
+            .resolve_content_playback_with_catalog(CID, ready(Ok(source)))
+            .await;
+        if value == 1 {
+            assert!(matches!(result, Err(ProviderError::ProtectedContent)));
+        } else {
+            assert!(matches!(result, Ok(ResolvedTransport::Hls { .. })));
+        }
+        assert!(
+            p.resolve_cache.get(CID).is_none(),
+            "HLS URLs remain uncached"
+        );
+    }
+}
+
+#[tokio::test]
+async fn protected_raw_vod_is_refused_before_store_admission() {
+    use ace_wire::bencode::Bencode;
+    let mut root = Bencode::parse(RAW_METAINFO).unwrap();
+    let Bencode::Dict(fields) = &mut root else {
+        unreachable!()
+    };
+    let Bencode::Dict(info) = fields.get_mut(b"info".as_slice()).unwrap() else {
+        unreachable!()
+    };
+    info.insert(b"premium".to_vec(), Bencode::Int(1));
+    let p = provider().with_bep9_content_id_fallback(true);
+    let result = p
+        .resolve_vod_info_with_catalog(&format!("cid:{CID}"), ready(Ok(root.encode())))
+        .await;
+    assert!(matches!(result, Err(ProviderError::ProtectedContent)));
 }

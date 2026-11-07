@@ -162,6 +162,7 @@ async fn upstream_phase_success_records_all_phases() {
 #[test]
 fn received_payload_is_counted_once_before_output_gating() {
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: 4,
         chunk_length: 4,
@@ -207,6 +208,7 @@ fn received_payload_is_counted_once_before_output_gating() {
 #[test]
 fn positions_clear_active_bounds_on_reconnect_and_reject_negative_windows() {
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: 4,
         chunk_length: 4,
@@ -285,6 +287,7 @@ async fn aborting_live_session_retains_recovery_history_and_clears_active_gauge(
 #[test]
 fn sliding_window_observations_do_not_change_scheduler_coverage() {
     let info = StreamInfo {
+        protection: None,
         infohash: [0; 20],
         piece_length: 4,
         chunk_length: 4,

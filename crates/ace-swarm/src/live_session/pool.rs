@@ -109,9 +109,12 @@ pub(super) fn recovery_channel_capacities(
     Ok((event_capacity, live_recovery.max_active_upstreams))
 }
 
-/// Drain authenticated contiguous pieces independently of the event that moved the cursor.
-/// HAVE/eviction/reconnect can expose an already-complete piece without another Piece message.
-/// `take_ready` remains the sole consumer, and output retains the normal awaited backpressure.
+mod pending;
+pub(super) use pending::PendingOutput;
+use pending::{finish_output, prepare_output, OutputReservation, Reciprocal};
+
+/// Drain retained accepted media before reconnecting. No active peer loop is held
+/// here; a cancelled reservation leaves all not-yet-enqueued media in Continuity.
 pub(super) async fn drain_ready_output(
     continuity: &mut Continuity,
     info: &StreamInfo,
@@ -121,87 +124,28 @@ pub(super) async fn drain_ready_output(
     candidates: &mut SessionCandidates,
     peers: &mut BTreeMap<u64, PeerRuntime>,
 ) -> Result<bool, ()> {
-    if continuity.startup_deadline.is_some() {
-        return Ok(false);
-    }
-    continuity.skip_far_behind_live(Instant::now());
-    if !continuity
-        .reasm
-        .has_complete_piece(continuity.reasm.next_needed())
-    {
-        return Ok(false);
-    }
-    let before = continuity.reasm.next_needed();
-    let ready = take_ready_with_stats(continuity, seed.metrics.as_ref(), info);
-    let after = continuity.reasm.next_needed();
-    let productive: std::collections::BTreeSet<_> = continuity
-        .piece_producers
-        .range(before..after)
-        .filter_map(|(_, producer)| *producer)
-        .collect();
-    continuity
-        .piece_producers
-        .retain(|&piece, _| piece >= after);
-    let authenticated = info.sig_len > 0
-        && ace_wire::live_auth::signature_len_from_pubkey_der(&info.source_pubkey)
-            == Some(info.sig_len);
-    if !ready.is_empty() && !continuity.authenticated_logged && authenticated {
-        continuity.authenticated_logged = true;
-        crate::alog!("[ace] discovery stage=authenticated-contiguous");
-    }
-    let outputs = continuity.resync_output(&ready);
-    let output_count = outputs.len();
-    let mut made_output = false;
-    for (index, output) in outputs.into_iter().enumerate() {
-        let aligned = output.bytes;
-        if continuity.emitted == 0 {
-            crate::alog!("[ace] discovery stage=first-source-output");
-        }
-        continuity.emitted += aligned.len() as u64;
-        if continuity.emitted >= continuity.next_log {
-            crate::alog!(
-                "[ace] served {} MiB (head={}, next piece needed={})",
-                continuity.emitted >> 20,
-                continuity.head,
-                continuity.reasm.next_needed()
-            );
-            continuity.next_log = continuity.emitted + (4 << 20);
-        }
-        let len = aligned.len() as u64;
-        if tx
-            .send(LiveOutput {
-                bytes: aligned,
-                discontinuity: output.discontinuity,
-                startup_complete: index + 1 == output_count && continuity.output_startup_complete(),
-            })
-            .await
-            .is_err()
-        {
-            shutdown_peer_runtimes(peers);
-            return Err(());
-        }
-        downloaded.fetch_add(len, Ordering::Relaxed);
-        made_output = true;
-    }
-    if made_output {
-        // With no new Piece event there is no triggering peer to credit. Use retained
-        // contribution evidence, never the sender of the HAVE/eviction notification.
-        for producer in productive {
-            for peer in peers.values_mut().filter(|peer| peer.addr == producer) {
-                peer.produced_output = true;
+    let mut emitted = false;
+    loop {
+        let worked = prepare_output(continuity, info, seed);
+        if continuity.pending_output.is_none() {
+            if worked {
+                tokio::task::yield_now().await;
+                continue;
             }
-            candidates.productive(producer);
-            if authenticated {
-                seed.warm_peers.record_productive(
-                    info.infohash,
-                    producer,
-                    candidates.kind(producer),
-                );
-            }
+            return Ok(emitted);
         }
-        continuity.next_needed_since = Instant::now();
+        let permit = match tx.clone().reserve_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                shutdown_peer_runtimes(peers);
+                return Err(());
+            }
+        };
+        finish_output(
+            continuity, info, permit, downloaded, seed, candidates, peers,
+        );
+        emitted = true;
     }
-    Ok(made_output)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -391,6 +335,8 @@ pub(super) async fn follow_peer_pool_with_discovery(
             true,
         );
     }
+    let mut output_reservation: Option<OutputReservation> = None;
+    let mut reciprocal = Reciprocal::default();
     let mut last_progress = Instant::now();
     let mut refill_closed = false;
     let mut observed_capacity = (peers.len(), learned_pending.len());
@@ -420,6 +366,11 @@ pub(super) async fn follow_peer_pool_with_discovery(
         }
         observed_capacity = (peers.len(), learned_pending.len());
         let now = Instant::now();
+        if seed.metrics.is_some() {
+            continuity
+                .stats_scan
+                .advance(&continuity.reasm, info.metadata.bitrate);
+        }
         publish_live_stats(continuity, seed.metrics.as_ref(), info);
         if continuity
             .startup_deadline
@@ -431,26 +382,26 @@ pub(super) async fn follow_peer_pool_with_discovery(
             let lost = advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
             record_pool_losses(candidates, &mut loss_count, lost);
         }
-        // A preceding HAVE or reconnect may have exposed buffered authenticated data.
-        // Drain it before deciding that the pool has stopped making useful progress.
-        match drain_ready_output(
-            continuity, info, tx, downloaded, seed, candidates, &mut peers,
-        )
-        .await
-        {
-            Ok(true) => last_progress = Instant::now(),
-            Ok(false) => {}
-            Err(()) => return FollowEnd::ConsumerGone,
+        // Prepare at most one accepted piece and reserve output without blocking
+        // control messages. The retained batch is bounded by one wire piece.
+        prepare_output(continuity, info, seed);
+        if continuity.pending_output.is_some() && output_reservation.is_none() {
+            output_reservation = Some(Box::pin(tx.clone().reserve_owned()));
         }
+        reciprocal.start(&peers, store);
         let now = Instant::now();
-        let Some(stale_budget) =
+        let Some(stale_budget) = if continuity.pending_output.is_some() {
+            // A slow consumer is not evidence of a stale upstream. A successful
+            // enqueue below starts the ordinary progress clock again.
+            Some(live_recovery.stale_upstream_timeout())
+        } else {
             stale_upstream_budget(last_progress, now, live_recovery.stale_upstream_timeout())
-                .or_else(|| {
-                    continuity
-                        .startup_deadline
-                        .map(|deadline| deadline.saturating_duration_since(now))
-                })
-        else {
+        }
+        .or_else(|| {
+            continuity
+                .startup_deadline
+                .map(|deadline| deadline.saturating_duration_since(now))
+        }) else {
             let stalled = peers.values().map(|p| p.addr).collect::<Vec<_>>();
             crate::alog!(
                 "[ace] upstream pool stale — no live progress for {:?}; reconnecting {} peer(s)",
@@ -470,17 +421,6 @@ pub(super) async fn follow_peer_pool_with_discovery(
         let newly_lost =
             retransmit_stalled_requests(&mut peers, continuity, chunks_per_piece, now).await;
         record_pool_losses(candidates, &mut loss_count, newly_lost);
-        // The sweep itself can skip an evicted gap. Do not wait for network input to
-        // publish the complete piece now at the cursor (it will not be requested again).
-        match drain_ready_output(
-            continuity, info, tx, downloaded, seed, candidates, &mut peers,
-        )
-        .await
-        {
-            Ok(true) => last_progress = Instant::now(),
-            Ok(false) => {}
-            Err(()) => return FollowEnd::ConsumerGone,
-        }
         if peers.is_empty() {
             return FollowEnd::PeerLost(loss_count);
         }
@@ -509,6 +449,9 @@ pub(super) async fn follow_peer_pool_with_discovery(
         let event = match tokio::time::timeout(wait, async {
             tokio::select! {
                 _ = tx.closed() => PoolWake::ConsumerGone,
+                result = async { output_reservation.as_mut().expect("enabled output reservation").await }, if output_reservation.is_some() => PoolWake::Output(result),
+                result = reciprocal.next(), if reciprocal.has_job() => PoolWake::Reciprocal(result),
+                _ = std::future::ready(()), if (continuity.pending_output.is_none() && continuity.startup_deadline.is_none() && continuity.reasm.has_complete_piece(continuity.reasm.next_needed())) || (seed.metrics.is_some() && continuity.stats_scan.pending()) => PoolWake::OutputWork,
                 event = event_rx.recv() => PoolWake::Peer(event),
                 result=learned_connects.join_next(), if !learned_connects.is_empty()=>PoolWake::ConnectCompletion(result),
                 _ = async {
@@ -528,6 +471,30 @@ pub(super) async fn follow_peer_pool_with_discovery(
 
         let event = match event {
             PoolWake::ConsumerGone => return FollowEnd::ConsumerGone,
+            PoolWake::Output(result) => {
+                output_reservation = None;
+                let Ok(permit) = result else {
+                    return FollowEnd::ConsumerGone;
+                };
+                finish_output(
+                    continuity, info, permit, downloaded, seed, candidates, &mut peers,
+                );
+                last_progress = Instant::now();
+                continue;
+            }
+            PoolWake::OutputWork => {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            PoolWake::Reciprocal((id, reply)) => {
+                if let Some(lost) =
+                    finish_reciprocal(id, reply, &mut peers, continuity, uploaded, peers_served)
+                        .await
+                {
+                    record_pool_losses(candidates, &mut loss_count, [lost]);
+                }
+                continue;
+            }
             PoolWake::CandidateRetry => {
                 observed_retry = Instant::now();
                 spawn_candidate_connects(
@@ -771,7 +738,7 @@ pub(super) async fn follow_peer_pool_with_discovery(
         };
 
         let mut made_activity = false;
-        let mut made_output = false;
+        let made_output = false;
         if let PeerMessage::Extended { payload, .. } | PeerMessage::Unknown { payload, .. } = &msg {
             observe_live_window(continuity, peer_id, payload);
         }
@@ -808,7 +775,7 @@ pub(super) async fn follow_peer_pool_with_discovery(
                 }
             }
             m @ PeerMessage::Piece { .. } => {
-                if let Some(lc) = LiveChunk::from_message(&m) {
+                if let Some(lc) = LiveChunk::borrow_from_message(&m) {
                     continuity.skip_far_behind_live(Instant::now());
                     let piece = lc.piece as u64;
                     if continuity.startup_deadline.is_some()
@@ -818,7 +785,7 @@ pub(super) async fn follow_peer_pool_with_discovery(
                     }
                     let arrived_at = Instant::now();
                     let accepted = match continuity
-                        .receive_live_chunk(&lc, info.chunk_length, store, arrived_at)
+                        .receive_live_chunk_ref(&lc, info.chunk_length, store, arrived_at)
                         .await
                     {
                         Ok(accepted) => accepted,
@@ -849,14 +816,6 @@ pub(super) async fn follow_peer_pool_with_discovery(
                     if let Some(observer) = &continuity.contribution_observer {
                         let _ = observer.send((piece, addr));
                     }
-                    made_output = match drain_ready_output(
-                        continuity, info, tx, downloaded, seed, candidates, &mut peers,
-                    )
-                    .await
-                    {
-                        Ok(made_output) => made_output,
-                        Err(()) => return FollowEnd::ConsumerGone,
-                    };
                     let newly_lost =
                         advance_pool_requests(&mut peers, continuity, chunks_per_piece).await;
                     record_pool_losses(candidates, &mut loss_count, newly_lost);
@@ -884,19 +843,8 @@ pub(super) async fn follow_peer_pool_with_discovery(
                     }
                 }
             }
-            request @ PeerMessage::Unknown { id: 6, .. } if seed.enabled => {
-                if let Some(reply) =
-                    prepare_reply(&request, Some(store), ServeProfile::Reciprocal).await
-                {
-                    if let Some(lost) =
-                        send_peer_command(peer_id, reply.message, &mut peers, continuity).await
-                    {
-                        record_pool_losses(candidates, &mut loss_count, [lost]);
-                    } else {
-                        uploaded.fetch_add(reply.media_bytes as u64, Ordering::Relaxed);
-                        peers_served.store(peers.len() as u32, Ordering::Relaxed);
-                    }
-                }
+            PeerMessage::Unknown { id: 6, payload } if seed.enabled => {
+                reciprocal.queue(peer_id, &payload);
             }
             PeerMessage::Unknown { id: 4, ref payload } if payload.len() == 8 => {
                 let piece =
@@ -1008,6 +956,26 @@ pub(super) async fn follow_peer_pool_with_discovery(
             last_progress = Instant::now();
         }
     }
+}
+
+async fn finish_reciprocal(
+    id: u64,
+    reply: Option<crate::seed::protocol::PreparedReply>,
+    peers: &mut BTreeMap<u64, PeerRuntime>,
+    continuity: &mut Continuity,
+    uploaded: &Arc<AtomicU64>,
+    peers_served: &Arc<AtomicU32>,
+) -> Option<SocketAddrV4> {
+    if !peers.contains_key(&id) {
+        return None;
+    }
+    let reply = reply?;
+    if let Some(lost) = send_peer_command(id, reply.message, peers, continuity).await {
+        return Some(lost);
+    }
+    uploaded.fetch_add(reply.media_bytes as u64, Ordering::Relaxed);
+    peers_served.store(peers.len() as u32, Ordering::Relaxed);
+    None
 }
 
 /// Runs only after reassembly accepts the chunk, including source signature validation

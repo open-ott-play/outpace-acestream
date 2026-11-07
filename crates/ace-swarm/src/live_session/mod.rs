@@ -160,11 +160,13 @@ mod pool_support;
 use pool_support::ready_buffer_snapshot;
 #[cfg(test)]
 use pool_support::spawn_learned_connects;
+#[cfg(test)]
+use pool_support::take_ready_with_stats;
 use pool_support::*;
 use pool_support::{
     advance_pool_requests, drop_peer_runtime, finish_candidate_connect, harvest_stale_gossip,
     observe_live_window, publish_live_stats, retransmit_stalled_requests, shutdown_peer_runtimes,
-    spawn_candidate_connects, take_ready_with_stats,
+    spawn_candidate_connects,
 };
 mod support;
 use support::{
@@ -377,6 +379,24 @@ async fn follow_live_session_with_run(
         if tx.is_closed() {
             return;
         }
+        // A pool may disappear while the consumer is backpressured. Retained accepted
+        // media belongs to the session and must drain before acquiring replacement peers.
+        if let Some(c) = &mut continuity {
+            if pool::drain_ready_output(
+                c,
+                &info,
+                &tx,
+                &downloaded,
+                &seed,
+                &mut candidates,
+                &mut BTreeMap::new(),
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
+        }
         drain_discovery(&mut rediscovery, &mut candidates);
         let ready = candidates.eligible(Instant::now());
         let (sources, pex) = candidates.learned_counts();
@@ -555,6 +575,8 @@ pub(super) struct Continuity {
     output_gate: ace_media::mpegts::KeyframeGate,
     pub(super) transport_recovery: Option<TransportRecovery>,
     discontinuity_pending: bool,
+    pending_output: Option<pool::PendingOutput>,
+    stats_scan: pool_support::BufferScan,
     pub(super) scheduler: Scheduler,
     pub(super) active_peers: ActivePeers,
     pub(super) received_chunks: BTreeMap<u64, HashSet<u16>>,
@@ -606,6 +628,9 @@ enum PoolWake {
     Discovery(Option<SocketAddrV4>),
     ConnectCompletion(Option<Result<CandidateConnectCompletion, tokio::task::JoinError>>),
     CandidateRetry,
+    Output(Result<mpsc::OwnedPermit<LiveOutput>, mpsc::error::SendError<()>>),
+    OutputWork,
+    Reciprocal((u64, Option<crate::seed::protocol::PreparedReply>)),
 }
 
 pub(super) struct LiveStatsGuard(pub(super) Option<Arc<dyn LiveObserver>>);

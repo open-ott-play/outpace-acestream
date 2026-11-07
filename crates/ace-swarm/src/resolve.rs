@@ -19,7 +19,7 @@ use ace_peer::session::PeerSession;
 use ace_wire::extended::{ExtendedHandshake, NodeFields, OutgoingExtendedHandshake};
 use ace_wire::handshake::random_peer_id;
 use ace_wire::identity::Identity;
-use ace_wire::infohash::{infohash_of_descriptor, transport_file_hash};
+use ace_wire::infohash::{infohash_of_decoded_transport, transport_file_hash};
 use ace_wire::message::PeerMessage;
 use ace_wire::transport::{
     decode_transport, decode_transport_source, TransportDescriptor, TransportSource,
@@ -83,6 +83,8 @@ const CATALOG_RESPONSE_KEY: &[u8] = b"CNVU\\\\w5S/HGg\"pSzY&O\"`uGCD18\\x0cfS|h2
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolveError {
+    ProtectedContent,
+    InvalidProtection,
     /// A recognized HLS descriptor has no usable manifest.
     Hls(&'static str),
     BadInfohash,
@@ -93,6 +95,14 @@ pub enum ResolveError {
     Peer(&'static str),
     /// A transport-file `url=` fetch failed a safety check or the network step.
     Url(&'static str),
+}
+
+fn protection_wire_error(error: ace_wire::WireError) -> ResolveError {
+    match error {
+        ace_wire::WireError::InvalidProtection => ResolveError::InvalidProtection,
+        ace_wire::WireError::Hls(message) => ResolveError::Hls(message),
+        _ => ResolveError::Transport("decode failed"),
+    }
 }
 
 fn normalized_title(value: &str) -> Option<String> {
@@ -110,11 +120,27 @@ fn normalized_title(value: &str) -> Option<String> {
 /// Build a [`StreamInfo`] from raw `AceStreamTransport` file bytes (the pure half of
 /// content-id resolution): official swarm infohash + geometry + trackers from the descriptor.
 pub fn stream_info_from_transport(bytes: &[u8]) -> Result<StreamInfo, ResolveError> {
-    let d = decode_transport(bytes).map_err(|_| ResolveError::Transport("decode failed"))?;
-    stream_info_from_descriptor(d)
+    let source = playback_from_transport(bytes)?;
+    match source {
+        ResolvedTransport::Swarm(info) => Ok(info),
+        other => {
+            // Known protection is terminal even when the caller requested the wrong transport.
+            other.ensure_playable()?;
+            if matches!(other, ResolvedTransport::Hls { .. }) {
+                Err(ResolveError::Hls(
+                    "HLS transport requires manifest playback",
+                ))
+            } else {
+                Err(ResolveError::Transport(
+                    "VOD descriptor is not a live stream",
+                ))
+            }
+        }
+    }
 }
 
 fn stream_info_from_descriptor(d: TransportDescriptor) -> Result<StreamInfo, ResolveError> {
+    let protection = d.protection().map_err(protection_wire_error)?;
     if !d.is_live {
         return Err(ResolveError::Transport(
             "VOD descriptor is not a live stream",
@@ -126,6 +152,8 @@ fn stream_info_from_descriptor(d: TransportDescriptor) -> Result<StreamInfo, Res
         ));
     }
     validate_geometry(d.piece_length, d.chunk_length)?;
+    let infohash = infohash_of_decoded_transport(&d)
+        .map_err(|_| ResolveError::Transport("infohash failed"))?;
     // A valid RSA pubkey => pieces carry a modulus-length signature tail to strip *and* a key
     // to verify each piece's in-band signature against (issue #10); no parseable pubkey =>
     // treat pieces as unsigned (don't strip, nothing to verify).
@@ -139,8 +167,8 @@ fn stream_info_from_descriptor(d: TransportDescriptor) -> Result<StreamInfo, Res
         categories: d.categories,
     };
     Ok(StreamInfo {
-        infohash: infohash_of_descriptor(&d.raw)
-            .map_err(|_| ResolveError::Transport("infohash failed"))?,
+        protection: Some(protection),
+        infohash,
         piece_length: d.piece_length,
         chunk_length: d.chunk_length,
         trackers: d.trackers,
@@ -170,9 +198,13 @@ pub fn vod_info_from_transport(bytes: &[u8]) -> Result<VodInfo, ResolveError> {
         } else {
             ace_wire::metainfo::decode_metainfo(bytes)
         }
-        .map_err(|_| ResolveError::Transport("invalid single-file metainfo"))?;
+        .map_err(|error| match error {
+            ace_wire::WireError::InvalidProtection => ResolveError::InvalidProtection,
+            _ => ResolveError::Transport("invalid single-file metainfo"),
+        })?;
         validate_geometry(metainfo.piece_length, DEFAULT_CHUNK_LENGTH)?;
         return Ok(VodInfo {
+            protection: Some(metainfo.protection),
             infohash: metainfo.infohash,
             filename: metainfo.filename,
             peer_protocol: ace_wire::handshake::HandshakeProtocol::BitTorrent,
@@ -183,11 +215,12 @@ pub fn vod_info_from_transport(bytes: &[u8]) -> Result<VodInfo, ResolveError> {
             total_length: metainfo.total_length,
         });
     }
-    let d = decode_transport(bytes).map_err(|_| ResolveError::Transport("decode failed"))?;
+    let d = decode_transport(bytes).map_err(protection_wire_error)?;
     vod_info_from_descriptor(d)
 }
 
 fn vod_info_from_descriptor(d: TransportDescriptor) -> Result<VodInfo, ResolveError> {
+    let protection = d.protection().map_err(protection_wire_error)?;
     if d.is_live {
         return Err(ResolveError::Transport("not a VOD transport (no pieces)"));
     }
@@ -204,7 +237,8 @@ fn vod_info_from_descriptor(d: TransportDescriptor) -> Result<VodInfo, ResolveEr
         ));
     }
     Ok(VodInfo {
-        infohash: infohash_of_descriptor(&d.raw)
+        protection: Some(protection),
+        infohash: infohash_of_decoded_transport(&d)
             .map_err(|_| ResolveError::Transport("infohash failed"))?,
         filename: None,
         peer_protocol: ace_wire::handshake::HandshakeProtocol::AceStream,
@@ -340,9 +374,25 @@ pub enum ResolvedTransport {
     Swarm(StreamInfo),
     Vod(VodInfo),
     Hls {
+        protection: ace_wire::protection::Protection,
         manifest_url: String,
         metadata: StreamMetadata,
     },
+}
+
+impl ResolvedTransport {
+    /// Content protection is independent of transport encryption and source authentication.
+    pub fn ensure_playable(&self) -> Result<(), ResolveError> {
+        match self {
+            Self::Swarm(info) => info.ensure_playable(),
+            Self::Vod(info) => info.ensure_playable(),
+            Self::Hls {
+                protection: ace_wire::protection::Protection::Protected,
+                ..
+            } => Err(ResolveError::ProtectedContent),
+            Self::Hls { .. } => Ok(()),
+        }
+    }
 }
 
 /// Resolve either supported descriptor kind without requiring HLS piece geometry.
@@ -350,10 +400,7 @@ pub fn playback_from_transport(bytes: &[u8]) -> Result<ResolvedTransport, Resolv
     if !ace_wire::infohash::is_transport_file(bytes) {
         return vod_info_from_transport(bytes).map(ResolvedTransport::Vod);
     }
-    let decoded = decode_transport_source(bytes).map_err(|error| match error {
-        ace_wire::WireError::Hls(message) => ResolveError::Hls(message),
-        _ => ResolveError::Transport("decode failed"),
-    })?;
+    let decoded = decode_transport_source(bytes).map_err(protection_wire_error)?;
     match decoded {
         TransportSource::Swarm(descriptor) => {
             if descriptor.is_live {
@@ -365,6 +412,7 @@ pub fn playback_from_transport(bytes: &[u8]) -> Result<ResolvedTransport, Resolv
         TransportSource::Hls(descriptor) => {
             validate_hls_manifest_url(&descriptor.manifest_url)?;
             Ok(ResolvedTransport::Hls {
+                protection: descriptor.protection,
                 manifest_url: descriptor.manifest_url,
                 metadata: StreamMetadata {
                     title: descriptor.title,
@@ -845,7 +893,7 @@ impl ResolveCache {
 /// id's entry to a lookup of the other. Every entry here is keyed by its own `info.infohash`,
 /// which [`stream_info_from_transport`] computed from the same descriptor that supplied the
 /// geometry and pubkey. The swarm infohash commits to `piece_length`, `chunk_length` and
-/// `pubkey` (see [`infohash_of_descriptor`]), so an entry can neither pair an infohash with
+/// `pubkey` (see [`infohash_of_decoded_transport`]), so an entry can neither pair an infohash with
 /// another stream's geometry nor go stale. Entries therefore carry no TTL; the index is bounded
 /// by evicting the least recently stored entry once `capacity` is reached.
 pub struct InfohashIndex {
@@ -1034,6 +1082,7 @@ mod tests {
 
     fn cache_info() -> StreamInfo {
         StreamInfo {
+            protection: None,
             infohash: [7; 20],
             piece_length: 1,
             chunk_length: 1,
@@ -1124,6 +1173,7 @@ mod tests {
         let ResolvedTransport::Hls {
             manifest_url,
             metadata,
+            ..
         } = playback_from_transport(&bytes).unwrap()
         else {
             panic!("expected HLS playback")
@@ -1892,6 +1942,7 @@ mod tests {
     fn cache_returns_stored_value_then_expires() {
         let c = ResolveCache::new(Duration::from_millis(40));
         let info = StreamInfo {
+            protection: None,
             infohash: [7; 20],
             piece_length: 1,
             chunk_length: 1,
@@ -1909,6 +1960,7 @@ mod tests {
 
     fn indexed_info(infohash: [u8; 20], piece_length: u64) -> StreamInfo {
         StreamInfo {
+            protection: None,
             infohash,
             piece_length,
             chunk_length: 16_384,

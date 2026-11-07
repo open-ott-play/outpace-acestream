@@ -1,7 +1,5 @@
 use super::*;
-use ace_swarm::resolve::{
-    resolve_playback_from_url, resolve_playback_via_catalog, ResolveError, ResolvedTransport,
-};
+use ace_swarm::resolve::{ResolveError, ResolvedTransport};
 
 pub(super) async fn ace_getstream(
     State(s): State<AppState>,
@@ -118,6 +116,10 @@ async fn ace_getstream_selection_response(
             }
             resolved_origin_redirect(&s, &manifest_url).await
         }
+        Err(ProviderError::CapacityExhausted) => super::streams::capacity_error(),
+        Err(error @ (ProviderError::ProtectedContent | ProviderError::InvalidProtection)) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response()
+        }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -186,6 +188,20 @@ async fn ace_manifest_selection_response(
         Err(ProviderError::DirectHls { manifest_url }) => {
             selection.hls_manifest_url = Some(manifest_url);
             return selected_origin_hls_response(&s, &headers, &selection, json_mode).await;
+        }
+        Err(
+            error @ (ProviderError::CapacityExhausted
+            | ProviderError::ProtectedContent
+            | ProviderError::InvalidProtection),
+        ) => {
+            if json_mode {
+                return Json(json!({"response": null, "error": error.to_string()})).into_response();
+            }
+            return if matches!(error, ProviderError::CapacityExhausted) {
+                super::streams::capacity_error()
+            } else {
+                (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response()
+            };
         }
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -343,6 +359,11 @@ async fn ace_hls_view_playback(
     let Some(network) = ace_network(&s) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if let Err(error @ (ProviderError::ProtectedContent | ProviderError::InvalidProtection)) =
+        s.manager.check_openable(&network, &session_key)
+    {
+        return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response();
+    }
     let Some(pkg) = s.manager.get_hls(&network, &session_key).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -443,6 +464,11 @@ async fn ace_hls_view_segment(
     let Some(network) = ace_network(&s) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if let Err(error @ (ProviderError::ProtectedContent | ProviderError::InvalidProtection)) =
+        s.manager.check_openable(&network, &session_key)
+    {
+        return (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response();
+    }
     let Some(pkg) = s.manager.get_hls(&network, &session_key).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -516,6 +542,7 @@ pub(super) async fn ace_playback(
         return StatusCode::NOT_FOUND.into_response();
     };
     let acquire = async {
+        s.manager.check_openable(&network, &session_key)?;
         match s.ace_sessions.bound_session(&id, &token) {
             Err(()) => Err(ProviderError::NotFound),
             Ok(Some(bound)) => {
@@ -548,6 +575,17 @@ pub(super) async fn ace_playback(
             // Provider messages may embed identifiers or credentials. Log only the typed
             // category, and keep both logs and response bodies independent of that text.
             let (status, category, reason) = match error {
+                ProviderError::CapacityExhausted => return super::streams::capacity_error(),
+                ProviderError::ProtectedContent => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "ProtectedContent",
+                    "encrypted content is not supported",
+                ),
+                ProviderError::InvalidProtection => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "InvalidProtection",
+                    "invalid content protection metadata",
+                ),
                 ProviderError::NotFound => (StatusCode::NOT_FOUND, "NotFound", ""),
                 ProviderError::Invalid(_) => (
                     StatusCode::BAD_REQUEST,
@@ -874,9 +912,11 @@ pub(super) async fn server_api(
                 .origin_hls
                 .as_ref()
                 .map_or(0, |relay| relay.active_count());
-            api::ok(api::status_result(
-                swarm_sessions.saturating_add(origin_sessions),
-            ))
+            let (occupied, max) = s.manager.admission_status();
+            let mut status = api::status_result(swarm_sessions.saturating_add(origin_sessions));
+            status["occupied_sessions"] = json!(occupied);
+            status["max_sessions"] = json!(max);
+            api::ok(status)
         }
         api::Method::GetNetworkConnectionStatus => api::ok(api::network_status_result(&s.networks)),
         // `get_content_id` only echoes an id the caller already gave; it can't derive one from a
@@ -932,7 +972,7 @@ async fn resolve_server_api_selector(
             if !s.resolve_content_ids_in_getstream {
                 return Err("content-id catalog resolution is disabled".to_string());
             }
-            match resolve_playback_via_catalog(&cid).await {
+            match catalog_descriptor_source(&cid).await {
                 Ok(transport) => {
                     // Only a swarm descriptor obtained from the signed catalog is indexable.
                     // Origin HLS has no peer geometry and must retain its own source type.
@@ -943,16 +983,16 @@ async fn resolve_server_api_selector(
                     }
                     Ok(ResolvedContent::from_transport(transport, Some(cid)))
                 }
-                Err(e) => Err(format!("content-id resolution failed: {e:?}")),
+                Err(e) => Err(ProviderError::from(e).to_string()),
             }
         }
         Selector::Url(url) => {
             if !s.resolve_content_ids_in_getstream {
                 return Err("transport-url resolution is disabled".to_string());
             }
-            match resolve_playback_from_url(&url).await {
+            match url_descriptor_source(&url).await {
                 Ok(transport) => Ok(ResolvedContent::from_transport(transport, None)),
-                Err(e) => Err(format!("transport-url resolution failed: {e:?}")),
+                Err(e) => Err(ProviderError::from(e).to_string()),
             }
         }
         Selector::Missing => Err("missing content_id/infohash/url/magnet".to_string()),
@@ -1005,14 +1045,22 @@ async fn resolve_ace_selection(
     if s.resolve_content_ids_in_getstream {
         let from_catalog = selection.content_id.is_some();
         let resolution = if let Some(content_id) = selection.content_id.as_deref() {
-            Some(resolve_playback_via_catalog(content_id).await)
+            Some(catalog_descriptor_source(content_id).await)
         } else if let Some(url) = crate::transport_url::decode_transport_url(&selection.session_key)
         {
-            Some(resolve_playback_from_url(&url).await)
+            Some(url_descriptor_source(&url).await)
         } else {
             None
         };
         if let Some(resolution) = resolution {
+            if !from_catalog {
+                if let (Some(network), Ok(ResolvedTransport::Swarm(info))) =
+                    (network.as_deref(), &resolution)
+                {
+                    s.manager
+                        .remember_transport_url(network, &selection.session_key, info);
+                }
+            }
             if from_catalog {
                 if let Ok(ResolvedTransport::Swarm(info)) = &resolution {
                     if let (Some(network), Some(content_id)) =
@@ -1035,10 +1083,13 @@ async fn resolve_ace_selection(
     // The provider may reject a selector synchronously. Cold Ace infohashes proceed to
     // asynchronous authenticated catalog resolution when the playback URL is opened.
     if let Some(network) = network.as_deref() {
-        if let Err(ProviderError::Unresolvable(reason)) =
-            s.manager.check_openable(network, &selection.session_key)
+        if let Err(
+            error @ (ProviderError::ProtectedContent
+            | ProviderError::InvalidProtection
+            | ProviderError::Unresolvable(_)),
+        ) = s.manager.check_openable(network, &selection.session_key)
         {
-            return Err(reason);
+            return Err(error.to_string());
         }
     }
     Ok(selection)
@@ -1048,6 +1099,11 @@ fn apply_transport_resolution(
     mut selection: AceStreamSelection,
     resolution: Result<ResolvedTransport, ResolveError>,
 ) -> Result<AceStreamSelection, &'static str> {
+    if let Ok(source) = &resolution {
+        source
+            .ensure_playable()
+            .map_err(|_| "encrypted content is not supported")?;
+    }
     match resolution {
         Ok(ResolvedTransport::Swarm(info)) => {
             Ok(selection.with_resolved_stream(infohash_hex(&info.infohash), info.metadata))
@@ -1056,6 +1112,7 @@ fn apply_transport_resolution(
         Ok(ResolvedTransport::Hls {
             manifest_url,
             metadata,
+            ..
         }) => {
             crate::alog!("[ace] HLS descriptor: handing playback to the original manifest");
             selection.hls_manifest_url = Some(manifest_url);
@@ -1069,6 +1126,9 @@ fn apply_transport_resolution(
             crate::alog!("[ace] HLS descriptor rejected: {message}");
             Err(message)
         }
+        Err(ResolveError::ProtectedContent) => Err("encrypted content is not supported"),
+        Err(ResolveError::InvalidProtection) => Err("invalid content protection metadata"),
+        Err(ResolveError::Transport(_)) => Err("unsupported source descriptor"),
         Err(error) => {
             crate::alog!("[ace] transport resolution failed, falling back to provider: {error:?}");
             Ok(selection)
@@ -1631,6 +1691,7 @@ mod origin_tests {
         )]))
         .unwrap();
         let info = ace_swarm::types::VodInfo {
+            protection: None,
             infohash: [1; 20],
             filename: None,
             peer_protocol: ace_wire::handshake::HandshakeProtocol::BitTorrent,

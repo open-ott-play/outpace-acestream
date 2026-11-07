@@ -294,6 +294,7 @@ impl CleanupTracker {
 
 pub struct StreamManager {
     registry: ProviderRegistry,
+    admission: Arc<crate::admission::Admission>,
     sessions: Mutex<HashMap<(String, String), Arc<StreamSession>>>,
     packagers: Mutex<HashMap<(String, String), HlsEntry>>,
     /// Synchronous pending/cancellation bookkeeping so a dropped future cleans up in `Drop`.
@@ -379,8 +380,30 @@ impl StreamManager {
         history: crate::history::HlsHistoryConfig,
         audio_languages: Vec<[u8; 3]>,
     ) -> Arc<StreamManager> {
+        Self::with_admission_config(
+            registry,
+            buffer,
+            hls,
+            normalizer,
+            history,
+            audio_languages,
+            0,
+        )
+    }
+
+    /// Cap pending provider opens and retained live/VOD owners; zero is unlimited.
+    pub(crate) fn with_admission_config(
+        registry: ProviderRegistry,
+        buffer: usize,
+        hls: HlsConfig,
+        normalizer: Option<crate::hls_audio::PreparedNormalizer>,
+        history: crate::history::HlsHistoryConfig,
+        audio_languages: Vec<[u8; 3]>,
+        max_sessions: usize,
+    ) -> Arc<StreamManager> {
         Arc::new(StreamManager {
             registry,
+            admission: crate::admission::Admission::new(max_sessions),
             sessions: Mutex::new(HashMap::new()),
             packagers: Mutex::new(HashMap::new()),
             hls_transitions: Arc::new(StdMutex::new(HlsLifecycleState::default())),
@@ -400,6 +423,24 @@ impl StreamManager {
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             shutdown_signal: watch::channel(false).0,
         })
+    }
+
+    /// Construct a manager with a provider resource cap; zero is unlimited.
+    pub fn with_session_limit(registry: ProviderRegistry, max_sessions: usize) -> Arc<Self> {
+        Self::with_admission_config(
+            registry,
+            256,
+            HlsConfig::default(),
+            None,
+            Default::default(),
+            Vec::new(),
+            max_sessions,
+        )
+    }
+
+    /// Pending opens and retained provider owners, including VOD ranges after cache eviction.
+    pub fn admission_status(&self) -> (usize, Option<usize>) {
+        self.admission.snapshot()
     }
 
     #[cfg(test)]
@@ -482,6 +523,13 @@ impl StreamManager {
         }
     }
 
+    /// Remember URL-scoped transport metadata without giving its infohash catalog authority.
+    pub fn remember_transport_url(&self, network: &str, id: &str, info: &StreamInfo) {
+        if let Some(provider) = self.registry.get(network) {
+            provider.remember_transport_url(id, info);
+        }
+    }
+
     /// Read already verified live metadata without starting a source or doing network I/O.
     pub fn verified_live_descriptor(
         &self,
@@ -531,6 +579,7 @@ impl StreamManager {
             id.to_owned()
         };
         let key = (network.to_owned(), id);
+        self.check_openable(network, &key.1)?;
         if let Some(v) = self.cached_vod(&key).await {
             return Ok(v);
         }
@@ -538,11 +587,19 @@ impl StreamManager {
         // we waited, so we must not resolve (and discover) a second time.
         let resolve_lock = Self::key_lock(&self.vod_resolve_locks, &key);
         let _resolving = resolve_lock.lock().await;
+        self.check_openable(network, &key.1)?;
         if let Some(v) = self.cached_vod(&key).await {
             return Ok(v);
         }
         let provider = self.registry.get(network).ok_or(ProviderError::NotFound)?;
-        let vod: Arc<dyn VodContent> = Arc::from(provider.resolve_vod(&key.1).await?);
+        let reservation = self.admission.reserve()?;
+        let inner = provider.resolve_vod(&key.1).await?;
+        let vod: Arc<dyn VodContent> = Arc::new(crate::admission::Content(Arc::new(
+            crate::admission::ContentOwner {
+                inner,
+                _reservation: reservation,
+            },
+        )));
         let _finalizing = self.hls_finalization.lock().await;
         if self
             .shutting_down
@@ -612,6 +669,7 @@ impl StreamManager {
         network: &str,
         id: &str,
     ) -> Result<Arc<StreamSession>, ProviderError> {
+        self.check_openable(network, id)?;
         let key = (network.to_string(), id.to_string());
         let observed = self.sessions.lock().await.get(&key).cloned();
         if let Some(session) = observed.as_ref().filter(|s| !s.is_finished()) {
@@ -625,6 +683,7 @@ impl StreamManager {
         if transition.is_cancelled() {
             return Err(ProviderError::NotFound);
         }
+        self.check_openable(network, id)?;
         {
             let map = self.sessions.lock().await;
             if let Some(s) = map
@@ -635,7 +694,11 @@ impl StreamManager {
             }
         }
         let provider = self.registry.get(network).ok_or(ProviderError::NotFound)?;
-        let source = provider.open(id).await?;
+        let reservation = self.admission.reserve()?;
+        let source: Box<dyn TsSource> = Box::new(crate::admission::Source {
+            inner: provider.open(id).await?,
+            _reservation: reservation,
+        });
         let session = StreamSession::start(source, self.buffer);
         // Publication ends the pending transition before old-worker cleanup finishes.
         // Keep the replacement owned until this request can attach its real receiver.
@@ -724,6 +787,7 @@ impl StreamManager {
         id: &str,
         native: bool,
     ) -> Result<(Arc<HlsPackager>, Arc<StreamSession>, Subscription), ProviderError> {
+        self.check_openable(network, id)?;
         let key = (network.to_string(), id.to_string());
         if self
             .shutting_down
@@ -740,6 +804,7 @@ impl StreamManager {
         if transition.is_cancelled() {
             return Err(ProviderError::NotFound);
         }
+        self.check_openable(network, id)?;
 
         let existing_session = self
             .sessions
@@ -750,7 +815,11 @@ impl StreamManager {
             .cloned();
         let mut source: Option<Box<dyn TsSource>> = if existing_session.is_none() {
             let provider = self.registry.get(network).ok_or(ProviderError::NotFound)?;
-            Some(provider.open(id).await?)
+            let reservation = self.admission.reserve()?;
+            Some(Box::new(crate::admission::Source {
+                inner: provider.open(id).await?,
+                _reservation: reservation,
+            }))
         } else {
             None
         };
@@ -3249,3 +3318,6 @@ mod tests {
         assert!(m.get_hls("test", "stale-hls").await.is_none());
     }
 }
+
+#[cfg(test)]
+mod admission_tests;

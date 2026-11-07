@@ -20,6 +20,7 @@ pub(crate) struct PreparedReply {
     pub(crate) message: PeerMessage,
     /// Stored payload bytes, excluding the live wire header; used at caller success boundaries.
     pub(crate) media_bytes: usize,
+    pub(crate) _read_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 pub(crate) async fn prepare_reply(
@@ -33,8 +34,18 @@ pub(crate) async fn prepare_reply(
             let requested_stream = u32::from_be_bytes(payload[0..4].try_into().ok()?);
             let piece = u32::from_be_bytes(payload[4..8].try_into().ok()?);
             let chunk = u16::from_be_bytes(payload[8..10].try_into().ok()?);
-            let (data, stored_header) =
-                PieceStore::shared_chunk(store, piece as u64, chunk).await?;
+            let (data, stored_header, permit) = match profile {
+                ServeProfile::Reciprocal => {
+                    let chunk =
+                        PieceStore::shared_reciprocal_chunk(store, piece as u64, chunk).await?;
+                    (chunk.data, chunk.header, chunk.permit)
+                }
+                ServeProfile::Inbound { .. } => {
+                    let (data, header) =
+                        PieceStore::shared_chunk(store, piece as u64, chunk).await?;
+                    (data, header, None)
+                }
+            };
             let (stream, header) = match profile {
                 ServeProfile::Inbound { fallback_header } => (
                     requested_stream,
@@ -49,6 +60,7 @@ pub(crate) async fn prepare_reply(
             Some(PreparedReply {
                 message: build_piece(stream, piece, chunk, header, &data),
                 media_bytes: data.len(),
+                _read_permit: permit,
             })
         }
         PeerMessage::Request {
@@ -59,6 +71,7 @@ pub(crate) async fn prepare_reply(
             let block = PieceStore::shared_block(store, *index as u64, *begin, *length).await?;
             Some(PreparedReply {
                 media_bytes: block.len(),
+                _read_permit: None,
                 message: PeerMessage::Piece {
                     index: *index,
                     begin: *begin,

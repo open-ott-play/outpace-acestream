@@ -57,7 +57,7 @@ outpace broadcast sports --public-host stream.example
 | --- | --- | --- |
 | `GET /healthz` | `200 text/plain` (`ok`) | Process health probe; it does not prove swarm connectivity. |
 | `GET /networks` | `200 application/json`, `{"networks":["ace"]}` | Provider networks configured in this daemon. |
-| `GET /streams` | `200 application/json`, `{"streams":[...]}` | Active shared sessions. Entries have `network`, `id`, direct-client count `clients`, and descriptor `metadata`. |
+| `GET /streams` | `200 application/json`, `{"streams":[...],"occupied_sessions":0,"max_sessions":null}` | Active shared sessions. Entries have `network`, `id`, direct-client count `clients`, and descriptor `metadata`. |
 | `GET /streams/<network>/<id>` | `200 video/mp2t` streaming body | Default live playback for dot-free provider ids; starts or joins the same shared session as the explicit `.ts` form. When the descriptor supplies a title, the response includes `Icy-Name`. Dotted ids, unknown networks, and invalid ids return `404`. An `ih:` selector without a verified descriptor returns `422` with a plain-text reason. Malformed `cid:`/`ih:` selectors return `400`. |
 | `GET /streams/<network>/<id>.ts` | `200 video/mp2t` streaming body | Explicit continuous MPEG-TS form; equivalent for dot-free ids, preserves dots within the provider id, and includes `Icy-Name` when the descriptor supplies a title. |
 | `GET /streams/<network>/<id>.m3u8` | `200 application/vnd.apple.mpegurl` | Starts or joins live HLS packaging and returns a sliding playlist. The same `422` applies. |
@@ -357,6 +357,21 @@ source logs contain only validated name/state/fixed codes, throttled to 30s plus
 event. See [deployment environment handling](deployment.md#managed-source-declarations) and
 the reservation/storage/platform/RTMP guarantees above before backing up or rolling back.
 
+## Provider admission and descriptor refusal
+
+`OUTPACE_MAX_SESSIONS` optionally caps pending provider acquisitions and retained
+live/VOD source owners. It defaults to unlimited. New native live/HLS/VOD starts
+at capacity return `503`, `Retry-After: 1`, and `session capacity reached`.
+Joining an existing source uses its existing slot. `GET /streams` and compatibility
+engine status add `occupied_sessions` and `max_sessions` (null for unlimited).
+Managed origin HLS keeps its independent relay bound. This limit does not bound
+process RSS, viewers or all asynchronously retiring peer sockets.
+
+Decoded protected descriptors return `422` with `encrypted content is not supported`;
+malformed authoritative protection metadata returns `invalid content protection metadata`.
+Compatibility JSON URL requests keep their established error envelope. No playback
+URL or source is created for a descriptor rejected by these checks.
+
 ## Stream status
 
 An active stream status response has stable field names and numeric counters:
@@ -469,6 +484,14 @@ needed by reassembly, `last` the last observed provider head, `live_first` and
 wall-clock timestamps is available. These observations are not a client's
 playhead or an authenticated source clock. Other providers without independent
 readers retain their existing post-output cached statistics behavior.
+
+Native `livepos.buffer_complete` indicates whether the bounded reassembly-buffer
+measurement is complete for the current cursor. Each pool turn scans at most
+2,048 TS packets and 64 piece transitions. While incomplete, while an accepted
+output batch is pending, or after coverage is cleared, this flag is false;
+zero reassembly buffer figures then mean unavailable, not proven empty.
+Startup-reservoir `buffer_ms` remains a separate observation as described above.
+Compatibility live-position keys and types remain unchanged.
 
 `recovery` is null for providers without recovery observations. Observed live
 sources expose all five numeric fields from session creation, initially zero.

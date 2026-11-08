@@ -71,4 +71,4 @@ f510d3b282d5fac9173b10b0ddedb9535c767ac9 # venus-os-ci-toolkit reviewed forward 
 
 35ea6ef05730806bd85e27fdbbeed326ac5c3deb # renovate: shared-toolkit-ref; reviewed candidate and security workflow revision
 
-65c3a644c440fcd5f95d94b6c2fa2be1df58249c # renovate: shared-toolkit-ref; reviewed merge and base-advance-safe withdrawal workflow
+0047a13b5eb79dfa770e31070a83e9696ddd36d1 # renovate: shared-toolkit-ref; reviewed merge and base-advance-safe withdrawal workflow

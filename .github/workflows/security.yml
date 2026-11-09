@@ -20,6 +20,6 @@ jobs:
       contents: read
       actions: read
       security-events: write
-    uses: victron-venus/venus-os-ci-toolkit/.github/workflows/security-scan.yml@42c1200e7ec4ce7ed32fa1c9e7492449b1f04b80 # main
+    uses: victron-venus/venus-os-ci-toolkit/.github/workflows/security-scan.yml@427a937de66be398d624822e1af558c0e019e0df # main
     with:
       languages: rust,python,actions

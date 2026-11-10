@@ -46,9 +46,8 @@ const KEY_BITS: usize = 768;
 // and at least 11 bytes of encoding overhead, including eight padding bytes.
 const MIN_SIGNING_MODULUS_BYTES: usize = 15 + 20 + 11;
 // Preserve the previous verifier's 4096-bit resource bound, independently of
-// the dependency's default (now 8192). The minimum matches the byte-width gate.
+// the dependency's default (now 8192).
 const MAX_SIGNING_MODULUS_BITS: usize = 4096;
-const MIN_SIGNING_MODULUS_BITS: usize = (MIN_SIGNING_MODULUS_BYTES - 1) * 8 + 1;
 
 /// A broadcast source's live-auth RSA identity.
 pub struct LiveSourceAuth {
@@ -139,15 +138,15 @@ impl LivePieceVerifier {
         let n = key.modulus.as_bytes();
         let e = key.public_exponent.as_bytes();
         // Bound allocations before constructing big integers from network data.
-        if !(MIN_SIGNING_MODULUS_BYTES..=MAX_SIGNING_MODULUS_BITS / 8).contains(&n.len())
-            || e.is_empty()
-            || e.len() > 8
-        {
+        if n.is_empty() || n.len() > MAX_SIGNING_MODULUS_BITS / 8 || e.is_empty() || e.len() > 8 {
             return None;
         }
         let n = BoxedUint::from_be_slice(n, (n.len() * 8) as u32).ok()?;
         let e = BoxedUint::from_be_slice(e, (e.len() * 8) as u32).ok()?;
-        PublicKey::new_with_size_limits(n, e, MIN_SIGNING_MODULUS_BITS..=MAX_SIGNING_MODULUS_BITS)
+        // Keep even undersized legacy keys recognizable: callers treat an
+        // unparseable key as unsigned. Verification must stay enabled and
+        // reject signatures that cannot fit, rather than downgrade that path.
+        PublicKey::new_with_size_limits(n, e, 1..=MAX_SIGNING_MODULUS_BITS)
             .ok()
             .map(Self)
     }
@@ -205,10 +204,8 @@ mod tests {
             let der = synthetic_public_key_der(&vec![0x81; bytes], &[1, 0, 1]);
             assert_eq!(signature_len_from_pubkey_der(&der), Some(bytes));
         }
-        for bytes in [1, 45, 513] {
-            let der = synthetic_public_key_der(&vec![0x81; bytes], &[1, 0, 1]);
-            assert!(LivePieceVerifier::from_der(&der).is_none());
-        }
+        let oversized = synthetic_public_key_der(&[0x81; 513], &[1, 0, 1]);
+        assert!(LivePieceVerifier::from_der(&oversized).is_none());
         for exponent in [vec![0], vec![1], vec![2], vec![0x81; 9]] {
             let der = synthetic_public_key_der(&[0x81; 96], &exponent);
             assert!(LivePieceVerifier::from_der(&der).is_none());
@@ -217,6 +214,23 @@ mod tests {
         even_modulus[95] = 0x80;
         let der = synthetic_public_key_der(&even_modulus, &[1, 0, 1]);
         assert!(LivePieceVerifier::from_der(&der).is_none());
+    }
+
+    #[test]
+    fn undersized_public_keys_keep_verification_enabled_and_reject_signatures() {
+        for bytes in [1, 32, 45] {
+            let der = synthetic_public_key_der(&vec![0x81; bytes], &[3]);
+            assert_eq!(signature_len_from_pubkey_der(&der), Some(bytes));
+            let verifier = LivePieceVerifier::from_der(&der).unwrap();
+            assert!(!verifier.verify(b"synthetic payload", &vec![0; bytes]));
+            let mut reassembler =
+                crate::reassembly::PieceReassembler::new(128, 0).with_source_pubkey(der);
+            assert!(matches!(
+                reassembler.add_block(0, 0, &[0; 128]),
+                Err(crate::WireError::SignatureRejected)
+            ));
+            assert!(reassembler.take_ready().is_empty());
+        }
     }
 
     #[test]

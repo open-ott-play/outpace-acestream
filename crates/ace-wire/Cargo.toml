@@ -6,15 +6,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# RSA 0.9 requires digest 0.10 and rand_core 0.6; keep its signing inputs compatible.
-sha1 = { version = "0.10", features = ["oid"] }
+# RSA 0.10 uses digest 0.11 and rand_core 0.10.
+sha1 = { version = "0.11", features = ["oid"] }
 sha2 = "0.11"
 ed25519-dalek = { version = "3", features = ["rand_core"] }
-# Keep rand 0.8 for RSA; Ed25519 generation fills a seed without coupling RNG traits.
-rand = "0.8"
+rand = "0.10"
 aes = "0.9"
 cbc = { version = "0.2", features = ["alloc"] }
-rsa = "0.10"
+# Legacy live-source identities use 768-bit RSA and PKCS#1 v1.5/SHA-1.
+# hazmat is used only to retain that key-generation size in live_auth.
+rsa = { version = "0.10", features = ["pkcs1v15", "hazmat"] }
 pkcs8 = { version = "0.11", features = ["pem"] }
 
 [dev-dependencies]

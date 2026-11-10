@@ -33,10 +33,10 @@ impl Identity {
 
     /// Mint a fresh random identity.
     pub fn generate() -> Self {
-        // Fill the Ed25519 seed directly so RSA's rand 0.8 dependency does not
-        // have to implement ed25519-dalek's newer rand_core traits.
+        // Fill the Ed25519 seed from the operating system's cryptographic RNG.
         let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+        rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut seed)
+            .expect("Ed25519 identity randomness");
         Self::from_seed(seed)
     }
 

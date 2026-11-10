@@ -32,11 +32,10 @@
 //! - `authmethod` = literal ASCII `"RSA"`.
 
 use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey};
-use rsa::pkcs1v15::Pkcs1v15Sign;
-use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
+use rsa::pkcs8::{der::Decode, EncodePublicKey, SubjectPublicKeyInfoRef};
 use rsa::traits::PublicKeyParts;
-use rsa::{RsaPrivateKey, RsaPublicKey};
-use sha1::{Digest, Sha1};
+use rsa::{BoxedUint, PrivateKey, PublicKey};
+use sha1::Sha1;
 
 /// Key size matching the real engine's own source-node-generated keys (note 25: a captured
 /// `.sauth` was 768 bits). Not a protocol requirement — any RSA key verifies fine — but
@@ -46,24 +45,30 @@ const KEY_BITS: usize = 768;
 // PKCS#1 v1.5 requires the SHA-1 DigestInfo prefix (15 bytes), digest (20 bytes),
 // and at least 11 bytes of encoding overhead, including eight padding bytes.
 const MIN_SIGNING_MODULUS_BYTES: usize = 15 + 20 + 11;
+// Preserve the previous verifier's 4096-bit resource bound, independently of
+// the dependency's default (now 8192). The minimum matches the byte-width gate.
+const MAX_SIGNING_MODULUS_BITS: usize = 4096;
+const MIN_SIGNING_MODULUS_BITS: usize = (MIN_SIGNING_MODULUS_BYTES - 1) * 8 + 1;
 
 /// A broadcast source's live-auth RSA identity.
 pub struct LiveSourceAuth {
-    key: RsaPrivateKey,
+    key: PrivateKey,
 }
 
 impl LiveSourceAuth {
     /// Mint a fresh keypair.
     pub fn generate() -> Self {
+        // RSA 0.10's normal generator requires 1024 bits. Only this legacy
+        // protocol identity opts out; private-key validation is still applied.
         let key =
-            RsaPrivateKey::new(&mut rand::thread_rng(), KEY_BITS).expect("RSA key generation");
+            PrivateKey::new_unchecked(&mut rand::rng(), KEY_BITS).expect("RSA key generation");
         LiveSourceAuth { key }
     }
 
     /// Load an identity from its PKCS#1 PEM private-key text (the `.sauth` format).
     /// Reject keys too short to encode a SHA-1 PKCS#1 v1.5 signature before use.
     pub fn from_pkcs1_pem(pem: &str) -> Result<Self, crate::WireError> {
-        let key = RsaPrivateKey::from_pkcs1_pem(pem)
+        let key = PrivateKey::from_pkcs1_pem(pem)
             .map_err(|_| crate::WireError::Invalid("bad PKCS#1 RSA private key PEM"))?;
         if key.size() < MIN_SIGNING_MODULUS_BYTES {
             return Err(crate::WireError::Invalid(
@@ -84,7 +89,7 @@ impl LiveSourceAuth {
     /// The DER-encoded X.509 SubjectPublicKeyInfo — exactly what the transport descriptor's
     /// `pubkey` field carries.
     pub fn pubkey_der(&self) -> Vec<u8> {
-        let pubkey = RsaPublicKey::from(&self.key);
+        let pubkey = PublicKey::from(&self.key);
         pubkey
             .to_public_key_der()
             .expect("DER SPKI encode")
@@ -102,9 +107,8 @@ impl LiveSourceAuth {
     /// will go): `SHA1(payload)` then RSASSA-PKCS1-v1_5. Returns exactly `signature_len()`
     /// bytes, appended as-is to `payload` to form the wire piece — see the module docs.
     pub fn sign(&self, payload: &[u8]) -> Vec<u8> {
-        let digest = Sha1::digest(payload);
         self.key
-            .sign(Pkcs1v15Sign::new::<Sha1>(), &digest)
+            .pkcs1v15_sign::<Sha1>(payload)
             .expect("RSA-PKCS1v15-SHA1 sign")
     }
 }
@@ -119,11 +123,33 @@ pub fn verify_piece(pubkey_der: &[u8], payload: &[u8], signature: &[u8]) -> bool
 }
 
 /// A source key parsed once for all pieces in a live stream.
-pub(crate) struct LivePieceVerifier(RsaPublicKey);
+pub(crate) struct LivePieceVerifier(PublicKey);
 
 impl LivePieceVerifier {
     pub(crate) fn from_der(der: &[u8]) -> Option<Self> {
-        RsaPublicKey::from_public_key_der(der).ok().map(Self)
+        // Decode SPKI explicitly to allow legacy sub-1024-bit keys. Retain the
+        // rsaEncryption algorithm/NULL parameters and byte-aligned BIT STRING
+        // checks; PSS-restricted keys cannot authenticate PKCS#1 v1.5 pieces.
+        let spki = SubjectPublicKeyInfoRef::from_der(der).ok()?;
+        if spki.algorithm != rsa::pkcs1::ALGORITHM_ID {
+            return None;
+        }
+        let key =
+            rsa::pkcs1::RsaPublicKeyRef::from_der(spki.subject_public_key.as_bytes()?).ok()?;
+        let n = key.modulus.as_bytes();
+        let e = key.public_exponent.as_bytes();
+        // Bound allocations before constructing big integers from network data.
+        if !(MIN_SIGNING_MODULUS_BYTES..=MAX_SIGNING_MODULUS_BITS / 8).contains(&n.len())
+            || e.is_empty()
+            || e.len() > 8
+        {
+            return None;
+        }
+        let n = BoxedUint::from_be_slice(n, (n.len() * 8) as u32).ok()?;
+        let e = BoxedUint::from_be_slice(e, (e.len() * 8) as u32).ok()?;
+        PublicKey::new_with_size_limits(n, e, MIN_SIGNING_MODULUS_BITS..=MAX_SIGNING_MODULUS_BITS)
+            .ok()
+            .map(Self)
     }
 
     pub(crate) fn signature_len(&self) -> usize {
@@ -131,21 +157,16 @@ impl LivePieceVerifier {
     }
 
     pub(crate) fn verify(&self, payload: &[u8], signature: &[u8]) -> bool {
-        let digest = Sha1::digest(payload);
-        self.0
-            .verify(Pkcs1v15Sign::new::<Sha1>(), &digest, signature)
-            .is_ok()
+        self.0.pkcs1v15_verify::<Sha1>(payload, signature).is_ok()
     }
 }
 
 /// The live-source signature length for a broadcaster's `pubkey` (the transport descriptor's
 /// DER SubjectPublicKeyInfo) — the RSA modulus's byte length, i.e. how many trailing bytes of
 /// each wire piece are the in-band signature (see the module docs / B0). Returns `None` if the
-/// bytes aren't a parseable RSA public key.
+/// bytes aren't a supported, valid RSA public key.
 pub fn signature_len_from_pubkey_der(pubkey_der: &[u8]) -> Option<usize> {
-    RsaPublicKey::from_public_key_der(pubkey_der)
-        .ok()
-        .map(|k| k.size())
+    LivePieceVerifier::from_der(pubkey_der).map(|verifier| verifier.signature_len())
 }
 
 /// Split a wire piece into `(payload, signature)` given the signer's signature length —
@@ -161,13 +182,67 @@ pub fn split_piece(piece: &[u8], sig_len: usize) -> Option<(&[u8], &[u8])> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsa::pkcs8::der::{asn1::BitStringRef, Encode};
+
+    fn synthetic_public_key_der(modulus: &[u8], exponent: &[u8]) -> Vec<u8> {
+        let key = rsa::pkcs1::RsaPublicKeyRef {
+            modulus: rsa::pkcs1::UintRef::new(modulus).unwrap(),
+            public_exponent: rsa::pkcs1::UintRef::new(exponent).unwrap(),
+        }
+        .to_der()
+        .unwrap();
+        SubjectPublicKeyInfoRef {
+            algorithm: rsa::pkcs1::ALGORITHM_ID,
+            subject_public_key: BitStringRef::new(0, &key).unwrap(),
+        }
+        .to_der()
+        .unwrap()
+    }
+
+    #[test]
+    fn legacy_public_key_decoder_keeps_modulus_and_exponent_bounds() {
+        for bytes in [46, 96, 128, 512] {
+            let der = synthetic_public_key_der(&vec![0x81; bytes], &[1, 0, 1]);
+            assert_eq!(signature_len_from_pubkey_der(&der), Some(bytes));
+        }
+        for bytes in [1, 45, 513] {
+            let der = synthetic_public_key_der(&vec![0x81; bytes], &[1, 0, 1]);
+            assert!(LivePieceVerifier::from_der(&der).is_none());
+        }
+        for exponent in [vec![0], vec![1], vec![2], vec![0x81; 9]] {
+            let der = synthetic_public_key_der(&[0x81; 96], &exponent);
+            assert!(LivePieceVerifier::from_der(&der).is_none());
+        }
+        let mut even_modulus = [0x81; 96];
+        even_modulus[95] = 0x80;
+        let der = synthetic_public_key_der(&even_modulus, &[1, 0, 1]);
+        assert!(LivePieceVerifier::from_der(&der).is_none());
+    }
+
+    #[test]
+    fn legacy_public_key_decoder_rejects_wrong_algorithm_and_malformed_der() {
+        let der = synthetic_public_key_der(&[0x81; 96], &[1, 0, 1]);
+        let mut spki = SubjectPublicKeyInfoRef::from_der(&der).unwrap();
+        spki.algorithm.parameters = None;
+        assert!(LivePieceVerifier::from_der(&spki.to_der().unwrap()).is_none());
+        spki.algorithm = rsa::pkcs1::ALGORITHM_ID;
+        spki.algorithm.oid = rsa::pkcs8::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10");
+        assert!(LivePieceVerifier::from_der(&spki.to_der().unwrap()).is_none());
+        spki.algorithm = rsa::pkcs1::ALGORITHM_ID;
+        spki.subject_public_key = BitStringRef::new(1, &[0]).unwrap();
+        assert!(LivePieceVerifier::from_der(&spki.to_der().unwrap()).is_none());
+        assert!(LivePieceVerifier::from_der(&der[..der.len() - 1]).is_none());
+        let mut trailing = der;
+        trailing.push(0);
+        assert!(LivePieceVerifier::from_der(&trailing).is_none());
+    }
 
     #[test]
     fn rejects_loaded_keys_below_the_sha1_signature_encoding_boundary() {
         // These ephemeral keys exercise the encoding boundary, not the default
         // key generator. In particular, 45 bytes is one byte too short.
         for bytes in [32, 45] {
-            let key = RsaPrivateKey::new(&mut rand::thread_rng(), bytes * 8)
+            let key = PrivateKey::new_unchecked(&mut rand::rng(), bytes * 8)
                 .expect("synthetic boundary key");
             assert_eq!(key.size(), bytes);
             let pem = key
@@ -185,7 +260,7 @@ mod tests {
     #[test]
     fn loaded_key_at_the_sha1_encoding_boundary_signs_and_round_trips() {
         let key =
-            RsaPrivateKey::new(&mut rand::thread_rng(), 46 * 8).expect("synthetic boundary key");
+            PrivateKey::new_unchecked(&mut rand::rng(), 46 * 8).expect("synthetic boundary key");
         assert_eq!(key.size(), 46);
         let pem = key
             .to_pkcs1_pem(rsa::pkcs8::LineEnding::LF)
@@ -203,6 +278,7 @@ mod tests {
     #[test]
     fn generated_pubkey_der_round_trips_through_pem_reload() {
         let a = LiveSourceAuth::generate();
+        assert_eq!(a.signature_len(), 96, "retain the legacy 768-bit identity");
         let pem = a.to_pkcs1_pem();
         let b = LiveSourceAuth::from_pkcs1_pem(&pem).unwrap();
         assert_eq!(
@@ -230,7 +306,7 @@ mod tests {
     fn captured_transport_pubkey_has_expected_der_and_signature_geometry() {
         let der =
             include_bytes!("../../../tests/vectors/live-source-auth/transport-public-key.der");
-        let key = RsaPublicKey::from_public_key_der(der).unwrap();
+        let key = LivePieceVerifier::from_der(der).unwrap().0;
         assert_eq!(key.to_public_key_der().unwrap().as_bytes(), der);
         assert_eq!(signature_len_from_pubkey_der(der), Some(96));
         assert_eq!(

@@ -59,6 +59,7 @@ mod broadcast_source;
 mod compat;
 mod origin_history;
 mod origin_hls;
+mod search;
 mod streams;
 mod vod;
 
@@ -370,3 +371,8 @@ pub fn router(state: AppState) -> Router {
 
 #[cfg(test)]
 mod tests;
+
+/// Build the separately opted-in external stream search routes.
+pub fn search_router(service: Option<Arc<crate::acestream_search::SearchService>>) -> Router {
+    search::router(service)
+}

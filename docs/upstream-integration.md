@@ -96,3 +96,36 @@ A green library suite is necessary but does not by itself demonstrate live
 provider availability or archival support. The final integrated build must also
 pass its compatibility/provider and client-facing session-generation tests before
 replacing the deployed engine.
+
+## November 13 source adaptations (unreleased)
+
+The following selective adaptations retain the original Outpace authorship and
+AGPL notices. Upstream now lives at
+[outpace-stream/outpace-engine](https://github.com/outpace-stream/outpace-engine).
+
+- [ATSC audio classification](https://github.com/outpace-stream/outpace-engine/commit/31c6b34)
+  recognizes AC3 `0x81` and E-AC3 `0x87`, retaining this tree's conflicting-codec
+  descriptor rejection and language selection. Recognition does not add E-AC3 conversion.
+- [Live normalization recovery](https://github.com/outpace-stream/outpace-engine/commit/774140b)
+  separates the 16 MiB discarded classification scan from the 1 MiB detached-input
+  budget and avoids exhausting recovery allowance after stable generations.
+  Large source-owned views are consumed in place, not copied into an impossible
+  input reservation; only one current source view is held. This is not a total
+  process RSS bound. See [live audio](live-audio.md) for ownership and deadlines.
+- [Execute-only cache ancestors](https://github.com/outpace-stream/outpace-engine/pull/464)
+  use Linux/Android `O_PATH` traversal while retaining final-directory ownership,
+  no-symlink traversal, private atomic replacement and readable final-directory sync.
+- [Optional metrics](https://github.com/outpace-stream/outpace-engine/commit/0497140)
+  aggregate active-session and HTTP measurements without source names, IDs, tokens
+  or URLs in labels. This adaptation also bounds simultaneous scrapes and collection
+  time. Session-lifetime totals remain gauges, not monotonic counters.
+- [Optional native search](https://github.com/outpace-stream/outpace-engine/pull/408)
+  is bounded discovery only, independent of playback compatibility. Returned
+  metadata never establishes descriptor provenance or edits curated playlists.
+  Both new HTTP features default off; see [configuration](configuration.md) and
+  [search](source-search.md).
+
+The upstream actor/DHT/store architecture is not substituted wholesale. Existing
+managed-origin HLS, replay, admission ownership and generation fencing remain the
+integration contracts. Synthetic qualification does not establish provider
+availability or improved decoded startup on real channels.

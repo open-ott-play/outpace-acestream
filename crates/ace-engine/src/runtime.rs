@@ -218,6 +218,13 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
     if let Some(v) = bool_from_env("OUTPACE_MANAGED_HLS")? {
         config.managed_hls = v;
     }
+    if let Some(v) = bool_from_env("OUTPACE_METRICS")? {
+        config.metrics = v;
+    }
+    config.acestream_services = crate::acestream_search::SearchSettings {
+        enabled: bool_from_env("OUTPACE_COMPAT_ACESTREAM_SERVICES")?.unwrap_or(false),
+    };
+    config.acestream_services.validate(false)?;
     if let Some(v) = std::env::var_os("OUTPACE_FFMPEG_PATH") {
         config.hls_audio.ffmpeg_path = v.into();
     }
@@ -941,6 +948,14 @@ async fn serve_http_inner(
         let (history, budget) = manager.history_context();
         crate::origin_hls::OriginHls::new_with_history(FetchPolicy::default(), history, budget)
     });
+    let search = if config.acestream_services.enabled {
+        Some(Arc::new(
+            crate::acestream_search::SearchService::new(config.acestream_services.clone())
+                .map_err(|_| "invalid AceStream search service configuration")?,
+        ))
+    } else {
+        None
+    };
     let state = AppState {
         manager,
         networks: networks.clone(),
@@ -1078,7 +1093,13 @@ async fn serve_http_inner(
             () = &mut shutdown => return Ok(()),
             result = startup => result?,
         }
-        axum::serve(listener, router(state))
+        let manager = state.manager.clone();
+        let networks = state.networks.clone();
+        let mut app = router(state).merge(crate::http::search_router(search));
+        if config.metrics {
+            app = crate::metrics::instrument(app, manager, &networks);
+        }
+        axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 // Axum retains this future in its own task. Dropping the outer
                 // serving future must wake it too, so it releases manager state.
@@ -1260,6 +1281,30 @@ mod tests {
     use super::*;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl EnvRestore {
+        fn clear(names: &[&'static str]) -> Self {
+            let previous = names
+                .iter()
+                .map(|&name| (name, std::env::var_os(name)))
+                .collect();
+            for name in names {
+                std::env::remove_var(name);
+            }
+            Self(previous)
+        }
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
 
     struct CompatEnvRestore([Option<std::ffi::OsString>; 2]);
 
@@ -1512,6 +1557,47 @@ mod tests {
                 crate::ace_provider::test_support::bep9_enabled(&provider),
                 enabled
             );
+        }
+    }
+
+    #[test]
+    fn search_env_is_separate_strict_and_disabled_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let name = "OUTPACE_COMPAT_ACESTREAM_SERVICES";
+        let _restore = EnvRestore::clear(&[
+            name,
+            "OUTPACE_ACE_COMPAT",
+            "OUTPACE_EXPERIMENTAL_ACE_COMPAT",
+        ]);
+        assert!(!config_from_env().unwrap().acestream_services.enabled);
+        std::env::set_var("OUTPACE_ACE_COMPAT", "1");
+        assert!(!config_from_env().unwrap().acestream_services.enabled);
+        for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            std::env::set_var(name, value);
+            assert_eq!(
+                config_from_env().unwrap().acestream_services.enabled,
+                expected
+            );
+        }
+        for invalid in ["", "yes", " 1"] {
+            std::env::set_var(name, invalid);
+            assert!(config_from_env().unwrap_err().to_string().contains(name));
+        }
+    }
+
+    #[test]
+    fn metrics_env_defaults_off_and_parses_strictly() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let name = "OUTPACE_METRICS";
+        let _restore = EnvRestore::clear(&[name]);
+        assert!(!config_from_env().unwrap().metrics);
+        for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            std::env::set_var(name, value);
+            assert_eq!(config_from_env().unwrap().metrics, expected);
+        }
+        for invalid in ["", "yes", " 1"] {
+            std::env::set_var(name, invalid);
+            assert!(config_from_env().unwrap_err().to_string().contains(name));
         }
     }
 

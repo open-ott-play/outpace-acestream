@@ -231,6 +231,14 @@ impl WarmPeerCache {
             }
         }
     }
+    /// Whether initial disk loading has finished, or this cache selected its
+    /// in-memory fallback. This acknowledges completion only: it does not imply
+    /// successful disk I/O, the presence of hints, or descriptor authority.
+    /// `initialized()` retains its separate best-effort 100 ms startup wait.
+    pub fn is_initialized(&self) -> bool {
+        self.0.shared.state.lock().unwrap().loaded
+    }
+
     pub async fn initialized(&self) {
         let _ = tokio::time::timeout(Duration::from_millis(100), async {
             loop {
@@ -618,31 +626,49 @@ mod secure {
     }
     impl Directory {
         pub(super) fn open(path: &Path) -> io::Result<Self> {
+            // Ancestors need search permission only (notably Android's /data).
+            // The final directory stays readable for sync_all after atomic replacement.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            const TRAVERSE: i32 = libc::O_PATH | libc::O_DIRECTORY;
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            const TRAVERSE: i32 = libc::O_RDONLY | libc::O_DIRECTORY;
+            let mut components = path
+                .components()
+                .filter_map(|component| match component {
+                    Component::Normal(name) => Some(name),
+                    _ => None,
+                })
+                .peekable();
             let mut dir = openat(
                 libc::AT_FDCWD,
                 Path::new("/").as_os_str(),
-                libc::O_RDONLY | libc::O_DIRECTORY,
+                if components.peek().is_some() {
+                    TRAVERSE
+                } else {
+                    libc::O_RDONLY | libc::O_DIRECTORY
+                },
                 0,
             )?;
-            for component in path.components() {
-                if let Component::Normal(name) = component {
-                    dir = match openat(dir.as_raw_fd(), name, libc::O_RDONLY | libc::O_DIRECTORY, 0)
-                    {
-                        Ok(next) => next,
-                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                            let name_c = CString::new(name.as_bytes()).map_err(|_| {
-                                io::Error::new(io::ErrorKind::InvalidInput, "NUL path")
-                            })?;
-                            if unsafe { libc::mkdirat(dir.as_raw_fd(), name_c.as_ptr(), 0o700) } < 0
-                                && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
-                            {
-                                return Err(io::Error::last_os_error());
-                            }
-                            openat(dir.as_raw_fd(), name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?
+            while let Some(name) = components.next() {
+                let flags = if components.peek().is_some() {
+                    TRAVERSE
+                } else {
+                    libc::O_RDONLY | libc::O_DIRECTORY
+                };
+                dir = match openat(dir.as_raw_fd(), name, flags, 0) {
+                    Ok(next) => next,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        let name_c = CString::new(name.as_bytes())
+                            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL path"))?;
+                        if unsafe { libc::mkdirat(dir.as_raw_fd(), name_c.as_ptr(), 0o700) } < 0
+                            && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
+                        {
+                            return Err(io::Error::last_os_error());
                         }
-                        Err(error) => return Err(error),
-                    };
-                }
+                        openat(dir.as_raw_fd(), name, flags, 0)?
+                    }
+                    Err(error) => return Err(error),
+                };
             }
             let metadata = dir.metadata()?;
             if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
@@ -764,6 +790,25 @@ mod secure {
     }
 }
 
+// Fixtures asserting persisted contents need actual load completion, not the
+// production best-effort startup delay. Keep the existing two-second setup bound.
+#[cfg(test)]
+pub(super) async fn fixture_loaded(cache: &WarmPeerCache) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let notified = cache.0.shared.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if cache.is_initialized() {
+                return;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .expect("cache fixture initial load must acknowledge completion");
+}
+
 #[cfg(test)]
 pub(super) async fn retired_terminal(path: &Path) -> bool {
     let identity = normalize(path).unwrap();
@@ -826,7 +871,7 @@ mod tests {
         let _guard = test_guard().await;
         let path = temp();
         let (cache, events) = observed_cache(&path);
-        cache.initialized().await;
+        fixture_loaded(&cache).await;
         let idle = writer_observation(&events).await;
         cache.record_productive([0; 20], peer(34561), CandidateKind::Source);
         assert!(
@@ -865,7 +910,7 @@ mod tests {
         std::fs::create_dir_all(path.join(FILE)).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let (cache, events) = observed_cache(&path);
-        cache.initialized().await;
+        fixture_loaded(&cache).await;
         let _ = writer_observation(&events).await;
         cache.record_productive([0; 20], peer(34563), CandidateKind::Source);
         loop {
@@ -986,6 +1031,38 @@ mod tests {
             "header/version is required"
         );
     }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn cache_persists_through_execute_only_parent() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping execute-only parent test: root bypasses directory permissions");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("search-only");
+        let existing = parent.join("existing");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let result = (|| -> io::Result<()> {
+            assert_eq!(
+                std::fs::read_dir(&parent).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied,
+                "fixture must deny directory reads"
+            );
+            // Also exercise mkdirat through a search-only ancestor.
+            for path in [existing.clone(), existing.join("new").join("cache")] {
+                let directory = secure::Directory::open(&path)?;
+                directory.write(&valid())?;
+                assert_eq!(directory.read()?, valid());
+                drop(directory);
+                let reopened = secure::Directory::open(&path)?;
+                assert_eq!(reopened.read()?, valid());
+            }
+            Ok(())
+        })();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        result.unwrap();
+    }
     #[test]
     fn cache_inode_and_directory_rejections_are_nonblocking() {
         let root = temp();
@@ -1023,6 +1100,7 @@ mod tests {
         let alias = root.with_extension("alias");
         symlink(&root, &alias).unwrap();
         assert!(secure::Directory::open(&alias).is_err());
+        assert!(secure::Directory::open(&alias.join("child")).is_err());
         std::fs::remove_file(alias).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(secure::Directory::open(&root).is_err());
@@ -1058,6 +1136,28 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]
+    async fn initialization_ack_does_not_claim_successful_io_or_hints() {
+        let _guard = test_guard().await;
+        let memory = WarmPeerCache::memory();
+        assert!(
+            memory.is_initialized(),
+            "memory fallback needs no disk load"
+        );
+        assert!(memory.candidate_addresses(&[0; 20]).is_empty());
+        let root = temp();
+        let directory = secure::Directory::open(&root).unwrap();
+        directory.write(b"invalid cache payload").unwrap();
+        drop(directory);
+        let cache = WarmPeerCache::new(&root, true);
+        fixture_loaded(&cache).await;
+        assert!(cache.is_initialized());
+        assert!(cache.candidate_addresses(&[0; 20]).is_empty());
+        drop(cache);
+        assert!(retired_terminal(&root).await);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn clone_updates_merge_with_initial_load_and_persist_actual_revision() {
         let _guard = test_guard().await;
         let root = temp();
@@ -1069,14 +1169,14 @@ mod tests {
         assert!(Arc::ptr_eq(&cache.0, &clone.0));
         // New progress can arrive before the old file finishes loading.
         clone.record_productive([0; 20], peer(23457), CandidateKind::Source);
-        cache.initialized().await;
+        fixture_loaded(&cache).await;
         assert_eq!(cache.hints(&[0; 20]).len(), 2);
         assert!(cache.flush().await);
         drop(clone);
         drop(cache);
         assert!(retired_terminal(&root).await);
         let fresh = WarmPeerCache::new(&root, true);
-        fresh.initialized().await;
+        fixture_loaded(&fresh).await;
         assert_eq!(fresh.hints(&[0; 20]).len(), 2);
         assert!(fresh
             .hints(&[0; 20])
@@ -1086,10 +1186,20 @@ mod tests {
         assert!(retired_terminal(&root).await);
         std::fs::remove_dir_all(root).unwrap();
     }
+    struct ReleasePausedWorkers(Arc<(Mutex<bool>, Condvar)>);
+    impl Drop for ReleasePausedWorkers {
+        fn drop(&mut self) {
+            *self.0 .0.lock().unwrap_or_else(|error| error.into_inner()) = true;
+            self.0 .1.notify_all();
+        }
+    }
+
     #[tokio::test]
     async fn paused_io_keeps_load_and_drop_bounded_and_retired_workers_owned() {
         let _guard = test_guard().await;
         let pause = Arc::new((Mutex::new(false), Condvar::new()));
+        // Even an early assertion failure must release synthetic paused writers.
+        let release_workers = ReleasePausedWorkers(pause.clone());
         let mut owners = Vec::new();
         let mut roots = Vec::new();
         for _ in 0..MAX_IDENTITIES {
@@ -1101,8 +1211,13 @@ mod tests {
             .iter()
             .all(|cache| cache.0.worker.lock().unwrap().is_some()));
         let start = Instant::now();
+        assert!(!owners[0].is_initialized());
         owners[0].initialized().await;
         assert!(start.elapsed() < Duration::from_millis(250));
+        assert!(
+            !owners[0].is_initialized(),
+            "the bounded startup wait must not pretend paused loading completed"
+        );
         let extra = WarmPeerCache::new(&temp(), true);
         assert!(extra.0.worker.lock().unwrap().is_none());
         let start = Instant::now();
@@ -1118,8 +1233,7 @@ mod tests {
             MAX_IDENTITIES,
             "retired handles stay bounded and observable"
         );
-        *pause.0.lock().unwrap() = true;
-        pause.1.notify_all();
+        drop(release_workers);
         for root in roots {
             assert!(retired_terminal(&root).await);
             std::fs::remove_dir_all(root).unwrap();

@@ -623,7 +623,15 @@ async fn warm_peer_hints_never_grant_descriptor_authority() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let provider = AceProvider::new(Arc::new(Identity::generate()), 0)
         .with_cache(CacheType::Memory, dir.clone());
-    provider.warm_peers.initialized().await;
+    // The authority fixture requires completed loading, whereas initialized()
+    // deliberately returns after its best-effort 100 ms startup allowance.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !provider.warm_peers.is_initialized() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("authority fixture cache load must acknowledge completion");
     let hash = hex20(PLACEHOLDER_ID).unwrap();
     assert_eq!(
         provider.warm_peers.candidate_addresses(&hash),

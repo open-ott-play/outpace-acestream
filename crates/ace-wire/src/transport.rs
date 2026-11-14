@@ -137,10 +137,6 @@ fn decode_categories(raw: &Bencode) -> Vec<String> {
     }
 }
 
-/// Read a required descriptor int that must be strictly positive.
-///
-/// These fields size piece/chunk requests, so a missing field or a negative value
-/// (which would otherwise wrap to a huge `u64`) is a decode error, not a silent 0.
 /// Tracker URLs from a descriptor's `trackers` field.
 ///
 /// Descriptors in the wild carry this field in two shapes: a list with one URL per entry,
@@ -166,6 +162,10 @@ fn decode_trackers(field: Option<&Bencode>) -> Vec<String> {
         .collect()
 }
 
+/// Read a required descriptor int that must be strictly positive.
+///
+/// These fields size piece/chunk requests, so a missing field or a negative value
+/// (which would otherwise wrap to a huge `u64`) is a decode error, not a silent 0.
 fn required_positive(raw: &Bencode, key: &[u8]) -> Result<u64> {
     match raw.get(key).and_then(|v| v.as_int()) {
         Some(i) if i > 0 => Ok(i as u64),

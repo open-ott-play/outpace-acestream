@@ -69,6 +69,6 @@ efb35369e0ad2afab669f228072c1b0d510eae64  GitHub Actions commit for softprops/ac
 287699b4030f6177d5042ccceb604feb19ee1ce4 # venus-os-ci-toolkit reviewed candidate assessment and shared security workflows (PR 257)
 f510d3b282d5fac9173b10b0ddedb9535c767ac9 # venus-os-ci-toolkit reviewed forward revision; candidate/security workflow and fuzz driver match prior bytes
 
-4c0b1565d4437315d1a8aadb4b2ab3e3fa350526 # renovate: shared-toolkit-ref; reviewed candidate and security workflow revision
+4774181674f4a1a18488bfc918b4c5ed1df39163 # renovate: shared-toolkit-ref; reviewed candidate and security workflow revision
 
-4c0b1565d4437315d1a8aadb4b2ab3e3fa350526 # renovate: shared-toolkit-ref; reviewed merge and base-advance-safe withdrawal workflow
+4774181674f4a1a18488bfc918b4c5ed1df39163 # renovate: shared-toolkit-ref; reviewed merge and base-advance-safe withdrawal workflow

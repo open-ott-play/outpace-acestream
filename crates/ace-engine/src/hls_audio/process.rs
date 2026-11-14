@@ -2562,41 +2562,108 @@ mod task4_preflight_tests {
         assert_eq!((started, reaped, pumps, joined), (2, 2, 6, 6));
     }
 
-    #[tokio::test]
+    // Capability policy must not depend on host process launch latency. Real child
+    // startup, capture, cancellation and reaping remain covered by the probe tests.
+    async fn missing_decoder_policy(missing: &str) -> (Result<(), HlsPreflightError>, usize) {
+        let prepared = PreparedNormalizer {
+            executable: PathBuf::from("synthetic-decoder-policy-executable"),
+        };
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(10);
+        let decoders = ["mp1", "mp2", "mp3", "ac3"]
+            .into_iter()
+            .filter(|decoder| *decoder != missing)
+            .map(|decoder| format!(" A {decoder}\n"))
+            .collect::<String>();
+        assert!(!decoders
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some(missing)));
+        for required in ["mp2", "mp3", "ac3"] {
+            assert_eq!(
+                decoders
+                    .lines()
+                    .any(|line| line.split_whitespace().nth(1) == Some(required)),
+                required != missing
+            );
+        }
+        let listings = [
+            ("-demuxers", " D mpegts\n"),
+            ("-muxers", " E mpegts\n"),
+            ("-encoders", " A aac\n"),
+            ("-decoders", decoders.as_str()),
+            ("-protocols", "pipe\n"),
+        ];
+        let (smoke, layout) = smoke_input();
+        let expected_smoke = build_command(&prepared, &layout);
+        let mut calls = 0;
+        let result = preflight_prepared_with(&prepared, deadline, |command, input, aggregate| {
+            assert_eq!(aggregate, deadline, "retain the original ten-second cutoff");
+            assert_eq!(Instant::now(), start + Duration::from_secs(calls as u64));
+            assert_eq!(
+                command.as_std().get_program(),
+                prepared.executable.as_os_str()
+            );
+            let output = if calls < listings.len() {
+                let (argument, listing) = listings[calls];
+                assert_eq!(
+                    command.as_std().get_args().collect::<Vec<_>>(),
+                    ["-hide_banner", argument]
+                );
+                assert!(input.is_empty());
+                listing.as_bytes().to_vec()
+            } else {
+                assert_eq!(
+                    calls,
+                    listings.len(),
+                    "exactly one smoke follows capability probes"
+                );
+                assert_eq!(
+                    input, smoke,
+                    "smoke receives the unchanged transport fixture"
+                );
+                assert_eq!(
+                    command.as_std().get_args().collect::<Vec<_>>(),
+                    expected_smoke.as_std().get_args().collect::<Vec<_>>()
+                );
+                Vec::new() // Deliberately invalid smoke; the production validator must reject it.
+            };
+            calls += 1;
+            async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(output)
+            }
+        })
+        .await;
+        (result, calls)
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn preflight_requires_each_mpeg_audio_decoder_capability() {
-        let _serial = process_test_lock().await;
-        let _restore = RestoreEnv::capture("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY");
         for missing in ["mp2", "mp3", "ac3"] {
-            std::env::set_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY", missing);
-            let (prepared, _) = fake_prepared_child(ChildMode::CapabilityListing);
-            let (_cancel_tx, cancel) = watch::channel(false);
-            let result =
-                preflight_prepared(&prepared, cancel, Instant::now() + Duration::from_secs(10))
-                    .await;
+            let (result, calls) = missing_decoder_policy(missing).await;
             assert!(
                 matches!(result, Err(HlsPreflightError::Capability(cap)) if cap == missing),
-                "missing required decoder {missing} should be reported exactly"
+                "missing required decoder {missing} should be reported exactly; result={result:?}"
+            );
+            assert_eq!(
+                calls, 4,
+                "stop after the exact decoder probe; never run smoke"
             );
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn preflight_accepts_missing_layer_one_decoder_when_required_codecs_exist() {
-        let _serial = process_test_lock().await;
-        reset_probe_test_counts();
-        let _restore = RestoreEnv::capture("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY");
-        std::env::set_var("OUTPACE_TEST_HLS_AUDIO_MISSING_CAPABILITY", "mp1");
-        let (prepared, _) = fake_prepared_child(ChildMode::CapabilityListing);
-        let (_cancel_tx, cancel) = watch::channel(false);
-        let result =
-            preflight_prepared(&prepared, cancel, Instant::now() + Duration::from_secs(10)).await;
+        let (result, calls) = missing_decoder_policy("mp1").await;
         assert_eq!(
             result,
             Err(HlsPreflightError::Smoke),
             "Layer I absence is not a capability failure; the fake smoke output still fails later"
         );
-        let (started, reaped, pumps, joined) = probe_test_counts();
-        assert_eq!((started, reaped, pumps, joined), (6, 6, 18, 18));
+        assert_eq!(
+            calls, 6,
+            "all five capability probes and exact smoke must execute"
+        );
     }
 
     #[tokio::test(start_paused = true)]

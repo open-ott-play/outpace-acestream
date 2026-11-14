@@ -63,6 +63,12 @@ the Unix durable peer-hint backend; follow the Windows-specific recipe.
 
 ## Recent improvements
 
+Unreleased source changes add ATSC AC3 recognition, recovery of live audio
+normalization across large pieces and long GOPs, and Linux/Android cache traversal
+through search-only ancestors. Optional [Prometheus metrics](docs/configuration.md)
+and [AceStream search](docs/source-search.md) are disabled by default. See the
+[upstream adaptation notes](docs/upstream-integration.md) for scope and limits.
+
 The 0.9.5 series strengthens replay-memory ownership and peer metadata validation.
 It also refines equal-priority peer selection using bounded timing measurements,
 stops obsolete queued requests after the playback cursor advances, and keeps
@@ -85,8 +91,9 @@ HTTP endpoint does not establish faster decoded playback on a particular channel
 | Audio conversion | Optional FFmpeg-based conversion of selected supported live-HLS audio to AAC stereo. Video is copied. |
 | Historical playback | Opt-in finite retained-HLS replay with independent viewer generations; experimental exact peer-history acquisition. No UTC programme archive or durable DVR. See [timeshift](docs/timeshift.md). |
 
-Channel discovery, playlist curation, EPG and the television interface belong to
-the player or proxy. Codec support still depends on that player. Premium or
+Playlist curation, EPG and the television interface belong to the player or proxy.
+Optional engine search provides discovery suggestions without adding playlist entries
+or granting playback authority. Codec support still depends on that player. Premium or
 encrypted sources and full closed-engine API parity are outside the supported
 scope.
 

@@ -430,6 +430,10 @@ config_with_root_redaction! {
     pub experimental_ace_compat: bool,
     /// Opt-in bounded local relay; false preserves direct origin handoff.
     pub managed_hls: bool,
+    /// Explicit native external search opt-in, independent of playback compatibility.
+    pub acestream_services: crate::acestream_search::SearchSettings,
+    /// Serve opt-in Prometheus metrics at GET /metrics. OUTPACE_METRICS.
+    pub metrics: bool,
     /// Compatibility HLS inactivity timeout; pending manifest requests remain protected.
     pub ace_hls_idle_timeout_ms: u64,
     /// Allow the outpace raw-transport-hash BEP-9 content-id fallback. Defaults off.
@@ -479,6 +483,8 @@ impl Default for Config {
             port_map_external_port: None,
             experimental_ace_compat: false,
             managed_hls: false,
+            acestream_services: Default::default(),
+            metrics: false,
             ace_hls_idle_timeout_ms: 60_000,
             bep9_content_id_fallback: false,
             broadcast_options: BTreeMap::new(),
@@ -805,6 +811,7 @@ mod tests {
             "inbound serving is on by default, matching the Acestream engine"
         );
         assert!(!c.managed_hls, "managed origin HLS must remain opt-in");
+        assert!(!c.metrics, "metrics must remain opt-in");
         assert!(
             !c.experimental_ace_compat,
             "Acestream HTTP compatibility must be opt-in"

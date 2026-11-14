@@ -32,6 +32,10 @@ sections before replacing an existing service.
   broadcast contracts.
 - [Compatibility](deployment-compatibility.md): supported Ace HTTP behavior,
   token ownership and lifecycle; not full closed-engine parity.
+- [Optional search](source-search.md): bounded native AceStream discovery,
+  disabled by default and independent of curated playlists or playback authority.
+- [Live audio](live-audio.md): normalization recovery and memory-accounting limits;
+  [metrics configuration](configuration.md#prometheus-metrics) covers optional monitoring.
 - [Advanced deployment](deployment.md): detailed Compose/networking modes,
   managed sources and operator choices.
 - [LXC with WARP](deployment-lxc-warp.md): a specialized topology, not a default

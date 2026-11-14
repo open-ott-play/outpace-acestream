@@ -227,7 +227,7 @@ async fn durable_provider_cache_control(mode: CacheProducer) {
         "old cache owner/writer must be terminal before fresh reconstruction"
     );
     let fresh = make_cache();
-    fresh.initialized().await;
+    warm_peers::fixture_loaded(&fresh).await;
     if mode != CacheProducer::Authenticated {
         assert!(
             fresh.hints(&[0; 20]).is_empty(),
@@ -615,7 +615,7 @@ async fn retained_signed_resume_credit_control(mode: ResumeCredit) {
         "prior cache writer must actually terminate before reconstruction"
     );
     let fresh = make_cache();
-    fresh.initialized().await;
+    warm_peers::fixture_loaded(&fresh).await;
     let hints = fresh.hints(&descriptor.infohash);
     drop(fresh);
     assert!(warm_peers::retired_terminal(&cache_dir).await);
@@ -685,7 +685,7 @@ async fn open_cached_session(
     discovery: PeerDiscovery,
 ) -> CachedSource {
     let mut run = DiscoveryRun::start(&discovery, crate::discover::DiscoveryOptions::default());
-    cache.initialized().await;
+    warm_peers::fixture_loaded(&cache).await;
     let mut peers = cache.candidate_addresses(&info.infohash);
     if peers.is_empty() {
         peers.extend(run.next_candidate().await);

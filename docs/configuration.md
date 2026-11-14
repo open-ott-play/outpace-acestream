@@ -271,3 +271,25 @@ In disk mode each served stream keeps its pieces under
 The directory is removed automatically when the stream is torn down (leech consumer disconnects,
 broadcast `DELETE`, or process exit), and a dedicated cache root is wiped on startup only if it
 is empty or contains `.outpace-cache`, so no per-stream directories accumulate.
+
+## Prometheus metrics
+
+Set `OUTPACE_METRICS=1` to expose `GET /metrics` on the existing HTTP listener.
+It is disabled by default and adds no dependency. Limit access using the same
+network/reverse-proxy policy as the daemon HTTP API. The endpoint provides build,
+uptime, optional jemalloc memory, admission, per-provider aggregate session and
+HTTP request metrics. Route labels are templates; content IDs, names, tokens and
+URLs are not labels. HTTP timing ends at response headers, not at completion of
+a streaming body. At most two session-stat snapshots run concurrently; busy or
+two-second-expired snapshots return HTTP 503 with Retry-After rather than queue
+unbounded work. Session byte/recovery totals are gauges that may decrease when
+sessions retire. Origin-HLS relay clients retain their separate admission and
+memory budgets; these provider aggregates do not describe relay-internal usage.
+
+## Native stream-name search
+
+`OUTPACE_COMPAT_ACESTREAM_SERVICES=1` enables the optional service-backed search
+API independently of `OUTPACE_ACE_COMPAT`. It is off by default. Search results
+are discovery metadata and never authorize playback or replace the curated
+playlist's exclusions. See [source search](source-search.md) for endpoints,
+response bounds, network behavior and failure handling.

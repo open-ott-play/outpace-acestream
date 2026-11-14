@@ -30,6 +30,8 @@ form_urlencoded = "1"
 flate2 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Native search protocol compatibility signatures.
+sha1 = "0.11"
 sha2 = "0.11"
 dirs = "7"
 rand = "0.10"
@@ -54,7 +56,6 @@ tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_support
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
-sha1 = "0.11"
 ace-tracker = { path = "../ace-tracker" }
 tar = "0.4"
 sha2 = "0.11"

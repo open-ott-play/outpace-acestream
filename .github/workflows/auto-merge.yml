@@ -38,7 +38,7 @@ jobs:
       pull-requests: write
     # Metadata only: the shared workflow validates same-repo trusted authors,
     # current-head independent approval, every observed check and the current base.
-    uses: victron-venus/venus-os-ci-toolkit/.github/workflows/auto-merge.yml@6472c9fea1eb72f9c706548092036de36230b7aa # main
+    uses: victron-venus/venus-os-ci-toolkit/.github/workflows/auto-merge.yml@4c0b1565d4437315d1a8aadb4b2ab3e3fa350526 # main
     with:
       reviewed-merge: true
       reviewed-single-pass: true
@@ -57,7 +57,7 @@ jobs:
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
       ((github.event.action == 'unlabeled' && github.event.label.name == 'automerge') || github.event.action == 'converted_to_draft' || (github.event.action == 'edited' && github.event.changes.base && github.event.pull_request.base.ref != github.event.repository.default_branch)) &&
       contains(fromJSON('["4alvit","californiantiramisu","dependabot[bot]","renovate[bot]"]'), github.event.pull_request.user.login)
-    uses: victron-venus/venus-os-ci-toolkit/.github/workflows/auto-merge.yml@6472c9fea1eb72f9c706548092036de36230b7aa # main
+    uses: victron-venus/venus-os-ci-toolkit/.github/workflows/auto-merge.yml@4c0b1565d4437315d1a8aadb4b2ab3e3fa350526 # main
     with:
       withdrawal-only: true
     secrets:

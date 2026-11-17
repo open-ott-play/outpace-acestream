@@ -257,4 +257,3 @@ Each phase ends with a concrete, verifiable milestone. Phase 0 is the gate.
 - Whether DHT participation is required or trackers suffice for public content.
 - Resolution path for bare `content_id` (hosted lookup vs derivable).
 - Minimum viable handshake to be accepted by official peers.
-```

@@ -286,6 +286,13 @@ unbounded work. Session byte/recovery totals are gauges that may decrease when
 sessions retire. Origin-HLS relay clients retain their separate admission and
 memory budgets; these provider aggregates do not describe relay-internal usage.
 
+`outpace_source_buffer_sessions{network,state}` counts active sessions by the
+latest source reassembly buffer observation. `unobserved` means no position
+snapshot exists, `pending` means its bounded scan has yet to complete,
+`empty` means the scan measured zero contiguous pieces, and `contiguous`
+means it measured at least one. These gauges describe the shared source
+queue. They cannot detect underruns in a viewer's decoder or player buffer.
+
 ## Native stream-name search
 
 `OUTPACE_COMPAT_ACESTREAM_SERVICES=1` enables the optional service-backed search

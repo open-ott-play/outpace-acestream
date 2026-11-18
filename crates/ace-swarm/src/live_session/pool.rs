@@ -73,6 +73,7 @@ pub(super) async fn activate_upstream_peer(
     continuity.admitted_upstreams += 1;
     continuity.publish_upstreams();
     let (command_tx, command_rx) = mpsc::channel(64);
+    let min_piece = Arc::new(AtomicU64::new(peer_min));
     let worker = tokio::spawn(peer_worker(
         peer_id,
         upstream.addr,
@@ -80,11 +81,12 @@ pub(super) async fn activate_upstream_peer(
         command_rx,
         event_tx.clone(),
         continuity.request_floor.clone(),
+        min_piece.clone(),
     ));
     Ok((
         PeerRuntime {
             addr: upstream.addr,
-            min_piece: peer_min,
+            min_piece,
             max_piece: peer_max,
             unchoked_peer: false,
             produced_output: false,

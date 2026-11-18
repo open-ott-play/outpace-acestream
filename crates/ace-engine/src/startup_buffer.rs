@@ -1038,14 +1038,13 @@ mod tests {
         }
     }
 
-    fn positioned_source(
-        pos: u64,
-        last: u64,
-    ) -> (
+    type PositionedFixture = (
         Box<dyn TsSource>,
         tokio::sync::mpsc::UnboundedSender<(Bytes, bool, bool)>,
         Arc<Mutex<SourceStats>>,
-    ) {
+    );
+
+    fn positioned_source(pos: u64, last: u64) -> PositionedFixture {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let stats = Arc::new(Mutex::new(SourceStats {
             livepos: Some(crate::provider::LivePositionStats {
@@ -1080,7 +1079,7 @@ mod tests {
             .unwrap();
         let mut source = StartupBufferedSource::new(inner, config(30_000, 4096, 15_000), None);
         let start = Instant::now();
-        for marker in [b'a', b'b'] {
+        for &marker in b"ab" {
             assert_eq!(source.next().await.unwrap()[20], marker);
             assert!(!source.startup_complete());
         }
@@ -1097,7 +1096,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ready_live_backlog_reaches_target_and_preserves_batch_readiness() {
         let (inner, tx, _) = positioned_source(11, 10);
-        for (index, marker) in [b'a', b'b', b'c'].into_iter().enumerate() {
+        for (index, &marker) in b"abc".iter().enumerate() {
             tx.send((
                 packet(PID, Some(index as u64 * 90_000), false, marker),
                 false,

@@ -63,6 +63,7 @@ impl Continuity {
                 startup_head: max_piece,
                 startup_complete: false,
                 startup_deadline: None,
+                startup_prefetch: false,
                 request_floor: Arc::new(AtomicU64::new(start)),
                 prefetch,
                 emitted: 0,
@@ -304,6 +305,12 @@ impl Continuity {
         }
         let target = self.head.saturating_sub(self.prefetch);
         self.reasm.skip_to(target);
+        if self.startup_prefetch && self.emitted == 0 {
+            // Discarding the provisional window also discards its readiness target.
+            // The replacement must catch up to the newly selected window itself.
+            self.startup_complete = false;
+            self.startup_head = self.head;
+        }
         if self.emitted > 0 || self.pending_output.is_some() {
             self.arm_output_gate();
         } else {

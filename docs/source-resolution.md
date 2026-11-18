@@ -208,6 +208,16 @@ run is bounded by that deadline rather than spawning another discovery generatio
 An active run continues supplying late candidates after the first candidate starts
 playback. Cancellation drops its owner.
 
+The DHT walker fills up to eight query slots. A correlated response or a
+1.5-second slot timeout makes room for the next node. An expired slot can still
+accept its reply for up to three seconds from send time while the walk is active.
+Each walk can attempt up to 4,096 sends, including retries and failed sends.
+When no peer has been found and the frontier is exhausted, one recovery round
+can use the remaining time in the same deadline. It tries the bootstrap routers
+first, then fills spare slots from a small in-memory cache of recent responders.
+The DHT log's `timeouts` field counts silent queries and `recovery_queries`
+counts the initial queries in that additional round.
+
 ## VOD container boundary
 
 The native VOD byte-range API and `play --vod` preserve arbitrary verified file

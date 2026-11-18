@@ -27,6 +27,7 @@ pub struct StreamSession {
     /// The background pull task; aborted on manager teardown even when a caller retains
     /// a session handle, and on final drop as a fallback.
     pump: tokio::task::JoinHandle<()>,
+    produced_media: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for StreamSession {
@@ -81,9 +82,14 @@ impl StreamSession {
         let pump_stats = stats.clone();
         let receiver_ready = Arc::new(Notify::new());
         let pump_ready = receiver_ready.clone();
+        let produced_media = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pump_media = produced_media.clone();
         let pump = tokio::spawn(async move {
             pump_ready.notified().await;
             while let Some(chunk) = source.next().await {
+                if !chunk.is_empty() {
+                    pump_media.store(true, Ordering::Release);
+                }
                 *pump_stats.lock().await = source.stats();
                 if source.take_discontinuity() {
                     let _ = pump_tx.send(StreamEvent::Discontinuity);
@@ -105,6 +111,7 @@ impl StreamSession {
             live_stats,
             metadata,
             pump,
+            produced_media,
         })
     }
 
@@ -156,6 +163,10 @@ impl StreamSession {
             return reader.snapshot();
         }
         self.stats.lock().await.clone()
+    }
+
+    pub(crate) fn produced_media(&self) -> bool {
+        self.produced_media.load(Ordering::Acquire)
     }
 
     pub fn metadata(&self) -> &StreamMetadata {

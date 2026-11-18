@@ -41,9 +41,7 @@ impl CatalogFlights {
                 cell
             } else {
                 if entries.len() >= MAX_FLIGHTS {
-                    return Err(ResolveError::Catalog(
-                        "too many concurrent catalog resolutions",
-                    ));
+                    return Err(ResolveError::CatalogBusy);
                 }
                 let cell = Arc::new(OnceCell::new());
                 entries.insert(key, Arc::downgrade(&cell));
@@ -54,7 +52,7 @@ impl CatalogFlights {
         // caller can initialize, while dropping every caller cancels all work for this key.
         tokio::time::timeout_at(deadline, cell.get_or_init(|| fetch))
             .await
-            .map_err(|_| ResolveError::Catalog("catalog timeout"))?
+            .map_err(|_| ResolveError::CatalogNetwork("catalog timeout"))?
             .clone()
     }
 }
@@ -151,9 +149,7 @@ mod tests {
             flights
                 .resolve("infohash", "0", async { Ok(vec![9]) })
                 .await,
-            Err(ResolveError::Catalog(
-                "too many concurrent catalog resolutions"
-            ))
+            Err(ResolveError::CatalogBusy)
         ));
         drop(active);
         assert_eq!(
@@ -327,7 +323,10 @@ mod tests {
             "waiting caller takes over the cancelled initializer"
         );
         tokio::time::advance(remaining).await;
-        assert_eq!(waiter.await, Err(ResolveError::Catalog("catalog timeout")));
+        assert_eq!(
+            waiter.await,
+            Err(ResolveError::CatalogNetwork("catalog timeout"))
+        );
         assert_eq!(
             began.elapsed(),
             CATALOG_TOTAL_TIMEOUT,

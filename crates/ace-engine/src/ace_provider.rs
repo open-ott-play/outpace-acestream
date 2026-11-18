@@ -219,7 +219,7 @@ pub struct AceProvider {
     /// trackers (#164). Separate from `resolve_cache`, which is keyed by the content-id string.
     infohash_index: InfohashIndex,
     /// Bounded short-lived suppression of failed cold lookups; never a source of metadata.
-    infohash_failures: std::sync::Mutex<VecDeque<([u8; 20], Instant)>>,
+    infohash_failures: std::sync::Mutex<VecDeque<([u8; 20], Instant, bool)>>,
     seed_registry: SeedRegistry,
     seed_store_bytes: u64,
     /// Age bound for live seed stores; `None` disables it (byte-only). Default `SEED_STORE_RETENTION`.
@@ -506,12 +506,22 @@ impl StreamProvider for AceProvider {
     }
 
     async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError> {
+        self.open_with_progress(id, crate::start_status::StartProgress::none())
+            .await
+    }
+
+    async fn open_with_progress(
+        &self,
+        id: &str,
+        progress: crate::start_status::StartProgress,
+    ) -> Result<Box<dyn TsSource>, ProviderError> {
         // One resolver for every live entry point. A bare infohash without a verified
         // descriptor fails closed here, before any discovery (#164).
         let opening = Instant::now();
         crate::alog!("[ace] discovery stage=open-request");
         let info = self.resolve_live_info(id).await?;
         info.ensure_playable()?;
+        progress.resolved();
         crate::alog!(
             "[ace] discovery stage=resolved resolve_ms={}",
             opening.elapsed().as_millis()

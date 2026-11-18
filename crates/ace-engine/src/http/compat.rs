@@ -592,10 +592,13 @@ pub(super) async fn ace_playback(
                     "Invalid",
                     "invalid stream selector",
                 ),
-                ProviderError::Backend(_) => {
+                ProviderError::Backend(_)
+                | ProviderError::NoPeers(_)
+                | ProviderError::Network(_)
+                | ProviderError::ResolverBusy(_) => {
                     (StatusCode::BAD_GATEWAY, "Backend", "stream start failed")
                 }
-                ProviderError::Unresolvable(_) => (
+                ProviderError::Unresolvable(_) | ProviderError::UnresolvableNetwork(_) => (
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "Unresolvable",
                     "stream metadata unavailable",

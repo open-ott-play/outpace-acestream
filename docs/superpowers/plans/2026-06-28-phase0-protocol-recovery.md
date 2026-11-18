@@ -745,4 +745,3 @@ git commit -m "phase0: go/no-go findings memo and consolidated protocol spec"
 - Adaptation note: TDD's failing-test/passing-test rhythm is preserved literally in
   Tasks 8 and 10 (real `cargo test`/run with expected FAIL→PASS); investigation tasks
   use an explicit "Exit criterion" as the verification analogue.
-```

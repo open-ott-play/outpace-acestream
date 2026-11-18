@@ -48,7 +48,9 @@ sections before replacing an existing service.
 
 - [RC fuzz assessment](fuzzing.md): bounded targets, synthetic corpora and source-bound evidence.
 - [CI and dependency maintenance](ci-cd.md): required checks, shared security analysis and Renovate.
+- [Shared CI dependency updates](ci-dependency-updates.md): the immutable toolkit the candidate assessment and security scan share.
 - [Release acceptance](releasing.md): immutable releases, corresponding source and publication checks.
+- [Earlier beta release notes](releases/archive/README.md): source notes for the 0.9.0 to 0.9.4 betas that predate the current release index.
 - [Retained replay](timeshift.md): retained-media replay, per-viewer controls, peer-history experiment and limits.
 - [Source resolution](source-resolution.md): typed live/VOD/HLS contracts, direct handoff, optional managed origins, catalog lifetime and container qualification.
 
@@ -75,8 +77,8 @@ superseded and do not override the current code.
 - [Compatibility matrix](protocol/compat-matrix.md)
 - [Public Ace Stream source review](protocol/public-code-review.md): pinned repository inventory and client-contract evidence.
 - [Shared seeding and admission](protocol/shared-seeding.md)
-- [Protocol research notes](protocol/notes/)
-- [Design specifications](superpowers/specs/) and [implementation plans](superpowers/plans/)
+- [Protocol research notes](protocol/notes/README.md)
+- [Design specifications](superpowers/specs/README.md) and [implementation plans](superpowers/plans/README.md)
 - [Interop testing](testing/interop-swarm.md) and [live gateway validation](testing/live-gateway-checklist.md)
 
 Illustrations are committed under [assets](assets/) as accessible, standalone

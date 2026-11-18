@@ -750,4 +750,3 @@ git commit -m "ace-wire: BEP-10 extended handshake parse with Acestream keys"
   `CARGO_MANIFEST_DIR/../../tests/vectors`.
 - Transport magic (`AceStreamTransport`) is distinct from the handshake pstr
   (`AceStreamProtocol`) — called out at Task 2 Step 3 to prevent the easy mix-up.
-```

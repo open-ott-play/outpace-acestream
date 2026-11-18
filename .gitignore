@@ -21,3 +21,4 @@ __pycache__/
 
 # Generated inventory inside corresponding-source exports
 /SOURCE-MANIFEST.json
+A*S.md

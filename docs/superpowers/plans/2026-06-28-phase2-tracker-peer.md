@@ -727,4 +727,3 @@ Expected: the peer accepts our handshake and prints its first message (the exten
   come from `ace-wire`.
 - Out of scope (Phase 3): piece request/download/verification (needs the OPEN
   transport-body layout), Mainline DHT, live piece picker.
-```

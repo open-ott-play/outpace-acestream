@@ -16,6 +16,7 @@ async fn peer_worker_sends_chunk_requests_from_commands() {
         command_rx,
         event_tx,
         Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
     ));
 
     command_tx
@@ -51,6 +52,7 @@ async fn peer_worker_emits_messages_from_session() {
         command_rx,
         event_tx,
         Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
     ));
 
     server
@@ -79,7 +81,7 @@ fn test_pool_peer(addr: SocketAddrV4) -> (PeerRuntime, mpsc::Receiver<PeerComman
     (
         PeerRuntime {
             addr,
-            min_piece: 7,
+            min_piece: Arc::new(AtomicU64::new(7)),
             max_piece: 8,
             unchoked_peer: false,
             produced_output: false,
@@ -559,7 +561,7 @@ fn runtime_peer(min_piece: u64, max_piece: u64) -> PeerRuntime {
     let (commands, _receiver) = mpsc::channel(1);
     PeerRuntime {
         addr: test_addr(),
-        min_piece,
+        min_piece: Arc::new(AtomicU64::new(min_piece)),
         max_piece,
         unchoked_peer: false,
         produced_output: false,
@@ -639,7 +641,13 @@ async fn full_peer_window_updates_availability_below_global_head() {
         ),
         Some(false),
     );
-    assert_eq!((peers[&1].min_piece, peers[&1].max_piece), (180, 195));
+    assert_eq!(
+        (
+            peers[&1].min_piece.load(Ordering::Relaxed),
+            peers[&1].max_piece
+        ),
+        (180, 195)
+    );
     assert_eq!(
         observe_runtime_window_payload(
             &mut peers,
@@ -657,7 +665,13 @@ async fn full_peer_window_updates_availability_below_global_head() {
         );
     }
     assert_eq!(c.head, 210);
-    assert_eq!((peers[&1].min_piece, peers[&1].max_piece), (185, 210));
+    assert_eq!(
+        (
+            peers[&1].min_piece.load(Ordering::Relaxed),
+            peers[&1].max_piece
+        ),
+        (185, 210)
+    );
     shutdown_peer_runtimes(&mut peers);
 }
 

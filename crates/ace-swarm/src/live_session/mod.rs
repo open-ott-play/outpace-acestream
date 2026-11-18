@@ -239,7 +239,7 @@ impl PeerEvent {
 
 pub(super) struct PeerRuntime {
     pub(super) addr: SocketAddrV4,
-    pub(super) min_piece: u64,
+    pub(super) min_piece: Arc<AtomicU64>,
     pub(super) max_piece: u64,
     pub(super) unchoked_peer: bool,
     pub(super) produced_output: bool,

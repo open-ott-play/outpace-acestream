@@ -90,6 +90,40 @@ fn render_sums_sessions_per_network_and_zero_fills_idle_networks() {
 }
 
 #[test]
+fn source_buffer_metrics_distinguish_unknown_pending_empty_and_contiguous() {
+    use crate::provider::LivePositionStats;
+    let observed = |buffer_complete, buffer_pieces| SourceStats {
+        livepos: Some(LivePositionStats {
+            buffer_complete,
+            buffer_pieces,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let text = render(&snapshot(vec![
+        ("ace".into(), 1, SourceStats::default()),
+        ("ace".into(), 5, observed(false, 0)),
+        ("ace".into(), 3, observed(true, 0)),
+        ("ace".into(), 0, observed(true, 2)),
+        ("ace".into(), 4, observed(true, 4)),
+    ]));
+    assert_exposition(&text);
+    for (state, count) in [
+        ("unobserved", 1),
+        ("pending", 1),
+        ("empty", 1),
+        ("contiguous", 2),
+    ] {
+        assert!(text.lines().any(|line| line
+            == format!(
+                "outpace_source_buffer_sessions{{network=\"ace\",state=\"{state}\"}} {count}"
+            )));
+        assert!(text.lines().any(|line| line
+            == format!("outpace_source_buffer_sessions{{network=\"idle\",state=\"{state}\"}} 0")));
+    }
+}
+
+#[test]
 fn render_omits_unlimited_admission_and_unavailable_allocator() {
     let mut s = snapshot(Vec::new());
     s.admission = (0, None);

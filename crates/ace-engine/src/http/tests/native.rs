@@ -394,9 +394,12 @@ async fn normalization_http_native_terminal_failure_is_retryable_and_private() {
     let body = axum::body::to_bytes(response.into_body(), 4096)
         .await
         .unwrap();
+    let failure: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(failure["error"]["code"], "internal");
+    assert_eq!(failure["error"]["message"], "stream start failed");
     assert!(
-        body.is_empty(),
-        "terminal details must not reach HTTP clients"
+        !String::from_utf8_lossy(&body).contains("ChildExit"),
+        "terminal diagnostics remain private"
     );
     let retry = st
         .manager
@@ -909,13 +912,19 @@ async fn native_routes_refuse_an_explicit_infohash_without_a_descriptor() {
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY, "{path}");
         let content_type = resp.headers()[header::CONTENT_TYPE].to_str().unwrap();
         assert!(
-            content_type.starts_with("text/plain"),
+            content_type.starts_with("application/json"),
             "{path}: {content_type}"
         );
         let body = body_text(resp).await;
+        let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(error["error"]["code"], "unresolvable");
+        assert!(error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cid:<content-id>"));
         assert!(
-            body.contains(&format!("cid:{UNRESOLVED_IH}")),
-            "{path}: {body}"
+            !body.contains(UNRESOLVED_IH),
+            "diagnostic must not echo the identity"
         );
     }
 }

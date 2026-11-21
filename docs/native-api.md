@@ -58,11 +58,11 @@ outpace broadcast sports --public-host stream.example
 | `GET /healthz` | `200 text/plain` (`ok`) | Process health probe; it does not prove swarm connectivity. |
 | `GET /networks` | `200 application/json`, `{"networks":["ace"]}` | Provider networks configured in this daemon. |
 | `GET /streams` | `200 application/json`, `{"streams":[...],"occupied_sessions":0,"max_sessions":null}` | Active shared sessions. Entries have `network`, `id`, direct-client count `clients`, and descriptor `metadata`. |
-| `GET /streams/<network>/<id>` | `200 video/mp2t` streaming body | Default live playback for dot-free provider ids; starts or joins the same shared session as the explicit `.ts` form. When the descriptor supplies a title, the response includes `Icy-Name`. Dotted ids, unknown networks, and invalid ids return `404`. An `ih:` selector without a verified descriptor returns `422` with a plain-text reason. Malformed `cid:`/`ih:` selectors return `400`. |
+| `GET /streams/<network>/<id>` | `200 video/mp2t` streaming body | Default live playback for dot-free provider ids; starts or joins the same shared session as the explicit `.ts` form. When the descriptor supplies a title, the response includes `Icy-Name`. Dotted ids, unknown networks, and invalid ids return `404`. An `ih:` selector without a verified descriptor returns `422`. Malformed `cid:`/`ih:` selectors return `400`. |
 | `GET /streams/<network>/<id>.ts` | `200 video/mp2t` streaming body | Explicit continuous MPEG-TS form; equivalent for dot-free ids, preserves dots within the provider id, and includes `Icy-Name` when the descriptor supplies a title. |
 | `GET /streams/<network>/<id>.m3u8` | `200 application/vnd.apple.mpegurl` | Starts or joins live HLS packaging and returns a sliding playlist. The same `422` applies. |
 | `GET /streams/<network>/<id>/seg/<n>.ts` | `200 video/mp2t` | Retained live HLS segment. Missing, expired, or not-yet-produced segments return `404`; a segment request alone never starts a stream. |
-| `GET /streams/<network>/<id>/status` | `200 application/json` | Active-session status; `404` before playback starts or after teardown. |
+| `GET /streams/<network>/<id>/status` | `200 application/json` | Report a running session, in-flight start or recent start failure. Returns `404` when none exists for the selector. |
 | `DELETE /streams/<network>/<id>` | `204` | Force-stops an active session; `404` if inactive. A `.ts` or `.m3u8` suffix is also accepted. |
 | `GET /vod/<network>/<id>` | `200` or `206` streaming body | Verified single-file VOD. Supports one byte range and advertises `Accept-Ranges: bytes`; an unsatisfiable range returns `416`. |
 | `GET /vod/<network>/<id>/manifest.m3u8` | `200 application/vnd.apple.mpegurl` | Experimental TS-only VOD HLS playlist (nominal durations; unsupported containers return `415`). |
@@ -361,18 +361,32 @@ the reservation/storage/platform/RTMP guarantees above before backing up or roll
 
 `OUTPACE_MAX_SESSIONS` optionally caps pending provider acquisitions and retained
 live/VOD source owners. It defaults to unlimited. New native live/HLS/VOD starts
-at capacity return `503`, `Retry-After: 1`, and `session capacity reached`.
+at capacity return `503`, `Retry-After: 1`, and the native error code `capacity`.
 Joining an existing source uses its existing slot. `GET /streams` and compatibility
 engine status add `occupied_sessions` and `max_sessions` (null for unlimited).
 Managed origin HLS keeps its independent relay bound. This limit does not bound
 process RSS, viewers or all asynchronously retiring peer sockets.
 
-Decoded protected descriptors return `422` with `encrypted content is not supported`;
-malformed authoritative protection metadata returns `invalid content protection metadata`.
+Decoded protected descriptors and malformed authoritative protection metadata
+return `422` with the native error code `protected` and a user-facing message.
 Compatibility JSON URL requests keep their established error envelope. No playback
 URL or source is created for a descriptor rejected by these checks.
 
 ## Stream status
+
+The `phase` field reports `resolving`, `connecting`, `buffering`, `playing`, or
+`failed`. Before the manager publishes a source, status can return only the
+selector and startup fields. Up to 64 start records are kept, and a recorded
+failure expires after 60 seconds. `playing` means the engine produced its first
+media output. HLS playlist availability and a decoded player frame have their
+own readiness conditions.
+
+Native live and VOD provider start errors include `{"error":{"code":"network", "message":"the network is unreachable"}}`
+for a network error, for example. Other codes include `not_found`, `no_peers`,
+`unresolvable`, `protected`, `capacity` and `internal`. The status endpoint
+reports the same error object in a `failed` phase and `null` otherwise. The HTTP
+status and retry headers still determine request handling. Clients reading the
+native error body can use `error.code` and display `error.message`.
 
 An active stream status response has stable field names and numeric counters:
 
@@ -380,6 +394,8 @@ An active stream status response has stable field names and numeric counters:
 {
   "network": "ace",
   "id": "<id>",
+  "phase": "playing",
+  "error": null,
   "clients": 1,
   "peers": 4,
   "bitrate": 2450000,
@@ -520,19 +536,22 @@ these recovery observations are exposed only by native status.
 
 ## Live startup buffering
 
-Direct MPEG-TS playback now defaults to a server-resident startup reservoir with a 30-second
+Direct MPEG-TS playback defaults to a server-resident startup reservoir with a 30-second
 target (`OUTPACE_PREBUFFER_MS=30000`), a 128 MiB payload ceiling
 (`OUTPACE_PREBUFFER_BYTES=134217728`), and a 15-second collection deadline
 (`OUTPACE_PREBUFFER_TIMEOUT_MS=15000`). The target is media-clock duration when usable timing is
 present, with the advertised bitrate as a fallback. This intentionally adds startup latency in
 exchange for resilience to transient swarm jitter. The server releases early when the byte limit
-or deadline is reached, so a short advertised live window degrades to the media collected so far
-rather than waiting indefinitely. The byte ceiling covers queued payload; allocation metadata,
+or deadline is reached, or when the live source reaches the end of its available history with
+media already queued. A short window can therefore start with less than the target duration.
+The byte ceiling covers queued payload. Allocation metadata,
 the seed store, HLS segments, and other daemon state are additional memory overhead.
 
 Set `OUTPACE_PREBUFFER_MS=0` to disable the reservoir and retain the earlier immediate-release
 behavior. The byte budget must still hold at least one 188-byte MPEG-TS packet. A nonzero target
-requires a nonzero timeout.
+requires a nonzero timeout. When the live source has one provisional peer window, it can
+download while waiting for another peer to confirm the window. Delivery still waits for the
+window decision. HLS continues to wait for source readiness and the required segments.
 
 HLS defaults to 5-second target segments (`OUTPACE_HLS_SEGMENT_DURATION_MS=5000`), an eight-segment
 retained window (`OUTPACE_HLS_WINDOW_SEGMENTS=8`), six completed startup segments

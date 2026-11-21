@@ -70,8 +70,9 @@ Environment variables parsed by the daemon include:
   must be at least `1`.
 - `OUTPACE_PREBUFFER_MS` - target server-resident live startup queue duration, default `30000`.
   The server intentionally waits before sending the first media so clients begin with more
-  tolerance for swarm jitter. `0` disables startup prebuffering and preserves the previous
-  immediate-release behavior.
+  tolerance for swarm jitter. When the live source reaches the end of available history,
+  the reservoir can release the media it has already collected before the target or deadline.
+  `0` disables startup prebuffering and preserves immediate release from the reservoir.
 - `OUTPACE_PREBUFFER_BYTES` - byte threshold for releasing the startup queue, default
   `134217728` (128 MiB). The input chunk crossing this threshold is retained intact before
   release, so queued payload can exceed the threshold by at most one input chunk. Queue

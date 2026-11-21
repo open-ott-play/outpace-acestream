@@ -296,6 +296,7 @@ pub struct StreamManager {
     registry: ProviderRegistry,
     admission: Arc<crate::admission::Admission>,
     sessions: Mutex<HashMap<(String, String), Arc<StreamSession>>>,
+    start_attempts: Arc<crate::start_status::StartAttempts>,
     packagers: Mutex<HashMap<(String, String), HlsEntry>>,
     /// Synchronous pending/cancellation bookkeeping so a dropped future cleans up in `Drop`.
     hls_transitions: Arc<StdMutex<HlsLifecycleState>>,
@@ -405,6 +406,7 @@ impl StreamManager {
             registry,
             admission: crate::admission::Admission::new(max_sessions),
             sessions: Mutex::new(HashMap::new()),
+            start_attempts: Arc::default(),
             packagers: Mutex::new(HashMap::new()),
             hls_transitions: Arc::new(StdMutex::new(HlsLifecycleState::default())),
             hls_finalization: Mutex::new(()),
@@ -501,6 +503,90 @@ impl StreamManager {
             length,
             stopping: self.shutdown_signal.subscribe(),
         }))
+    }
+
+    /// In-flight or recent failed open, independently of published sessions.
+    pub(crate) fn start_status(
+        &self,
+        network: &str,
+        id: &str,
+    ) -> Option<crate::start_status::AttemptStatus> {
+        self.start_attempts
+            .status(&(network.to_owned(), id.to_owned()))
+    }
+
+    fn record_start_failure(&self, transition: &HlsTransition, error: &ProviderError) {
+        if matches!(error, ProviderError::DirectHls { .. }) {
+            return;
+        }
+        let fence = self.hls_transitions.lock().unwrap();
+        if !fence
+            .cancelled
+            .contains(&(transition.key.clone(), transition.generation))
+            && !self
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.start_attempts
+                .begin(transition.key.clone())
+                .fail(error);
+        }
+    }
+
+    fn check_live_openable(
+        &self,
+        network: &str,
+        id: &str,
+        transition: &HlsTransition,
+    ) -> Result<(), ProviderError> {
+        let result = self.check_openable(network, id);
+        if let Err(error) = &result {
+            if self.registry.get(network).is_some() {
+                self.record_start_failure(transition, error);
+            }
+        }
+        result
+    }
+
+    async fn open_with_attempt(
+        &self,
+        provider: &dyn crate::provider::StreamProvider,
+        id: &str,
+        transition: &HlsTransition,
+    ) -> Result<(Box<dyn TsSource>, crate::start_status::StartAttempt), ProviderError> {
+        let attempt = {
+            let fence = self.hls_transitions.lock().unwrap();
+            if fence
+                .cancelled
+                .contains(&(transition.key.clone(), transition.generation))
+                || self
+                    .shutting_down
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(ProviderError::NotFound);
+            }
+            self.start_attempts.begin(transition.key.clone())
+        };
+        match provider.open_with_progress(id, attempt.progress()).await {
+            Ok(source) => Ok((source, attempt)),
+            // An origin handoff succeeds without publishing a local session.
+            Err(error @ ProviderError::DirectHls { .. }) => Err(error),
+            Err(error) => {
+                // Match the stop generation fence: stop either clears a recorded
+                // failure afterward, or wins here and prevents its publication.
+                let fence = self.hls_transitions.lock().unwrap();
+                if !fence
+                    .cancelled
+                    .contains(&(transition.key.clone(), transition.generation))
+                    && !self
+                        .shutting_down
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    attempt.fail(&error);
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Offline pre-check that `id` can be opened on `network`; see
@@ -669,21 +755,22 @@ impl StreamManager {
         network: &str,
         id: &str,
     ) -> Result<Arc<StreamSession>, ProviderError> {
-        self.check_openable(network, id)?;
         let key = (network.to_string(), id.to_string());
+        let mut transition = HlsTransition::begin(self.hls_transitions.clone(), key.clone());
+        self.check_live_openable(network, id, &transition)?;
         let observed = self.sessions.lock().await.get(&key).cloned();
         if let Some(session) = observed.as_ref().filter(|s| !s.is_finished()) {
             return Ok(session.clone());
         }
         // Serialize same-key starts and re-check: direct and HLS callers share this lock, while
         // unrelated provider opens remain concurrent.
-        let mut transition = HlsTransition::begin(self.hls_transitions.clone(), key.clone());
+
         let start_lock = self.session_start_lock(&key);
         let _starting = start_lock.lock().await;
         if transition.is_cancelled() {
             return Err(ProviderError::NotFound);
         }
-        self.check_openable(network, id)?;
+        self.check_live_openable(network, id, &transition)?;
         {
             let map = self.sessions.lock().await;
             if let Some(s) = map
@@ -694,9 +781,14 @@ impl StreamManager {
             }
         }
         let provider = self.registry.get(network).ok_or(ProviderError::NotFound)?;
-        let reservation = self.admission.reserve()?;
+        let reservation = self.admission.reserve().inspect_err(|error| {
+            self.record_start_failure(&transition, error);
+        })?;
+        let (opened, _attempt) = self
+            .open_with_attempt(provider.as_ref(), id, &transition)
+            .await?;
         let source: Box<dyn TsSource> = Box::new(crate::admission::Source {
-            inner: provider.open(id).await?,
+            inner: opened,
             _reservation: reservation,
         });
         let session = StreamSession::start(source, self.buffer);
@@ -787,8 +879,9 @@ impl StreamManager {
         id: &str,
         native: bool,
     ) -> Result<(Arc<HlsPackager>, Arc<StreamSession>, Subscription), ProviderError> {
-        self.check_openable(network, id)?;
         let key = (network.to_string(), id.to_string());
+        let mut transition = HlsTransition::begin(self.hls_transitions.clone(), key.clone());
+        self.check_live_openable(network, id, &transition)?;
         if self
             .shutting_down
             .load(std::sync::atomic::Ordering::Acquire)
@@ -796,7 +889,7 @@ impl StreamManager {
             return Err(ProviderError::NotFound);
         }
         let observed = self.sessions.lock().await.get(&key).cloned();
-        let mut transition = HlsTransition::begin(self.hls_transitions.clone(), key.clone());
+
         let start_lock = self.session_start_lock(&key);
 
         // Serialize only starts for this key. Unrelated provider opens, reap, and stop proceed.
@@ -804,7 +897,7 @@ impl StreamManager {
         if transition.is_cancelled() {
             return Err(ProviderError::NotFound);
         }
-        self.check_openable(network, id)?;
+        self.check_live_openable(network, id, &transition)?;
 
         let existing_session = self
             .sessions
@@ -813,11 +906,18 @@ impl StreamManager {
             .get(&key)
             .filter(|session| Self::reuse_session(session, observed.as_ref()))
             .cloned();
+        let mut _attempt = None;
         let mut source: Option<Box<dyn TsSource>> = if existing_session.is_none() {
             let provider = self.registry.get(network).ok_or(ProviderError::NotFound)?;
-            let reservation = self.admission.reserve()?;
+            let reservation = self.admission.reserve().inspect_err(|error| {
+                self.record_start_failure(&transition, error);
+            })?;
+            let (opened, attempt) = self
+                .open_with_attempt(provider.as_ref(), id, &transition)
+                .await?;
+            _attempt = Some(attempt);
             Some(Box::new(crate::admission::Source {
-                inner: provider.open(id).await?,
+                inner: opened,
                 _reservation: reservation,
             }))
         } else {
@@ -923,6 +1023,8 @@ impl StreamManager {
                 for generation in pending {
                     lifecycle.cancelled.insert((key.clone(), generation));
                 }
+                // A later generation may record a new attempt after this fence.
+                self.start_attempts.clear(&key);
             }
             let entry = self.packagers.lock().await.remove(&key);
             if let Some(entry) = &entry {

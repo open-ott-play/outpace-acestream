@@ -181,28 +181,26 @@ fn vod_partial_response(
 
 /// HTTP mapping for a failed VOD provider call: malformed selectors are `400`, a missing
 /// network or target is `404`, a well-formed id the provider will not open is `422`, and an
-/// upstream failure is `502`. Return the provider's reason without its outer `ProviderError`
-/// debug wrapper.
+/// upstream failure is `502`. Native start failures use sanitized diagnostic messages.
 pub(super) fn vod_failure(error: ProviderError) -> Response {
     let status = match &error {
-        ProviderError::CapacityExhausted => return super::streams::capacity_error(),
+        ProviderError::CapacityExhausted => StatusCode::SERVICE_UNAVAILABLE,
         ProviderError::ProtectedContent | ProviderError::InvalidProtection => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
-        ProviderError::Invalid(_) => StatusCode::BAD_REQUEST,
-        ProviderError::NotFound => StatusCode::NOT_FOUND,
-        ProviderError::Unresolvable(_) | ProviderError::DirectHls { .. } => {
-            StatusCode::UNPROCESSABLE_ENTITY
+        ProviderError::Invalid(reason) => {
+            return (StatusCode::BAD_REQUEST, reason.clone()).into_response();
         }
-        ProviderError::Backend(_) => StatusCode::BAD_GATEWAY,
+        ProviderError::NotFound => StatusCode::NOT_FOUND,
+        ProviderError::Unresolvable(_)
+        | ProviderError::UnresolvableNetwork(_)
+        | ProviderError::DirectHls { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        ProviderError::Backend(_)
+        | ProviderError::NoPeers(_)
+        | ProviderError::Network(_)
+        | ProviderError::ResolverBusy(_) => StatusCode::BAD_GATEWAY,
     };
-    let body = match &error {
-        // `NotFound` covers both an unknown network and an unknown target; a single "not found"
-        // reason is accurate for either and does not claim the network is unknown.
-        ProviderError::NotFound => "vod target not found".to_owned(),
-        _ => error.to_string(),
-    };
-    (status, body).into_response()
+    super::streams::start_failure_response(status, &error)
 }
 
 /// Resolve `id` on `network` to a single-file VOD via the manager's shared cache, or the HTTP

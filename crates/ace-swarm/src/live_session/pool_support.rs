@@ -252,9 +252,8 @@ pub(super) async fn advance_pool_requests(
     chunks_per_piece: u16,
 ) -> Vec<SocketAddrV4> {
     continuity.skip_far_behind_live(Instant::now());
-    if continuity.startup_deadline.is_some() {
-        return Vec::new();
-    }
+    // Corroboration withholds publication, not bounded requests or verified
+    // reassembly. A newer window still raises the worker floor before admission.
     let mut failed = Vec::new();
     let request_head = continuity.request_head();
     let now = Instant::now();

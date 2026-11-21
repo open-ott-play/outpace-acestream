@@ -11,6 +11,7 @@ pub(super) type OutputReservation = Pin<
 /// One accepted piece after TS alignment; ownership survives pool replacement.
 /// No later piece is consumed until every output boundary in this batch is sent.
 pub(in crate::live_session) struct PendingOutput {
+    piece: u64,
     chunks: VecDeque<LiveOutput>,
     producers: BTreeSet<SocketAddrV4>,
     authenticated: bool,
@@ -18,7 +19,32 @@ pub(in crate::live_session) struct PendingOutput {
 
 /// At most one wire piece is processed per call, even if the recovery gate filters it.
 pub(super) fn prepare_output(c: &mut Continuity, info: &StreamInfo, seed: &SeedConfig) -> bool {
-    if c.pending_output.is_some() || c.startup_deadline.is_some() {
+    if c.startup_deadline.is_some() {
+        return false;
+    }
+    if c.emitted > 0 {
+        c.startup_prefetch = false;
+    }
+    if c.startup_prefetch
+        && c.pending_output
+            .as_ref()
+            .is_some_and(|pending| pending.piece < c.head.saturating_sub(c.prefetch))
+    {
+        // A newer window can arrive while output capacity is unavailable. This
+        // provisional batch has never been published or credited, so replace it
+        // before either the active pool or reconnect drainage emits its first byte.
+        let pending = c.pending_output.take().unwrap();
+        c.discontinuity_pending |= pending.chunks.iter().any(|chunk| chunk.discontinuity);
+        c.startup_complete = false;
+        c.startup_head = c.head;
+        c.resync = ace_media::mpegts::TsResync::new();
+        c.output_gate = if c.discontinuity_pending {
+            ace_media::mpegts::KeyframeGate::new()
+        } else {
+            ace_media::mpegts::KeyframeGate::new_passthrough()
+        };
+    }
+    if c.pending_output.is_some() {
         return false;
     }
     c.skip_far_behind_live(Instant::now());
@@ -48,6 +74,7 @@ pub(super) fn prepare_output(c: &mut Continuity, info: &StreamInfo, seed: &SeedC
     if let Some(last) = chunks.back_mut() {
         last.startup_complete = c.output_startup_complete();
         c.pending_output = Some(PendingOutput {
+            piece: before,
             chunks,
             producers,
             authenticated,

@@ -149,7 +149,16 @@ async fn native_protection_and_capacity_errors_have_stable_status_and_retry_hint
             let body = axum::body::to_bytes(response.into_body(), 1 << 20)
                 .await
                 .unwrap();
-            assert_eq!(std::str::from_utf8(&body).unwrap(), message);
+            let failure: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(failure["error"]["message"], message);
+            assert_eq!(
+                failure["error"]["code"],
+                if id == "capacity" {
+                    "capacity"
+                } else {
+                    "protected"
+                }
+            );
         }
     }
 }
@@ -212,9 +221,9 @@ async fn cached_native_and_bound_compat_sources_recheck_protection() {
         .ace_sessions
         .bind_generation("synthetic", &token, &session, None));
     provider.0.store(true, Ordering::SeqCst);
-    for url in [
-        "/streams/ace/synthetic".to_string(),
-        format!("/ace/r/synthetic/{token}"),
+    for (url, native) in [
+        ("/streams/ace/synthetic".to_string(), true),
+        (format!("/ace/r/synthetic/{token}"), false),
     ] {
         let response = router(state.clone())
             .oneshot(Request::get(url).body(Body::empty()).unwrap())
@@ -224,10 +233,16 @@ async fn cached_native_and_bound_compat_sources_recheck_protection() {
         let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
             .await
             .unwrap();
-        assert_eq!(
-            std::str::from_utf8(&bytes).unwrap(),
-            "encrypted content is not supported"
-        );
+        if native {
+            let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(payload["error"]["code"], "protected");
+            assert_eq!(
+                payload["error"]["message"],
+                "encrypted content is not supported"
+            );
+        } else {
+            assert_eq!(bytes.as_ref(), b"encrypted content is not supported");
+        }
     }
     state.manager.stop("ace", "synthetic").await;
 }

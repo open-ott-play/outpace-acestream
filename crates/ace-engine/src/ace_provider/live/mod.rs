@@ -141,7 +141,7 @@ impl AceProvider {
         );
         crate::alog!("[ace] open {id}: discovered {} peer(s)", peers.len());
         if peers.is_empty() {
-            return Err(ProviderError::Backend(
+            return Err(ProviderError::NoPeers(
                 "no peers (no trackers/bootstrap)".into(),
             ));
         }

@@ -91,6 +91,12 @@ pub enum ResolveError {
     Transport(&'static str),
     /// A signed catalog request/response step failed during content-id resolution.
     Catalog(&'static str),
+    /// Catalog connection, I/O or finite acquisition deadline failed.
+    CatalogNetwork(&'static str),
+    /// Catalog replied with an unusable HTTP response, before metadata validation.
+    CatalogHttp(&'static str),
+    /// Shared catalog acquisition admission was exhausted.
+    CatalogBusy,
     /// A peer/network step failed during content-id resolution.
     Peer(&'static str),
     /// A transport-file `url=` fetch failed a safety check or the network step.
@@ -488,7 +494,7 @@ async fn fetch_catalog_transport_hosts(
     parameter: &str,
     value: &str,
 ) -> Result<Vec<u8>, ResolveError> {
-    let mut last = ResolveError::Catalog("catalog request failed");
+    let mut last = None;
     for &(host, port) in CATALOG_HOSTS {
         match tokio::time::timeout(
             CATALOG_HOST_TIMEOUT,
@@ -497,11 +503,26 @@ async fn fetch_catalog_transport_hosts(
         .await
         {
             Ok(Ok(transport)) => return Ok(transport),
-            Ok(Err(e)) => last = e,
-            Err(_) => last = ResolveError::Catalog("catalog timeout"),
+            Ok(Err(error)) => retain_catalog_failure(&mut last, error),
+            Err(_) => {
+                retain_catalog_failure(&mut last, ResolveError::CatalogNetwork("catalog timeout"))
+            }
         }
     }
-    Err(last)
+    Err(last.unwrap_or(ResolveError::CatalogNetwork("catalog request failed")))
+}
+
+fn retain_catalog_failure(current: &mut Option<ResolveError>, error: ResolveError) {
+    // An answered but rejected authenticated reply is stronger evidence than
+    // unreachable hosts; an ordinary non-200 reply must not mask an outage.
+    let rank = |error: &ResolveError| match error {
+        ResolveError::CatalogHttp(_) => 0,
+        ResolveError::CatalogNetwork(_) => 1,
+        _ => 2,
+    };
+    if current.as_ref().is_none_or(|old| rank(&error) >= rank(old)) {
+        *current = Some(error);
+    }
 }
 
 #[cfg(test)]
@@ -542,11 +563,11 @@ async fn fetch_catalog_transport_query(
 
     let mut stream = TcpStream::connect((host, port))
         .await
-        .map_err(|_| ResolveError::Catalog("catalog connect failed"))?;
+        .map_err(|_| ResolveError::CatalogNetwork("catalog connect failed"))?;
     stream
         .write_all(request.as_bytes())
         .await
-        .map_err(|_| ResolveError::Catalog("catalog write failed"))?;
+        .map_err(|_| ResolveError::CatalogNetwork("catalog write failed"))?;
 
     let mut response = Vec::new();
     let mut buf = [0u8; 8192];
@@ -554,12 +575,12 @@ async fn fetch_catalog_transport_query(
         let n = stream
             .read(&mut buf)
             .await
-            .map_err(|_| ResolveError::Catalog("catalog read failed"))?;
+            .map_err(|_| ResolveError::CatalogNetwork("catalog read failed"))?;
         if n == 0 {
             break;
         }
         if response.len() + n > CATALOG_RESPONSE_LIMIT {
-            return Err(ResolveError::Catalog("catalog response too large"));
+            return Err(ResolveError::CatalogHttp("catalog response too large"));
         }
         response.extend_from_slice(&buf[..n]);
     }
@@ -669,15 +690,15 @@ fn http_response_body(response: &[u8]) -> Result<Vec<u8>, ResolveError> {
     let header_end = response
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .ok_or(ResolveError::Catalog("bad catalog http response"))?;
+        .ok_or(ResolveError::CatalogHttp("bad catalog HTTP response"))?;
     let headers = std::str::from_utf8(&response[..header_end])
-        .map_err(|_| ResolveError::Catalog("bad catalog http headers"))?;
+        .map_err(|_| ResolveError::CatalogHttp("bad catalog HTTP headers"))?;
     let mut lines = headers.split("\r\n");
     let status = lines
         .next()
-        .ok_or(ResolveError::Catalog("missing catalog http status"))?;
+        .ok_or(ResolveError::CatalogHttp("missing catalog HTTP status"))?;
     if !status.starts_with("HTTP/") || !status.contains(" 200 ") {
-        return Err(ResolveError::Catalog("catalog http status"));
+        return Err(ResolveError::CatalogHttp("catalog HTTP status unavailable"));
     }
     let chunked = lines.any(|line| {
         let lower = line.to_ascii_lowercase();
@@ -694,24 +715,25 @@ fn http_response_body(response: &[u8]) -> Result<Vec<u8>, ResolveError> {
 fn decode_chunked_body(mut body: &[u8]) -> Result<Vec<u8>, ResolveError> {
     let mut out = Vec::new();
     loop {
-        let line_end = find_crlf(body).ok_or(ResolveError::Catalog("bad chunk size"))?;
+        let line_end = find_crlf(body).ok_or(ResolveError::CatalogHttp("bad chunk size"))?;
         let size_line = std::str::from_utf8(&body[..line_end])
-            .map_err(|_| ResolveError::Catalog("bad chunk size"))?;
+            .map_err(|_| ResolveError::CatalogHttp("bad chunk size"))?;
         let size = usize::from_str_radix(size_line.split(';').next().unwrap_or("").trim(), 16)
-            .map_err(|_| ResolveError::Catalog("bad chunk size"))?;
+            .map_err(|_| ResolveError::CatalogHttp("bad chunk size"))?;
         body = &body[line_end + 2..];
 
         if size == 0 {
             return Ok(out);
         }
-        if body.len() < size + 2 {
-            return Err(ResolveError::Catalog("truncated chunk"));
-        }
+        let chunk_end = size
+            .checked_add(2)
+            .filter(|end| *end <= body.len())
+            .ok_or(ResolveError::CatalogHttp("truncated chunk"))?;
         out.extend_from_slice(&body[..size]);
-        if &body[size..size + 2] != b"\r\n" {
-            return Err(ResolveError::Catalog("bad chunk terminator"));
+        if &body[size..chunk_end] != b"\r\n" {
+            return Err(ResolveError::CatalogHttp("bad chunk terminator"));
         }
-        body = &body[size + 2..];
+        body = &body[chunk_end..];
     }
 }
 
@@ -933,7 +955,7 @@ impl InfohashIndex {
 }
 
 fn decode_hex20(hex: &str) -> Option<[u8; 20]> {
-    if hex.len() != 40 {
+    if hex.len() != 40 || !hex.is_ascii() {
         return None;
     }
     let mut out = [0u8; 20];
@@ -2086,5 +2108,49 @@ mod playback_kind_tests {
                 "VOD descriptor is not a live stream"
             ))
         ));
+    }
+}
+
+#[cfg(test)]
+mod catalog_failure_tests {
+    use super::*;
+    #[test]
+    fn non_ascii_fixed_width_catalog_hex_is_rejected_without_panicking() {
+        for text in [
+            format!("a{}é{}", "0".repeat(18), "0".repeat(19)),
+            "é".repeat(20),
+        ] {
+            assert_eq!(text.len(), 40);
+            assert_eq!(decode_hex20(&text), None);
+        }
+        assert_eq!(
+            decode_hex20("0123456789abcdef0123456789abcdef01234567")
+                .unwrap()
+                .len(),
+            20
+        );
+    }
+    #[test]
+    fn catalog_rejection_beats_network_and_http_cannot_mask_network() {
+        let network = ResolveError::CatalogNetwork("catalog timeout");
+        let rejected = ResolveError::Catalog("catalog signature mismatch");
+        let http = http_response_body(b"HTTP/1.1 503 Unavailable\r\n\r\n").unwrap_err();
+        for errors in [[http.clone(), network.clone()], [network.clone(), http]] {
+            let mut chosen = None;
+            for error in errors {
+                retain_catalog_failure(&mut chosen, error);
+            }
+            assert_eq!(chosen, Some(network.clone()));
+        }
+        for errors in [
+            [rejected.clone(), network.clone()],
+            [network, rejected.clone()],
+        ] {
+            let mut chosen = None;
+            for error in errors {
+                retain_catalog_failure(&mut chosen, error);
+            }
+            assert_eq!(chosen, Some(rejected.clone()));
+        }
     }
 }

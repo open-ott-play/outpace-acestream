@@ -89,16 +89,19 @@ async fn json_response(response: Response) -> serde_json::Value {
     )
     .unwrap()
 }
-async fn assert_capacity(response: Response) {
+async fn assert_capacity(response: Response, native: bool) {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(response.headers()[header::RETRY_AFTER], "1");
-    assert_eq!(
-        axum::body::to_bytes(response.into_body(), 128)
-            .await
-            .unwrap()
-            .as_ref(),
-        b"session capacity reached"
-    );
+    let body = axum::body::to_bytes(response.into_body(), 128)
+        .await
+        .unwrap();
+    if native {
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "capacity");
+        assert_eq!(payload["error"]["message"], "session capacity reached");
+    } else {
+        assert_eq!(body.as_ref(), b"session capacity reached");
+    }
 }
 
 #[tokio::test]
@@ -120,7 +123,7 @@ async fn pending_provider_cap_has_consistent_http_errors_without_extra_opens() {
         format!("/ace/getstream?infohash={SYNTHETIC_ID}"),
         format!("/ace/manifest.m3u8?infohash={SYNTHETIC_ID}"),
     ] {
-        assert_capacity(request(&app, &path).await).await;
+        assert_capacity(request(&app, &path).await, !path.starts_with("/ace/")).await;
     }
     let json = json_response(
         request(
@@ -150,7 +153,7 @@ async fn pending_provider_cap_has_consistent_http_errors_without_extra_opens() {
         .unwrap()
         .strip_prefix("http://127.0.0.1:6878")
         .unwrap();
-    assert_capacity(request(&app, playback).await).await;
+    assert_capacity(request(&app, playback).await, false).await;
     assert_eq!(probe.opens.load(Ordering::SeqCst), 1);
     assert_eq!(probe.vod_opens.load(Ordering::SeqCst), 0);
 
@@ -201,7 +204,7 @@ async fn native_and_compatibility_viewers_reuse_full_provider_capacity() {
     assert_eq!(status["result"]["status"], "dl");
     assert_eq!(status["result"]["active_sessions"], 1);
     assert_eq!(status["result"]["occupied_sessions"], 1);
-    assert_capacity(request(&app, "/streams/synthetic/other.ts").await).await;
+    assert_capacity(request(&app, "/streams/synthetic/other.ts").await, true).await;
     drop((first, second, direct));
     manager.shutdown().await;
 }
@@ -225,7 +228,7 @@ async fn cached_vod_reuses_a_slot_and_zero_limit_keeps_null_status_maximum() {
     }
     assert_eq!(probe.vod_opens.load(Ordering::SeqCst), 1);
     assert_eq!(manager.admission_status(), (1, Some(1)));
-    assert_capacity(request(&app, "/vod/synthetic/other").await).await;
+    assert_capacity(request(&app, "/vod/synthetic/other").await, true).await;
     manager.shutdown().await;
 
     let (state, probe) = capped_state(0);

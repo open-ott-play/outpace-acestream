@@ -244,6 +244,7 @@ async fn cold_infohash_failure_expires_and_verified_metadata_wins() {
     p.infohash_failures.lock().unwrap().push_back((
         expected.infohash,
         Instant::now() - INFOHASH_FAILURE_TTL - Duration::from_secs(1),
+        false,
     ));
     assert_eq!(
         p.resolve_infohash_with_catalog(&id, std::future::ready(Ok(expected.clone())))
@@ -271,11 +272,11 @@ fn cold_infohash_failure_cache_is_bounded_and_deduplicated() {
     p.remember_infohash_failure([INFOHASH_FAILURE_CAPACITY as u8; 20]);
     let entries = p.infohash_failures.lock().unwrap();
     assert_eq!(entries.len(), INFOHASH_FAILURE_CAPACITY);
-    assert!(!entries.iter().any(|(key, _)| *key == [0; 20]));
+    assert!(!entries.iter().any(|(key, ..)| *key == [0; 20]));
     assert_eq!(
         entries
             .iter()
-            .filter(|(key, _)| *key == [INFOHASH_FAILURE_CAPACITY as u8; 20])
+            .filter(|(key, ..)| *key == [INFOHASH_FAILURE_CAPACITY as u8; 20])
             .count(),
         1
     );

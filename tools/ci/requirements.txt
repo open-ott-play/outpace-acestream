@@ -1,2 +1,2 @@
 # YAML parser for workflow contract checks only; never shipped in runtime images.
-PyYAML==6.0.3
+PyYAML==6.0.4

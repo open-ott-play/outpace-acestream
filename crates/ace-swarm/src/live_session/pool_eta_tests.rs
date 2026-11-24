@@ -58,7 +58,7 @@ async fn next_owner_after_measured_completions(case: SourceCase) -> u64 {
             id,
             PeerRuntime {
                 addr,
-                min_piece: 0,
+                min_piece: Arc::new(AtomicU64::new(0)),
                 max_piece: 1,
                 unchoked_peer: false,
                 produced_output: false,

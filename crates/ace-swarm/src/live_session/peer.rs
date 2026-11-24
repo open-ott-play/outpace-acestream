@@ -18,6 +18,7 @@ pub(super) async fn peer_worker<S>(
     mut commands: mpsc::Receiver<PeerCommand>,
     events: mpsc::Sender<PeerEvent>,
     request_floor: Arc<AtomicU64>,
+    peer_min_piece: Arc<AtomicU64>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -27,7 +28,12 @@ pub(super) async fn peer_worker<S>(
                 match command {
                     Some(PeerCommand::RequestPiece { piece, chunks_per_piece }) => {
                         for chunk in 0..chunks_per_piece {
-                            if piece < request_floor.load(Ordering::Relaxed) {
+                            // Another peer may still cover the shared cursor after
+                            // this peer evicts it. Stop obsolete writes on this
+                            // transport without moving the shared cursor.
+                            if piece < request_floor.load(Ordering::Relaxed)
+                                || piece < peer_min_piece.load(Ordering::Relaxed)
+                            {
                                 break;
                             }
                             if session.send(&chunk_request(piece as u32, chunk)).await.is_err() {

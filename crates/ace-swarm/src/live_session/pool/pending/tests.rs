@@ -33,7 +33,7 @@ fn runtime(id: u64) -> (PeerRuntime, mpsc::Receiver<PeerCommand>) {
     (
         PeerRuntime {
             addr: SocketAddrV4::new([127, 0, 0, 1].into(), id as u16),
-            min_piece: 7,
+            min_piece: Arc::new(AtomicU64::new(7)),
             max_piece: 8,
             unchoked_peer: false,
             produced_output: false,

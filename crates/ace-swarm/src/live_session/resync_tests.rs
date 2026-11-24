@@ -559,7 +559,7 @@ async fn buffered_output_drain_stops_workers_when_consumer_closes() {
         0,
         PeerRuntime {
             addr: fixture.producer,
-            min_piece: 0,
+            min_piece: Arc::new(AtomicU64::new(0)),
             max_piece: 2,
             unchoked_peer: false,
             produced_output: false,

@@ -374,7 +374,7 @@ async fn known_live_floor_prunes_buffered_and_inflight_stale_pieces_before_reque
         1,
         PeerRuntime {
             addr,
-            min_piece: 7,
+            min_piece: Arc::new(AtomicU64::new(7)),
             max_piece: 10,
             unchoked_peer: false,
             produced_output: false,
@@ -805,6 +805,7 @@ enum CursorAdvance {
     LiveHead,
     Eviction,
     ContiguousDrain,
+    PeerEviction,
 }
 
 async fn queued_chunk_requests_stop_after_floor_change(advance: CursorAdvance) {
@@ -815,6 +816,7 @@ async fn queued_chunk_requests_stop_after_floor_change(advance: CursorAdvance) {
     let (info, seed) = fixture(1);
     let (mut c, _) = Continuity::fresh(&info, 7, 8, 1, seed.live_recovery);
     let addr = "127.0.0.1:1".parse().unwrap();
+    let peer_min = Arc::new(AtomicU64::new(7));
     let worker = tokio::spawn(peer_worker(
         1,
         addr,
@@ -822,6 +824,7 @@ async fn queued_chunk_requests_stop_after_floor_change(advance: CursorAdvance) {
         rx,
         events,
         c.request_floor.clone(),
+        peer_min.clone(),
     ));
     commands
         .send(PeerCommand::RequestPiece {
@@ -850,6 +853,31 @@ async fn queued_chunk_requests_stop_after_floor_change(advance: CursorAdvance) {
                 c.skip_evicted_gap(c.next_needed_since + c.live_recovery.request_timeout()),
                 Some(9)
             );
+        }
+        CursorAdvance::PeerEviction => {
+            c.register_active_peer(1, addr, window(7, 9));
+            c.set_peer_unchoked(1, true);
+            let alternative = "127.0.0.1:2".parse().unwrap();
+            c.register_active_peer(2, alternative, window(7, 9));
+            c.set_peer_unchoked(2, true);
+            let mut peers = BTreeMap::from([(
+                1,
+                PeerRuntime {
+                    addr,
+                    min_piece: peer_min.clone(),
+                    max_piece: 9,
+                    unchoked_peer: false,
+                    produced_output: false,
+                    seen_ids: HashSet::new(),
+                    commands: commands.clone(),
+                    worker: tokio::spawn(async {}),
+                },
+            )]);
+            observe_runtime_eviction(&mut peers, &mut c, 1, 9);
+            observe_runtime_eviction(&mut peers, &mut c, 1, 8);
+            assert_eq!(peer_min.load(Ordering::Relaxed), 9);
+            assert!(c.active_peers.any_unchoked_covers(7));
+            assert_eq!(c.reasm.next_needed(), 7);
         }
         CursorAdvance::LiveHead => {
             c.head = 10;
@@ -882,7 +910,14 @@ async fn queued_chunk_requests_stop_after_floor_change(advance: CursorAdvance) {
     }
     drop(commands);
     worker.await.unwrap();
-    assert_eq!(c.request_floor.load(Ordering::Relaxed), 9);
+    assert_eq!(
+        c.request_floor.load(Ordering::Relaxed),
+        if matches!(advance, CursorAdvance::PeerEviction) {
+            7
+        } else {
+            9
+        }
+    );
     assert!(stale_after_observation<=1,"only a write already underway before the new cursor may complete; queued stale chunk writes must stop, got {stale_after_observation}");
 }
 
@@ -899,6 +934,11 @@ async fn queued_chunk_requests_stop_when_eviction_moves_cursor_without_a_new_hea
 #[tokio::test]
 async fn queued_chunk_requests_stop_when_contiguous_drain_moves_cursor_without_a_new_head() {
     queued_chunk_requests_stop_after_floor_change(CursorAdvance::ContiguousDrain).await;
+}
+
+#[tokio::test]
+async fn queued_chunk_requests_stop_when_only_this_peer_evicts_the_piece() {
+    queued_chunk_requests_stop_after_floor_change(CursorAdvance::PeerEviction).await;
 }
 
 #[tokio::test]

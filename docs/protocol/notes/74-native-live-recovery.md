@@ -174,6 +174,39 @@ obsolete chunks even without a new live-head announcement. A network write
 already in progress may finish; later stale requests are suppressed. Viewer
 seek does not move the shared upstream producer.
 
+A second request boundary applies to each connection's own advertised window.
+If peer A evicts the current piece while peer B still covers it, the playback
+cursor must stay eligible for B. A's worker now stops subsequent chunk writes
+below A's new minimum. Out-of-order eviction messages cannot lower that
+minimum. Existing ownership and timeout handling can still accept a valid
+reply already in transit. This local check sends no extra wire message.
+
+## Interpreting timing and buffer observations
+
+The measured interval describes an accepted source piece. Resolution, peer
+discovery, first contiguous bytes, server startup release, first decodable
+TS frame or HLS segment, and the player's own buffering are separately
+observable milestones. Some stages overlap. HTTP time to headers is earlier
+than decoded playback and may precede the first media bytes.
+
+For example, in a serial service model, two pieces ahead of a new request at
+50 ms per piece imply 150 ms to completion. An empty peer at 400 ms per
+piece implies 400 ms. The current capacity-first scheduler can still choose
+the empty peer in that case. The example is a model, and live service times
+depend on delivery order, contention and accepted data. Comparison across
+unequal backlogs needs a controlled workload before changing peer priority.
+
+After a stall, playback can refill a deficit of `D` seconds at a delivery
+rate of `r` media seconds per wall-clock second. The ideal refill time is
+`D / r` while paused (`r > 0`) or `D / (r - 1)` while playing at normal speed
+(`r > 1`). Both estimates assume contiguous decodable
+media and exclude discovery, keyframe and segment delays.
+
+Native status exposes the source scan's `buffer_complete` flag. The optional
+Prometheus metric `outpace_source_buffer_sessions` distinguishes unobserved,
+pending, empty and contiguous source buffers by provider network. Player
+underrun and recovery timing must be observed at the client.
+
 ## Qualification and remaining limits
 
 Synthetic regression coverage includes cold/stale timing, rolling-history

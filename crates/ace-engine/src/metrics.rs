@@ -210,6 +210,10 @@ struct NetworkTotals {
     stale_teardowns: u64,
     skipped_evicted_gaps: u64,
     signature_rejects: u64,
+    buffer_unobserved: u64,
+    buffer_pending: u64,
+    buffer_empty: u64,
+    buffer_contiguous: u64,
 }
 
 /// `(metric name, help text, value extractor)` for one per-network gauge.
@@ -295,6 +299,13 @@ fn render(s: &Snapshot) -> String {
         t.upload_rate = t.upload_rate.saturating_add(stats.upload_rate);
         t.downloaded = t.downloaded.saturating_add(stats.downloaded);
         t.uploaded = t.uploaded.saturating_add(stats.uploaded);
+        let buffer_state = match &stats.livepos {
+            None => &mut t.buffer_unobserved,
+            Some(pos) if !pos.buffer_complete => &mut t.buffer_pending,
+            Some(pos) if pos.buffer_pieces == 0 => &mut t.buffer_empty,
+            Some(_) => &mut t.buffer_contiguous,
+        };
+        *buffer_state = buffer_state.saturating_add(1);
         if let Some(r) = &stats.recovery {
             t.active_upstreams = t
                 .active_upstreams
@@ -305,6 +316,27 @@ fn render(s: &Snapshot) -> String {
                 .skipped_evicted_gaps
                 .saturating_add(r.skipped_evicted_gaps);
             t.signature_rejects = t.signature_rejects.saturating_add(r.signature_rejects);
+        }
+    }
+
+    header(
+        &mut out,
+        "outpace_source_buffer_sessions",
+        "gauge",
+        "Active sessions by source reassembly buffer observation and provider network.",
+    );
+    for (network, t) in &totals {
+        let network = escape_label(network);
+        for (state, count) in [
+            ("unobserved", t.buffer_unobserved),
+            ("pending", t.buffer_pending),
+            ("empty", t.buffer_empty),
+            ("contiguous", t.buffer_contiguous),
+        ] {
+            let _ = writeln!(
+                out,
+                "outpace_source_buffer_sessions{{network=\"{network}\",state=\"{state}\"}} {count}"
+            );
         }
     }
 

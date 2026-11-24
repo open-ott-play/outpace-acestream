@@ -19,7 +19,11 @@ pub(super) fn update_runtime_window(
 ) {
     if let Some(peer) = peers.get_mut(&peer_id) {
         peer.max_piece = peer.max_piece.max(max_piece);
-        continuity.update_peer_window(peer_id, peer.min_piece, peer.max_piece);
+        continuity.update_peer_window(
+            peer_id,
+            peer.min_piece.load(Ordering::Relaxed),
+            peer.max_piece,
+        );
     }
 }
 
@@ -49,9 +53,12 @@ pub(super) fn observe_runtime_eviction(
     first_piece: u64,
 ) {
     if let Some(peer) = peers.get_mut(&peer_id) {
-        peer.min_piece = peer.min_piece.max(first_piece);
-        peer.max_piece = peer.max_piece.max(peer.min_piece);
-        continuity.update_peer_window(peer_id, peer.min_piece, peer.max_piece);
+        let minimum = peer
+            .min_piece
+            .fetch_max(first_piece, Ordering::Relaxed)
+            .max(first_piece);
+        peer.max_piece = peer.max_piece.max(minimum);
+        continuity.update_peer_window(peer_id, minimum, peer.max_piece);
     }
 }
 

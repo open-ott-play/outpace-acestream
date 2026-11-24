@@ -3,7 +3,11 @@ use super::*;
 /// Preserve actionable source diagnostics without flattening content-policy failures.
 fn contextual_resolution_error(context: &str, error: ResolveError) -> ProviderError {
     match error {
-        ResolveError::ProtectedContent | ResolveError::InvalidProtection => error.into(),
+        ResolveError::ProtectedContent
+        | ResolveError::InvalidProtection
+        | ResolveError::CatalogNetwork(_)
+        | ResolveError::CatalogHttp(_)
+        | ResolveError::CatalogBusy => error.into(),
         _ => ProviderError::Backend(format!("{context}: {error:?}")),
     }
 }
@@ -129,7 +133,7 @@ impl AceProvider {
                 Err(e) => crate::alog!("[ace] resolve {addr}: {e:?}"),
             }
         }
-        Err(ProviderError::Backend(
+        Err(ProviderError::NoPeers(
             "content-id resolution: no metadata peer responded".into(),
         ))
     }
@@ -242,17 +246,23 @@ impl AceProvider {
             }
             Err(_) => {}
         }
-        if self
+        let cached_network = self
             .infohash_failures
             .lock()
             .unwrap()
             .iter()
-            .any(|(key, at)| *key == requested && at.elapsed() < INFOHASH_FAILURE_TTL)
-        {
-            return Err(ProviderError::Unresolvable(format!(
+            .find(|(key, at, _)| *key == requested && at.elapsed() < INFOHASH_FAILURE_TTL)
+            .map(|(_, _, network)| *network);
+        if let Some(network) = cached_network {
+            let message = format!(
                 "{} Recent catalog lookup failed; retry shortly.",
                 unresolved_infohash_message(id)
-            )));
+            );
+            return Err(if network {
+                ProviderError::UnresolvableNetwork(message)
+            } else {
+                ProviderError::Unresolvable(message)
+            });
         }
         let info = match catalog.await {
             Ok(info) => info,
@@ -260,11 +270,28 @@ impl AceProvider {
                 return Err(error.into())
             }
             Err(error) => {
-                self.remember_infohash_failure(requested);
-                return Err(ProviderError::Unresolvable(format!(
+                let network = matches!(
+                    error,
+                    ResolveError::CatalogNetwork(_) | ResolveError::CatalogHttp(_)
+                );
+                if matches!(error, ResolveError::CatalogBusy) {
+                    // A bare hash still has no verified descriptor. Preserve its
+                    // unresolvable response without caching temporary saturation.
+                    return Err(ProviderError::Unresolvable(format!(
+                        "{} Catalog resolver busy; retry shortly.",
+                        unresolved_infohash_message(id)
+                    )));
+                }
+                self.remember_infohash_failure_kind(requested, network);
+                let message = format!(
                     "{} Catalog lookup failed: {error:?}",
                     unresolved_infohash_message(id)
-                )));
+                );
+                return Err(if network {
+                    ProviderError::UnresolvableNetwork(message)
+                } else {
+                    ProviderError::Unresolvable(message)
+                });
             }
         };
         if info.infohash != requested {
@@ -280,12 +307,16 @@ impl AceProvider {
     }
 
     pub(super) fn remember_infohash_failure(&self, requested: [u8; 20]) {
+        self.remember_infohash_failure_kind(requested, false);
+    }
+
+    fn remember_infohash_failure_kind(&self, requested: [u8; 20], network: bool) {
         let mut failures = self.infohash_failures.lock().unwrap();
-        failures.retain(|(key, at)| *key != requested && at.elapsed() < INFOHASH_FAILURE_TTL);
+        failures.retain(|(key, at, _)| *key != requested && at.elapsed() < INFOHASH_FAILURE_TTL);
         if failures.len() >= INFOHASH_FAILURE_CAPACITY {
             failures.pop_front();
         }
-        failures.push_back((requested, Instant::now()));
+        failures.push_back((requested, Instant::now(), network));
     }
 
     #[cfg(test)]
@@ -436,9 +467,14 @@ impl AceProvider {
 }
 
 fn disabled_content_id_fallback(catalog_error: ResolveError) -> ProviderError {
-    ProviderError::Backend(format!(
-        "content-id catalog resolution failed: {catalog_error:?}; raw-hash BEP-9 fallback is disabled (OUTPACE_BEP9_CONTENT_ID_FALLBACK=1 to opt in)"
-    ))
+    match catalog_error {
+        ResolveError::CatalogNetwork(reason) | ResolveError::CatalogHttp(reason) =>
+            ProviderError::Network(reason.into()),
+        ResolveError::CatalogBusy => ProviderError::ResolverBusy("catalog resolver busy".into()),
+        other => ProviderError::Backend(format!(
+            "content-id catalog resolution failed: {other:?}; raw-hash BEP-9 fallback is disabled (OUTPACE_BEP9_CONTENT_ID_FALLBACK=1 to opt in)"
+        )),
+    }
 }
 
 /// Whether `id` is a bare 40-hex string: a swarm infohash, or a content id missing its `cid:`

@@ -46,6 +46,163 @@ fn runtime(id: u64) -> (PeerRuntime, mpsc::Receiver<PeerCommand>) {
 }
 
 #[tokio::test]
+async fn corroboration_withholds_prefetched_output_and_productive_credit() {
+    let (info, seed, mut c) = fixture();
+    c.startup_prefetch = true;
+    c.startup_deadline = Some(Instant::now() + LIVE_START_CORROBORATION);
+    c.reasm.add_block(7, 0, &media(0x21)).unwrap();
+    let (peer, _rx) = runtime(1);
+    let addr = peer.addr;
+    let mut peers = BTreeMap::from([(1, peer)]);
+    c.piece_producers.insert(7, Some(addr));
+    assert!(!prepare_output(&mut c, &info, &seed));
+    assert!(c.pending_output.is_none());
+    assert!(c.reasm.has_complete_piece(7));
+    assert_eq!(c.reasm.next_needed(), 7);
+    assert!(!peers[&1].produced_output);
+    c.startup_deadline = None;
+    assert!(prepare_output(&mut c, &info, &seed));
+    assert_eq!(c.emitted, 0, "preparation does not earn output credit");
+    let (tx, mut rx) = mpsc::channel(1);
+    let downloaded = Arc::new(AtomicU64::new(0));
+    finish_output(
+        &mut c,
+        &info,
+        tx.reserve_owned().await.unwrap(),
+        &downloaded,
+        &seed,
+        &mut SessionCandidates::default(),
+        &mut peers,
+    );
+    assert!(rx.recv().await.unwrap().startup_complete);
+    assert!(peers[&1].produced_output);
+    assert_eq!(downloaded.load(Ordering::Relaxed), 564);
+    shutdown_peer_runtimes(&mut peers);
+}
+
+#[tokio::test]
+async fn newer_head_discards_unpublished_prefetch_and_preserves_gap_and_readiness() {
+    for carried_gap in [false, true] {
+        let (info, seed, mut c) = fixture();
+        c.prefetch = 1;
+        c.startup_prefetch = true;
+        c.discontinuity_pending = carried_gap;
+        c.reasm.add_block(7, 0, &media(0x21)).unwrap();
+        let (peer, _rx) = runtime(1);
+        let addr = peer.addr;
+        let mut peers = BTreeMap::from([(1, peer)]);
+        c.piece_producers.insert(7, Some(addr));
+        let downloaded = Arc::new(AtomicU64::new(0));
+        let mut candidates = SessionCandidates::default();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(LiveOutput {
+            bytes: Bytes::from_static(b"occupied"),
+            discontinuity: false,
+            startup_complete: false,
+        })
+        .await
+        .unwrap();
+        assert!(prepare_output(&mut c, &info, &seed));
+        assert!(
+            c.startup_complete,
+            "old pending batch had reached its provisional head"
+        );
+        let mut reservation = Box::pin(tx.clone().reserve_owned());
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                reservation.as_mut().poll(cx).is_pending()
+            ))
+            .await
+        );
+        c.head = 10;
+        assert!(!prepare_output(&mut c, &info, &seed));
+        drop(reservation);
+        assert!(c.pending_output.is_none());
+        assert_eq!(c.reasm.next_needed(), 9);
+        assert_eq!(c.startup_head, 10);
+        assert!(!c.startup_complete);
+        assert!(c.startup_prefetch, "no media byte has reached the consumer");
+        assert_eq!(c.discontinuity_pending, carried_gap);
+        assert!(!peers[&1].produced_output);
+        assert_eq!(downloaded.load(Ordering::Relaxed), 0);
+        assert_eq!(rx.recv().await.unwrap().bytes.as_ref(), b"occupied");
+        // The real output gate's bounded fallback avoids requiring a codec fixture.
+        c.output_gate = ace_media::mpegts::KeyframeGate::with_max_scan_packets(1);
+        c.reasm.add_block(9, 0, &media(0x33)).unwrap();
+        c.piece_producers.insert(9, Some(addr));
+        assert!(prepare_output(&mut c, &info, &seed));
+        finish_output(
+            &mut c,
+            &info,
+            tx.clone().reserve_owned().await.unwrap(),
+            &downloaded,
+            &seed,
+            &mut candidates,
+            &mut peers,
+        );
+        let output = rx.recv().await.unwrap();
+        assert!(output
+            .bytes
+            .as_chunks::<188>()
+            .0
+            .iter()
+            .all(|packet| packet[4] == 0x33));
+        assert_eq!(output.discontinuity, carried_gap);
+        assert!(
+            !output.startup_complete,
+            "replacement still has its head outstanding"
+        );
+        assert!(peers[&1].produced_output);
+        c.reasm.add_block(10, 0, &media(0x44)).unwrap();
+        assert!(prepare_output(&mut c, &info, &seed));
+        assert!(
+            !c.startup_prefetch,
+            "first published byte ends provisional startup"
+        );
+        finish_output(
+            &mut c,
+            &info,
+            tx.clone().reserve_owned().await.unwrap(),
+            &downloaded,
+            &seed,
+            &mut candidates,
+            &mut peers,
+        );
+        let output = rx.recv().await.unwrap();
+        assert!(output.startup_complete);
+        assert!(!output.discontinuity);
+        shutdown_peer_runtimes(&mut peers);
+    }
+}
+
+#[tokio::test]
+async fn reconnect_drain_discards_stale_provisional_pending_media_without_credit() {
+    let (info, seed, mut c) = fixture();
+    c.prefetch = 1;
+    c.startup_prefetch = true;
+    c.reasm.add_block(7, 0, &media(0x21)).unwrap();
+    assert!(prepare_output(&mut c, &info, &seed));
+    c.head = 10;
+    let downloaded = Arc::new(AtomicU64::new(0));
+    let (tx, mut rx) = mpsc::channel(1);
+    assert!(!super::super::drain_ready_output(
+        &mut c,
+        &info,
+        &tx,
+        &downloaded,
+        &seed,
+        &mut SessionCandidates::default(),
+        &mut BTreeMap::new(),
+    )
+    .await
+    .unwrap());
+    assert!(rx.try_recv().is_err());
+    assert_eq!(downloaded.load(Ordering::Relaxed), 0);
+    assert_eq!(c.reasm.next_needed(), 9);
+    assert!(c.startup_prefetch);
+}
+
+#[tokio::test]
 async fn one_piece_output_retains_order_credit_and_bytes_across_cancelled_reservation() {
     let (info, seed, mut c) = fixture();
     let first = media(0x21);

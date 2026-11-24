@@ -406,7 +406,7 @@ async fn vod_hls_rejects_partial_packets_and_invalid_transport_headers() {
 async fn vod_failures_map_to_the_documented_selector_contract() {
     // A well-formed id the provider will not open is client-actionable (`422`, like the live
     // `ih:` refusal), a missing network or target is `404`, and only an upstream failure is
-    // `502`. Bodies carry the provider's reason without its outer error-variant wrapper.
+    // `502`. Backend details do not go into typed native responses.
     let invalid = vod_failure(ProviderError::Invalid("invalid selector".into()));
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
     let body = axum::body::to_bytes(invalid.into_body(), 256)
@@ -419,21 +419,25 @@ async fn vod_failures_map_to_the_documented_selector_contract() {
     let body = axum::body::to_bytes(unprocessable.into_body(), 256)
         .await
         .unwrap();
-    assert_eq!(&body[..], b"bare infohash");
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "unresolvable");
 
     let missing = vod_failure(ProviderError::NotFound);
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     let body = axum::body::to_bytes(missing.into_body(), 256)
         .await
         .unwrap();
-    assert_eq!(&body[..], b"vod target not found");
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "not_found");
 
     let upstream = vod_failure(ProviderError::Backend("catalog timeout".into()));
     assert_eq!(upstream.status(), StatusCode::BAD_GATEWAY);
     let body = axum::body::to_bytes(upstream.into_body(), 256)
         .await
         .unwrap();
-    assert_eq!(&body[..], b"catalog timeout");
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "internal");
+    assert_eq!(body["error"]["message"], "stream start failed");
 
     let direct_hls = vod_failure(ProviderError::DirectHls {
         manifest_url: "https://origin.invalid/manifest.m3u8".into(),

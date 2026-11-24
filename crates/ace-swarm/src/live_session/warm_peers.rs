@@ -13,6 +13,11 @@ const MAX_BYTES: usize = 256 * 1024;
 const MAX_IDENTITIES: usize = 16;
 const HEADER: &str = "OUTPACE-WARM-1\n";
 const FILE: &str = "recent-peers-v1";
+/// Test-only hang guard for real filesystem work, including durable file/directory sync.
+/// These waits still require the actual acknowledgement or worker terminal; disk latency
+/// is not the production startup/drop contract checked by the separate tight assertions.
+#[cfg(test)]
+const TEST_IO_DEADLINE: Duration = Duration::from_secs(30);
 #[derive(Clone, Copy)]
 struct Entry {
     addr: SocketAddrV4,
@@ -311,7 +316,7 @@ impl WarmPeerCache {
             state.revision
         };
         self.0.shared.wake.notify_one();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(TEST_IO_DEADLINE, async {
             loop {
                 let notified = self.0.shared.changed.notified();
                 tokio::pin!(notified);
@@ -791,10 +796,10 @@ mod secure {
 }
 
 // Fixtures asserting persisted contents need actual load completion, not the
-// production best-effort startup delay. Keep the existing two-second setup bound.
+// production best-effort 100 ms startup delay or a disk-speed assertion.
 #[cfg(test)]
 pub(super) async fn fixture_loaded(cache: &WarmPeerCache) {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(TEST_IO_DEADLINE, async {
         loop {
             let notified = cache.0.shared.changed.notified();
             tokio::pin!(notified);
@@ -812,7 +817,7 @@ pub(super) async fn fixture_loaded(cache: &WarmPeerCache) {
 #[cfg(test)]
 pub(super) async fn retired_terminal(path: &Path) -> bool {
     let identity = normalize(path).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(TEST_IO_DEADLINE, async {
         loop {
             {
                 let mut slots = registry().lock().unwrap();
@@ -844,7 +849,7 @@ mod tests {
     async fn writer_observation(
         receiver: &std::sync::mpsc::Receiver<WriterObservation>,
     ) -> WriterObservation {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(TEST_IO_DEADLINE, async {
             loop {
                 if let Ok(event) = receiver.try_recv() {
                     return event;

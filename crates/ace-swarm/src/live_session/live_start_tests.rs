@@ -240,7 +240,8 @@ async fn stale_then_source(max_active: usize, matching_window: bool) {
     let relay_addr = v4(relay_listener.local_addr().unwrap());
     let client = TcpStream::connect(relay_addr).await.unwrap();
     let (relay_stream, _) = relay_listener.accept().await.unwrap();
-    let observed = requests.clone();
+    let relay_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = relay_requests.clone();
     let relay = tokio::spawn(async move {
         let mut session = PeerSession::new(relay_stream);
         session.send(&PeerMessage::Unchoke).await.unwrap();
@@ -332,12 +333,17 @@ async fn stale_then_source(max_active: usize, matching_window: bool) {
     );
     assert!(received.load(Ordering::Relaxed) >= output.bytes.len() as u64);
     let requests = requests.lock().unwrap();
-    assert!(!requests.is_empty());
+    let relay_requests = relay_requests.lock().unwrap();
+    assert!(!requests.is_empty() || !relay_requests.is_empty());
     assert!(
         requests
             .iter()
             .all(|piece| *piece >= if matching_window { 7 } else { 1000 }),
-        "no piece below live head minus prefetch may be requested: {requests:?}"
+        "source requests stay above the confirmed floor: {requests:?}"
+    );
+    assert!(
+        relay_requests.iter().all(|piece| (7..=8).contains(piece)),
+        "provisional requests stay inside their advertised window: {relay_requests:?}"
     );
     assert!(count.load(Ordering::Relaxed) <= max_active as u32);
     assert!(
@@ -347,7 +353,7 @@ async fn stale_then_source(max_active: usize, matching_window: bool) {
 }
 
 #[tokio::test]
-async fn stale_first_window_waits_for_actual_source_before_request_or_output() {
+async fn stale_first_window_waits_for_actual_source_before_output() {
     stale_then_source(4, false).await;
 }
 #[tokio::test]
@@ -470,7 +476,8 @@ async fn single_peer_with_hint_or_head(
         let started = Instant::now();
         let mut first = Some(first_tx);
         let mut session = PeerSession::new(server);
-        session.send(&PeerMessage::Unchoke).await.unwrap();
+        // Advertise new evidence before unchoking: requests now overlap the
+        // corroboration interval instead of waiting for its output decision.
         if pending_source {
             let mut payload = vec![0; 14];
             payload[8..12].copy_from_slice(&silent_addr.ip().octets());
@@ -488,6 +495,7 @@ async fn single_peer_with_hint_or_head(
                 .await
                 .unwrap();
         }
+        session.send(&PeerMessage::Unchoke).await.unwrap();
         while let Ok(msg) = session.read_message().await {
             if let PeerMessage::Unknown { id: 6, payload } = msg {
                 observed.fetch_add(1, Ordering::Relaxed);
@@ -523,6 +531,7 @@ async fn single_peer_with_hint_or_head(
     let (tx, mut rx) = mpsc::channel(16);
     let store = Arc::new(tokio::sync::Mutex::new(PieceStore::new(752, 752, 4096)));
     let actual_store = store.clone();
+    let pool_started = Instant::now();
     let pool = tokio::spawn(async move {
         follow_peer_pool(
             vec![ConnectedUpstream {
@@ -556,6 +565,10 @@ async fn single_peer_with_hint_or_head(
             .await
             .unwrap()
             .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "corroboration still withholds output"
+        );
         drop(rx);
         tokio::time::timeout(Duration::from_secs(1), pool)
             .await
@@ -566,10 +579,9 @@ async fn single_peer_with_hint_or_head(
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            requests.load(Ordering::Relaxed),
-            0,
-            "closing during corroboration must cancel without media requests"
+        assert!(
+            requests.load(Ordering::Relaxed) <= 2,
+            "prefetch stays bounded to the initial window even when cancelled"
         );
         return;
     }
@@ -577,10 +589,11 @@ async fn single_peer_with_hint_or_head(
         .await
         .unwrap()
         .unwrap();
-    let output = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+    let output = tokio::time::timeout(Duration::from_millis(1600), rx.recv())
         .await
         .unwrap()
         .unwrap();
+    let first_output = pool_started.elapsed();
     drop(rx);
     pool.await.unwrap();
     server.await.unwrap();
@@ -594,12 +607,20 @@ async fn single_peer_with_hint_or_head(
         assert!(pending.await.unwrap_err().is_cancelled());
     }
     assert!(
-        first >= Duration::from_millis(900),
-        "single peer must receive bounded opportunity for corroboration"
+        first < Duration::from_millis(900),
+        "media requests should overlap corroboration: {first:?}"
     );
     assert!(
-        first < Duration::from_millis(if stale_window_delay { 1200 } else { 1500 }),
-        "gossip and coarse sweeps must not extend the one-second media decision budget: {first:?}"
+        first_output >= Duration::from_millis(900),
+        "output must wait for the corroboration decision: {first_output:?}"
+    );
+    assert!(
+        first_output < Duration::from_millis(if stale_window_delay { 1200 } else { 1500 }),
+        "gossip and coarse sweeps must not extend the one-second output decision budget: {first_output:?}"
+    );
+    assert!(
+        requests.load(Ordering::Relaxed) <= 2,
+        "verified prefetched pieces must not be requested again"
     );
     assert!(
         output

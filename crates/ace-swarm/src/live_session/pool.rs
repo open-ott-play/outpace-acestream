@@ -255,8 +255,9 @@ pub(super) async fn follow_peer_pool_with_discovery(
     let live_recovery = continuity.live_recovery;
     if lone_fresh {
         continuity.startup_deadline = Some(Instant::now() + LIVE_START_CORROBORATION);
+        continuity.startup_prefetch = true;
         crate::alog!(
-            "[ace] live start: withholding media for independent window evidence (up to 1000 ms)"
+            "[ace] live start: prefetching while withholding output for independent window evidence (up to 1000 ms)"
         );
     }
     let (event_capacity, refill_capacity) = match recovery_channel_capacities(live_recovery) {
@@ -387,7 +388,9 @@ pub(super) async fn follow_peer_pool_with_discovery(
         // Prepare at most one accepted piece and reserve output without blocking
         // control messages. The retained batch is bounded by one wire piece.
         prepare_output(continuity, info, seed);
-        if continuity.pending_output.is_some() && output_reservation.is_none() {
+        if continuity.pending_output.is_none() {
+            output_reservation = None;
+        } else if output_reservation.is_none() {
             output_reservation = Some(Box::pin(tx.clone().reserve_owned()));
         }
         reciprocal.start(&peers, store);
@@ -780,9 +783,7 @@ pub(super) async fn follow_peer_pool_with_discovery(
                 if let Some(lc) = LiveChunk::borrow_from_message(&m) {
                     continuity.skip_far_behind_live(Instant::now());
                     let piece = lc.piece as u64;
-                    if continuity.startup_deadline.is_some()
-                        || piece < continuity.reasm.next_needed()
-                    {
+                    if piece < continuity.reasm.next_needed() {
                         continue;
                     }
                     let arrived_at = Instant::now();

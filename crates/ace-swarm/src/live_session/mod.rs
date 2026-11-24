@@ -595,8 +595,11 @@ pub(super) struct Continuity {
     pub(super) head: u64,
     startup_head: u64,
     startup_complete: bool,
-    /// Only a fresh lone-window pool delays media; reconnect continuity stays authoritative.
+    /// Only a fresh lone-window pool delays output; requests can already prefetch.
     startup_deadline: Option<Instant>,
+    /// Keep provisional media subject to the newest live floor until its first byte
+    /// actually reaches the consumer, including a retained pending output batch.
+    startup_prefetch: bool,
     /// Workers discard queued stale chunk writes after new live-head evidence.
     pub(super) request_floor: Arc<AtomicU64>,
     /// Pieces behind the live edge to leave as a cushion when re-syncing forward to live.

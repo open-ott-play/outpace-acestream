@@ -129,3 +129,33 @@ The upstream actor/DHT/store architecture is not substituted wholesale. Existing
 managed-origin HLS, replay, admission ownership and generation fencing remain the
 integration contracts. Synthetic qualification does not establish provider
 availability or improved decoded startup on real channels.
+
+## Live startup and discovery follow-up
+
+These changes use the original Outpace engine's November 18 source as a reference.
+The original authorship and AGPL notices apply to the adapted code.
+
+- [Short live backlog](https://github.com/outpace-stream/outpace-engine/pull/475):
+  the startup reservoir can release buffered media after the available history
+  is exhausted. HLS still uses source readiness and its own packaging threshold.
+- [Parallel startup prefetch](https://github.com/outpace-stream/outpace-engine/pull/528):
+  download during the initial window check and keep output gated until the
+  current window is accepted. Preserve downstream completion tracking and
+  validate the output position again before delivery.
+- [Response-paced DHT](https://github.com/outpace-stream/outpace-engine/pull/490),
+  [bootstrap recovery](https://github.com/outpace-stream/outpace-engine/pull/520)
+  and [recent-node hints](https://github.com/outpace-stream/outpace-engine/pull/527):
+  reuse query slots as answers arrive and allow one recovery round within the
+  original deadline when discovery returns no peers. Cache hints are used in
+  recovery only, after bootstrap routers claim their slots.
+- [Start phase](https://github.com/outpace-stream/outpace-engine/pull/487),
+  [normalization failures](https://github.com/outpace-stream/outpace-engine/pull/493)
+  and [catalog failure classification](https://github.com/outpace-stream/outpace-engine/pull/530):
+  report finite startup state and stable error codes without forwarding backend
+  details. Server output and player decode are separate milestones.
+- [Hex validation](https://github.com/outpace-stream/outpace-engine/commit/a32d307b4)
+  checks input encoding before fixed-width parsing. The [Compose smoke filters](https://github.com/outpace-stream/outpace-engine/pull/514)
+  track the Docker context exclude file and the Rust toolchain pin.
+- The [warm-peer cache tests](https://github.com/outpace-stream/outpace-engine/pull/504)
+  wait for explicit disk I/O acknowledgements within a test-only hang guard.
+  The production startup wait and cache ownership checks retain their bounds.

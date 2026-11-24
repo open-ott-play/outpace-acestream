@@ -117,6 +117,16 @@ pub trait StreamProvider: Send + Sync {
     fn network(&self) -> &'static str;
     /// Open a live TS source for `id` (the provider resolves/discovers internally).
     async fn open(&self, id: &str) -> Result<Box<dyn TsSource>, ProviderError>;
+    /// Report intermediate opening progress without changing provider retry policy.
+    async fn open_with_progress(
+        &self,
+        id: &str,
+        progress: crate::start_status::StartProgress,
+    ) -> Result<Box<dyn TsSource>, ProviderError> {
+        let _ = progress;
+        self.open(id).await
+    }
+
     /// Resolve `id` to a single-file VOD, returning its geometry (total length) and a handle for
     /// opening verified byte ranges. Defaults to unsupported; networks with a VOD path override
     /// this. Kept separate from [`open`](Self::open) because VOD is finite, length-known content
@@ -168,6 +178,14 @@ pub enum ProviderError {
     /// The caller's selector is malformed. The message is safe to return to clients.
     Invalid(String),
     Backend(String),
+    /// Discovery exhausted its bounded candidate search; diagnostics stay internal.
+    NoPeers(String),
+    /// Catalog or network transport could not be reached.
+    Network(String),
+    /// Shared resolver admission was full; retains Backend HTTP mappings.
+    ResolverBusy(String),
+    /// A verified selector remains unavailable because its catalog was unreachable.
+    UnresolvableNetwork(String),
     /// The id is well-formed, but the requested playback mode is unsupported or the provider
     /// has no verified metadata to open it (#164: a bare infohash without a descriptor). The
     /// message is user-facing: it explains the refusal and how to open the stream instead, and
@@ -189,6 +207,10 @@ impl std::fmt::Debug for ProviderError {
             Self::NotFound => f.write_str("NotFound"),
             Self::Invalid(message) => f.debug_tuple("Invalid").field(message).finish(),
             Self::Backend(message) => f.debug_tuple("Backend").field(message).finish(),
+            Self::NoPeers(_) => f.write_str("NoPeers"),
+            Self::Network(_) => f.write_str("Network"),
+            Self::ResolverBusy(_) => f.write_str("ResolverBusy"),
+            Self::UnresolvableNetwork(_) => f.write_str("UnresolvableNetwork"),
             Self::Unresolvable(message) => f.debug_tuple("Unresolvable").field(message).finish(),
             // Signed origin URLs belong only in explicit playback/resolve responses.
             Self::DirectHls { .. } => f.debug_struct("DirectHls").finish_non_exhaustive(),
@@ -205,6 +227,10 @@ impl std::fmt::Display for ProviderError {
             ProviderError::NotFound => f.write_str("not found"),
             ProviderError::Invalid(msg)
             | ProviderError::Backend(msg)
+            | ProviderError::NoPeers(msg)
+            | ProviderError::Network(msg)
+            | ProviderError::ResolverBusy(msg)
+            | ProviderError::UnresolvableNetwork(msg)
             | ProviderError::Unresolvable(msg) => f.write_str(msg),
             ProviderError::DirectHls { .. } => f.write_str(
                 "source is origin HLS; use the native HTTP playback URL or outpace play --resolve",
@@ -218,6 +244,11 @@ impl From<ace_swarm::resolve::ResolveError> for ProviderError {
         match error {
             ace_swarm::resolve::ResolveError::ProtectedContent => Self::ProtectedContent,
             ace_swarm::resolve::ResolveError::InvalidProtection => Self::InvalidProtection,
+            ace_swarm::resolve::ResolveError::CatalogNetwork(reason)
+            | ace_swarm::resolve::ResolveError::CatalogHttp(reason) => Self::Network(reason.into()),
+            ace_swarm::resolve::ResolveError::CatalogBusy => {
+                Self::ResolverBusy("catalog resolver busy".into())
+            }
             other => Self::Backend(format!("descriptor resolution: {other:?}")),
         }
     }

@@ -94,6 +94,42 @@ fn test_pool_peer(addr: SocketAddrV4) -> (PeerRuntime, mpsc::Receiver<PeerComman
 }
 
 #[tokio::test]
+async fn corroboration_prefetch_keeps_verified_completions_out_of_the_request_queue() {
+    let mut stream = info();
+    stream.piece_length = 8;
+    stream.chunk_length = 4;
+    stream.sig_len = 0;
+    let (mut c, _) = Continuity::fresh(&stream, 7, 8, 1, default_live_recovery());
+    c.startup_deadline = Some(Instant::now() + LIVE_START_CORROBORATION);
+    c.startup_prefetch = true;
+    let addr = "127.0.0.1:1".parse().unwrap();
+    let (peer, mut commands) = test_pool_peer(addr);
+    let mut peers = BTreeMap::from([(1, peer)]);
+    c.register_active_peer(1, addr, live_pos(7, 8));
+    c.set_peer_unchoked(1, true);
+    advance_pool_requests(&mut peers, &mut c, 2).await;
+    for piece in [7, 8] {
+        assert!(
+            matches!(commands.try_recv(), Ok(PeerCommand::RequestPiece { piece: requested, .. }) if requested == piece)
+        );
+        c.reasm.add_block(piece, 0, b"abcdefgh").unwrap();
+        assert!(c.note_chunk(piece, 1, 2));
+    }
+    advance_pool_requests(&mut peers, &mut c, 2).await;
+    assert!(
+        commands.try_recv().is_err(),
+        "completed prefetched pieces stay retained"
+    );
+    assert_eq!(c.scheduler.in_flight_count(), 0);
+    assert_eq!(c.active_peers.in_flight_count(1), 0);
+    assert_eq!(c.reasm.next_needed(), 7);
+    assert!(c.reasm.has_complete_piece(7));
+    assert!(c.reasm.has_complete_piece(8));
+    assert_eq!(c.emitted, 0);
+    shutdown_peer_runtimes(&mut peers);
+}
+
+#[tokio::test]
 async fn timed_out_piece_retries_when_all_peer_slots_are_full() {
     let policy = LiveRecoveryConfig {
         max_piece_advance: 1,
